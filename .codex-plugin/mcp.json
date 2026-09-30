@@ -1,0 +1,9 @@
+{
+  "fcc-spectrum-mcp-server": {
+    "command": "npx",
+    "args": ["-y", "@cyanheads/fcc-spectrum-mcp-server"],
+    "env": {
+      "MCP_TRANSPORT_TYPE": "stdio"
+    }
+  }
+}
