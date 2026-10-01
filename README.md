@@ -1,5 +1,5 @@
 <div align="center">
-  <h1>fcc-spectrum-mcp-server</h1>
+  <h1>@cyanheads/fcc-spectrum-mcp-server</h1>
   <p><b>Search FCC radio licenses, find nearby transmitter sites, and see who is licensed on a frequency via MCP. STDIO or Streamable HTTP.</b>
   <div>5 Tools • 1 Resource</div>
   </p>
