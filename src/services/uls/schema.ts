@@ -19,7 +19,7 @@ import {
 export const MIRROR_NAME = 'fcc-uls';
 
 /** Current store schema version; bump it and add a migration on any schema change. */
-export const SCHEMA_VERSION = 3;
+const SCHEMA_VERSION = 3;
 
 /** License statuses whose records keep sites, antennas, frequencies, and market blocks. */
 export const LIVE_STATUSES = ['A', 'L', 'X'] as const;
@@ -196,11 +196,11 @@ export const META_KEYS = {
 /** Per-group counts kept in `meta` under {@link META_KEYS.groupStats}. */
 export type GroupStats = Record<string, { frequencies: number; records: number; sites: number }>;
 
-/** `ingest_files.stage` values, in step order. A daily file is written once, as `complete`. */
-export const INGEST_STAGES = ['downloaded', 'records', 'complete'] as const;
-
-/** Progress of one applied file. */
-export type IngestStage = (typeof INGEST_STAGES)[number];
+/**
+ * Progress of one applied file: the `ingest_files.stage` values, in step order. A daily file
+ * is written once, as `complete`.
+ */
+export type IngestStage = 'downloaded' | 'records' | 'complete';
 
 /** Per-record-type line statistics kept in `ingest_files.stats_json`. */
 export type RecordStats = Record<
@@ -333,6 +333,14 @@ export function generationFileName(stamp: string, suffix?: string): string {
 /** True for a generation database file name (not its `-wal`/`-shm` sidecars). */
 export function isGenerationFile(name: string): boolean {
   return name.startsWith(GENERATION_PREFIX) && name.endsWith(GENERATION_SUFFIX);
+}
+
+/**
+ * A generation file name's stamp with its suffix (`fcc-uls-20260927T133855Z-2.db` →
+ * `20260927T133855Z-2`): the generation id cursors are bound to.
+ */
+export function generationStamp(name: string): string {
+  return name.slice(GENERATION_PREFIX.length, -GENERATION_SUFFIX.length);
 }
 
 /** The published-generation pointer (`current.json`). */

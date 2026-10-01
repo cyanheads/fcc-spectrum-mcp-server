@@ -8,12 +8,13 @@ import { tool, z } from '@cyanheads/mcp-ts-core';
 import { JsonRpcErrorCode } from '@cyanheads/mcp-ts-core/errors';
 import {
   bandText,
+  callsignText,
   cell,
   inline,
-  joinNotice,
   licenseeText,
   orList,
   renderAppliedFilters,
+  stateSourceText,
   yesNo,
 } from '@/mcp-server/tools/format-helpers.js';
 import {
@@ -328,9 +329,8 @@ export const findTransmitters = tool('fcc_spectrum_find_transmitters', {
         cap: input.limit,
         guidance: fragments.join(' '),
       });
-    } else {
-      const notice = joinNotice(fragments);
-      if (notice) ctx.enrich.notice(notice);
+    } else if (fragments.length) {
+      ctx.enrich.notice(fragments.join(' '));
     }
 
     return { sites: page.rows, ...(page.nextCursor && { nextCursor: page.nextCursor }) };
@@ -342,15 +342,13 @@ export const findTransmitters = tool('fcc_spectrum_find_transmitters', {
       const place = [site.county && inline(site.county), site.state].filter(Boolean).join(', ');
       lines.push(
         '',
-        `### ${site.distanceKm} km · ${site.callsign ? inline(site.callsign) : '(no callsign)'} · USI ${site.usi} · location ${site.locationNumber}`,
+        `### ${site.distanceKm} km · ${callsignText(site.callsign)} · USI ${site.usi} · location ${site.locationNumber}`,
         `- **Licensee:** ${licenseeText(site.licenseeName, site.licenseeRedacted)} · **Redacted:** ${yesNo(site.licenseeRedacted)} · **Lease:** ${yesNo(site.isLease)}`,
         `- **Status:** ${site.licenseStatus} · **Service:** ${site.radioServiceCode} (${inline(site.radioServiceLabel)})${site.locationTypeCode ? ` · **Location type:** ${site.locationTypeCode}` : ''}`,
         `- **Coordinates:** ${site.latitude}, ${site.longitude}${site.groundElevationM !== undefined ? ` · **Ground elevation:** ${site.groundElevationM} m` : ''}${site.overallHeightM !== undefined ? ` · **Overall height:** ${site.overallHeightM} m` : ''}${site.asrNumber ? ` · **ASR:** ${site.asrNumber}` : ''}`,
       );
       if (place) {
-        lines.push(
-          `- **Place:** ${place}${site.stateFromCoordinates ? ' (state derived from coordinates)' : ''}${site.stateFromCoordinates === false ? ' (state as filed)' : ''}`,
-        );
+        lines.push(`- **Place:** ${place}${stateSourceText(site.stateFromCoordinates)}`);
       }
       if (site.sitesSharingNumber !== undefined) {
         lines.push(

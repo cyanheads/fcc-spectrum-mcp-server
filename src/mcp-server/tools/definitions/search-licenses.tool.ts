@@ -8,8 +8,8 @@
 import { tool, z } from '@cyanheads/mcp-ts-core';
 import { JsonRpcErrorCode } from '@cyanheads/mcp-ts-core/errors';
 import {
+  callsignText,
   inline,
-  joinNotice,
   licenseeText,
   renderAppliedFilters,
   yesNo,
@@ -288,9 +288,8 @@ export const searchLicenses = tool('fcc_spectrum_search_licenses', {
         cap: input.limit,
         guidance: fragments.join(' '),
       });
-    } else {
-      const notice = joinNotice(fragments);
-      if (notice) ctx.enrich.notice(notice);
+    } else if (fragments.length) {
+      ctx.enrich.notice(fragments.join(' '));
     }
 
     return { licenses: page.rows, ...(page.nextCursor && { nextCursor: page.nextCursor }) };
@@ -301,7 +300,7 @@ export const searchLicenses = tool('fcc_spectrum_search_licenses', {
     for (const license of result.licenses) {
       lines.push(
         '',
-        `### ${license.callsign ? inline(license.callsign) : '(no callsign)'} · USI ${license.usi}`,
+        `### ${callsignText(license.callsign)} · USI ${license.usi}`,
         `- **Licensee:** ${licenseeText(license.licenseeName, license.licenseeRedacted)} · **Redacted:** ${yesNo(license.licenseeRedacted)}${license.frn ? ` · **FRN:** ${license.frn}` : ''}${license.applicantType ? ` · **Applicant type:** ${license.applicantType}` : ''}`,
         `- **Status:** ${license.licenseStatus} (${license.statusLabel}) · **Service:** ${license.radioServiceCode} (${inline(license.radioServiceLabel)}) · **Group:** ${license.serviceGroup} · **Lease:** ${yesNo(license.isLease)}`,
       );

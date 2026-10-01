@@ -20,7 +20,6 @@ import {
   type MirrorLogger,
   type MirrorStore,
   type SqliteHandle,
-  type SqliteStatement,
   type SqlValue,
   type SyncContext,
   type SyncPage,
@@ -840,23 +839,29 @@ function dropStaging(db: SqliteHandle): void {
   db.exec(STAGING_TABLES.map((table) => `DROP TABLE IF EXISTS temp.${table};`).join('\n'));
 }
 
+/** What every record type staged from one archive shares; `stats` collects each type's counts. */
+interface StagingPass {
+  archive: ZipArchive;
+  db: SqliteHandle;
+  signal: AbortSignal;
+  stats: RecordStats;
+}
+
 /**
- * Stream one record type from the archive into a staging table. `toRow` maps a decoded
- * record to its bound values, or `null` to skip it (a non-licensee entity, a non-live
- * USI). Lines that fail to decode are counted as rejected, never guessed at.
+ * Stream one record type from the archive into a staging table through `insertSql`. `toRow`
+ * maps a decoded record to its bound values, or `null` to skip it (a non-licensee entity, a
+ * non-live USI). Lines that fail to decode are counted as rejected, never guessed at.
  */
 async function stageType<T>(
-  db: SqliteHandle,
-  archive: ZipArchive,
+  { archive, db, signal, stats }: StagingPass,
   type: RecordType,
   decode: (line: string) => T | null,
   toRow: (record: T) => SqlValue[] | null,
-  insert: SqliteStatement,
-  signal: AbortSignal,
-  stats: RecordStats,
+  insertSql: string,
 ): Promise<void> {
   const entry = archive.find(`${type}.dat`);
   if (!entry) return;
+  const insert = db.prepare(insertSql);
   const counts = { read: 0, rejected: 0, kept: 0 };
   stats[type] = counts;
   let batch: SqlValue[][] = [];
@@ -893,10 +898,9 @@ async function stageRecords(
   signal: AbortSignal,
 ): Promise<RecordStats> {
   db.exec(RECORD_STAGING_DDL);
-  const stats: RecordStats = {};
+  const pass: StagingPass = { archive, db, signal, stats: {} };
   await stageType(
-    db,
-    archive,
+    pass,
     'HD',
     // A header without a status or service code cannot be filtered or classified: rejected.
     (line) => {
@@ -915,69 +919,45 @@ async function stageRecords(
       hd.lastActionDate,
       hd.callsign && LEASE_CALLSIGN.test(hd.callsign) ? 1 : 0,
     ],
-    db.prepare(
-      `INSERT OR IGNORE INTO temp.stage_hd (usi, callsign, license_status, radio_service_code,
-         grant_date, expired_date, cancellation_date, effective_date, last_action_date, is_lease)
-       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
-    ),
-    signal,
-    stats,
+    `INSERT OR IGNORE INTO temp.stage_hd (usi, callsign, license_status, radio_service_code,
+       grant_date, expired_date, cancellation_date, effective_date, last_action_date, is_lease)
+     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
   );
   await stageType(
-    db,
-    archive,
+    pass,
     'EN',
     decodeEn,
     (en) =>
       en.entityType === 'L'
         ? [en.usi, en.entityName, en.city, en.state, en.frn, en.applicantType]
         : null,
-    db.prepare(
-      `INSERT OR IGNORE INTO temp.stage_en (usi, licensee_name, licensee_city, licensee_state, frn, applicant_type)
-       VALUES (?, ?, ?, ?, ?, ?)`,
-    ),
-    signal,
-    stats,
+    `INSERT OR IGNORE INTO temp.stage_en (usi, licensee_name, licensee_city, licensee_state, frn, applicant_type)
+     VALUES (?, ?, ?, ?, ?, ?)`,
   );
   await stageType(
-    db,
-    archive,
+    pass,
     'AM',
     decodeAm,
     (am) => [am.usi, am.operatorClass, am.trusteeCallsign, am.previousCallsign, am.trusteeName],
-    db.prepare(
-      `INSERT OR IGNORE INTO temp.stage_am (usi, operator_class, trustee_callsign, previous_callsign, trustee_name)
-       VALUES (?, ?, ?, ?, ?)`,
-    ),
-    signal,
-    stats,
+    `INSERT OR IGNORE INTO temp.stage_am (usi, operator_class, trustee_callsign, previous_callsign, trustee_name)
+     VALUES (?, ?, ?, ?, ?)`,
   );
   await stageType(
-    db,
-    archive,
+    pass,
     'MK',
     decodeMk,
     (mk) => [mk.usi, mk.marketCode, mk.channelBlock, mk.marketName, marketStates(mk.marketName)],
-    db.prepare(
-      `INSERT OR IGNORE INTO temp.stage_mk (usi, market_code, channel_block, market_name, market_states)
-       VALUES (?, ?, ?, ?, ?)`,
-    ),
-    signal,
-    stats,
+    `INSERT OR IGNORE INTO temp.stage_mk (usi, market_code, channel_block, market_name, market_states)
+     VALUES (?, ?, ?, ?, ?)`,
   );
   await stageType(
-    db,
-    archive,
+    pass,
     'LL',
     decodeLl,
     (ll) => [ll.leaseUsi, ll.parentUsi, ll.parentCallsign, ll.leaseId],
-    db.prepare(
-      'INSERT INTO temp.stage_ll (lease_usi, parent_usi, parent_callsign, lease_id) VALUES (?, ?, ?, ?)',
-    ),
-    signal,
-    stats,
+    'INSERT INTO temp.stage_ll (lease_usi, parent_usi, parent_callsign, lease_id) VALUES (?, ?, ?, ?)',
   );
-  return stats;
+  return pass.stats;
 }
 
 /**
@@ -991,10 +971,9 @@ async function stageTechnical(
   signal: AbortSignal,
 ): Promise<RecordStats> {
   db.exec(TECHNICAL_STAGING_DDL);
-  const stats: RecordStats = {};
+  const pass: StagingPass = { archive, db, signal, stats: {} };
   await stageType(
-    db,
-    archive,
+    pass,
     'LO',
     decodeLo,
     (lo) => {
@@ -1027,18 +1006,13 @@ async function stageTechnical(
         derived === null ? 0 : 1,
       ];
     },
-    db.prepare(
-      `INSERT INTO temp.stage_lo (usi, location_number, location_type, location_class, address,
-         city, county, state, radius_km, ground_elevation_m, lat, lon, coord_dms, asr_number,
-         support_height_m, overall_height_m, structure_type, location_name, site_state, state_derived)
-       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
-    ),
-    signal,
-    stats,
+    `INSERT INTO temp.stage_lo (usi, location_number, location_type, location_class, address,
+       city, county, state, radius_km, ground_elevation_m, lat, lon, coord_dms, asr_number,
+       support_height_m, overall_height_m, structure_type, location_name, site_state, state_derived)
+     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
   );
   await stageType(
-    db,
-    archive,
+    pass,
     'AN',
     decodeAn,
     (an) =>
@@ -1059,17 +1033,12 @@ async function stageTechnical(
             an.haatM,
           ]
         : null,
-    db.prepare(
-      `INSERT INTO temp.stage_an (usi, location_number, antenna_number, antenna_type, height_to_tip_m,
-         height_to_center_m, make, model, polarization, beamwidth_deg, gain_dbi, azimuth_deg, haat_m)
-       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
-    ),
-    signal,
-    stats,
+    `INSERT INTO temp.stage_an (usi, location_number, antenna_number, antenna_type, height_to_tip_m,
+       height_to_center_m, make, model, polarization, beamwidth_deg, gain_dbi, azimuth_deg, haat_m)
+     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
   );
   await stageType(
-    db,
-    archive,
+    pass,
     'FR',
     decodeFr,
     (fr) =>
@@ -1089,17 +1058,12 @@ async function stageTechnical(
             fr.transmitterModel,
           ]
         : null,
-    db.prepare(
-      `INSERT INTO temp.stage_fr (usi, location_number, antenna_number, freq_seq_id, class_station,
-         frequency_mhz, upper_mhz, power_output_w, erp_w, eirp_dbm, transmitter_make, transmitter_model)
-       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
-    ),
-    signal,
-    stats,
+    `INSERT INTO temp.stage_fr (usi, location_number, antenna_number, freq_seq_id, class_station,
+       frequency_mhz, upper_mhz, power_output_w, erp_w, eirp_dbm, transmitter_make, transmitter_model)
+     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
   );
   await stageType(
-    db,
-    archive,
+    pass,
     'EM',
     decodeEm,
     (em) =>
@@ -1113,26 +1077,17 @@ async function stageTechnical(
             emissionBandwidthMhz(em.emissionCode),
           ]
         : null,
-    db.prepare(
-      `INSERT INTO temp.stage_em (usi, location_number, antenna_number, freq_seq_id, emission_code, bandwidth_mhz)
-       VALUES (?, ?, ?, ?, ?, ?)`,
-    ),
-    signal,
-    stats,
+    `INSERT INTO temp.stage_em (usi, location_number, antenna_number, freq_seq_id, emission_code, bandwidth_mhz)
+     VALUES (?, ?, ?, ?, ?, ?)`,
   );
   await stageType(
-    db,
-    archive,
+    pass,
     'MF',
     decodeMf,
     (mf) => (live.has(mf.usi) ? [mf.usi, mf.partitionAreaId ?? 0, mf.lowerMhz, mf.upperMhz] : null),
-    db.prepare(
-      'INSERT INTO temp.stage_mf (usi, partition_area_id, lower, upper) VALUES (?, ?, ?, ?)',
-    ),
-    signal,
-    stats,
+    'INSERT INTO temp.stage_mf (usi, partition_area_id, lower, upper) VALUES (?, ?, ?, ?)',
   );
-  return stats;
+  return pass.stats;
 }
 
 /**

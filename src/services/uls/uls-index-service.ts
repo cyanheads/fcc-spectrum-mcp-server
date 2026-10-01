@@ -27,6 +27,7 @@ import {
   createUlsStore,
   type GenerationPointer,
   type GroupStats,
+  generationStamp,
   isGenerationFile,
   isMalformedPointer,
   isProcessAlive,
@@ -91,8 +92,6 @@ export const LICENSE_PAGE = { sites: 50, antennas: 100, leases: 100 } as const;
 
 /** Callsign-prefix candidates offered on a miss. */
 const MAX_CANDIDATES = 5;
-
-const GENERATION_PREFIX = 'fcc-uls-';
 
 /** A published generation, opened. */
 interface OpenGeneration {
@@ -741,7 +740,7 @@ export class UlsIndexService {
           .all(row.callsign, row.usi);
       }
     } else {
-      const callsign = params.callsign ?? '';
+      const { callsign } = params;
       const rows = db
         .prepare<LicenseRow>(
           `SELECT * FROM licenses WHERE callsign = ?
@@ -1588,8 +1587,8 @@ export class UlsIndexService {
         }),
       );
     }
-    if (pointer?.file === this.current?.file && this.current) {
-      this.current.publishedAt = pointer?.publishedAt ?? this.current.publishedAt;
+    if (pointer && pointer.file === this.current?.file) {
+      this.current.publishedAt = pointer.publishedAt;
       this.pointerMtime = mtime;
       return this.current;
     }
@@ -1629,7 +1628,7 @@ export class UlsIndexService {
         store,
         db,
         file: pointer.file,
-        id: pointer.file.slice(GENERATION_PREFIX.length).replace(/\.db$/, ''),
+        id: generationStamp(pointer.file),
         publishedAt: pointer.publishedAt,
         ready: Boolean(state.completedAt),
       };

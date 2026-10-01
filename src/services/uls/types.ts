@@ -204,16 +204,17 @@ export interface LicenseDetail {
   usi: string;
 }
 
-/** `getLicense` parameters: exactly one of `callsign` or `usi` (checked by the tool). */
-export interface GetLicenseParams {
-  callsign?: string | undefined;
+/** `getLicense` parameters: the record by exactly one of `callsign` or `usi`, and the page. */
+export type GetLicenseParams = (
+  | { callsign: string; usi?: never }
+  | { callsign?: never; usi: string }
+) & {
   /** Index of the first lease listed, in lease-ID order (default 0). */
   leaseOffset?: number;
   /** Index of the first location number in the window, in number order (default 0). */
   locationOffset?: number;
   maxFrequencies: number;
-  usi?: string | undefined;
-}
+};
 
 /** `getLicense` outcome: a miss is a result carrying callsign-prefix candidates. */
 export type GetLicenseResult =

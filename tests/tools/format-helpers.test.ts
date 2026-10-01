@@ -1,19 +1,20 @@
 /**
  * @fileoverview Tests for the `format()` helpers: CR/LF flattening for inline slots, table
- * cell escaping, licensee display text, band text, the applied-filters line, and notice
- * composition.
+ * cell escaping, callsign and licensee display text, the state-source suffix, band text,
+ * the applied-filters line, and option lists.
  * @module tests/tools/format-helpers.test
  */
 
 import { describe, expect, it } from 'vitest';
 import {
   bandText,
+  callsignText,
   cell,
   inline,
-  joinNotice,
   licenseeText,
   orList,
   renderAppliedFilters,
+  stateSourceText,
   yesNo,
 } from '@/mcp-server/tools/format-helpers.js';
 
@@ -47,6 +48,21 @@ describe('yesNo', () => {
   it('renders booleans as yes and no', () => {
     expect(yesNo(true)).toBe('yes');
     expect(yesNo(false)).toBe('no');
+  });
+});
+
+describe('callsignText', () => {
+  it('flattens a filed callsign and names a missing one', () => {
+    expect(callsignText('KZZ\r\n901')).toBe('KZZ 901');
+    expect(callsignText(undefined)).toBe('(no callsign)');
+  });
+});
+
+describe('stateSourceText', () => {
+  it('says where the state came from, and nothing when that is unknown', () => {
+    expect(stateSourceText(true)).toBe(' (state derived from coordinates)');
+    expect(stateSourceText(false)).toBe(' (state as filed)');
+    expect(stateSourceText(undefined)).toBe('');
   });
 });
 
@@ -112,12 +128,5 @@ describe('orList', () => {
   it('joins two with "or" and more with commas and a final "or"', () => {
     expect(orList(['a', 'b'])).toBe('a or b');
     expect(orList(['a', false, 'b', undefined, 'c'])).toBe('a, b, or c');
-  });
-});
-
-describe('joinNotice', () => {
-  it('returns undefined for no fragments and joins the rest with spaces', () => {
-    expect(joinNotice([])).toBeUndefined();
-    expect(joinNotice(['First.', 'Second.'])).toBe('First. Second.');
   });
 });

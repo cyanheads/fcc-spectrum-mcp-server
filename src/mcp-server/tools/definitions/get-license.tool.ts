@@ -7,7 +7,15 @@
 
 import { tool, z } from '@cyanheads/mcp-ts-core';
 import { JsonRpcErrorCode } from '@cyanheads/mcp-ts-core/errors';
-import { bandText, cell, inline, licenseeText, yesNo } from '@/mcp-server/tools/format-helpers.js';
+import {
+  bandText,
+  callsignText,
+  cell,
+  inline,
+  licenseeText,
+  stateSourceText,
+  yesNo,
+} from '@/mcp-server/tools/format-helpers.js';
 import { blankAsUnset, callsignSchema, usiSchema } from '@/mcp-server/tools/input-schemas.js';
 import { PAL_BAND_MHZ } from '@/services/uls/codes.js';
 import { getUlsIndexService, LICENSE_PAGE } from '@/services/uls/uls-index-service.js';
@@ -422,18 +430,19 @@ export const getLicense = tool('fcc_spectrum_get_license', {
     if (dataAsOf === undefined) throw ctx.fail('index_not_ready');
     ctx.enrich({ dataAsOf, truncated: false, shown: 0, cap: input.max_frequencies });
 
-    if ((input.callsign === undefined) === (input.usi === undefined)) {
-      throw ctx.fail(
-        'identifier_required',
-        input.callsign === undefined
-          ? 'Neither callsign nor usi was given.'
-          : 'Both callsign and usi were given; pass only one.',
-      );
+    if (input.callsign !== undefined && input.usi !== undefined) {
+      throw ctx.fail('identifier_required', 'Both callsign and usi were given; pass only one.');
     }
+    const lookup =
+      input.callsign !== undefined
+        ? { callsign: input.callsign }
+        : input.usi !== undefined
+          ? { usi: input.usi }
+          : undefined;
+    if (!lookup) throw ctx.fail('identifier_required', 'Neither callsign nor usi was given.');
 
     const result = await index.getLicense({
-      callsign: input.callsign,
-      usi: input.usi,
+      ...lookup,
       maxFrequencies: input.max_frequencies,
       locationOffset: input.location_offset,
       leaseOffset: input.lease_offset,
@@ -568,12 +577,10 @@ function part(label: string, value: string | number | undefined): string {
   return value === undefined ? '' : ` · **${label}:** ${value}`;
 }
 
-type Block = NonNullable<z.infer<typeof LicenseSchema>['market']>['blocks'][number];
-
 function licenseLines(license: z.infer<typeof LicenseSchema>): string[] {
   const { licensee } = license;
   const lines = [
-    `## ${license.callsign ? inline(license.callsign) : '(no callsign)'} · USI ${license.usi}`,
+    `## ${callsignText(license.callsign)} · USI ${license.usi}`,
     `**Status:** ${license.licenseStatus} (${license.statusLabel}) · **Service:** ${license.radioServiceCode} (${inline(license.radioServiceLabel)}) · **Group:** ${license.serviceGroup} · **Lease:** ${yesNo(license.isLease)}`,
     `**${licensee.role === 'lessee' ? 'Lessee' : 'Licensee'}:** ${licenseeText(licensee.name, licensee.redacted)} · **Redacted:** ${yesNo(licensee.redacted)} · **Role:** ${licensee.role}${part('FRN', licensee.frn)}${part('Applicant type', licensee.applicantType)}${part('City', licensee.city && inline(licensee.city))}${part('State', licensee.state)}`,
   ];
@@ -606,15 +613,17 @@ function licenseLines(license: z.infer<typeof LicenseSchema>): string[] {
       `**Market:** ${market.marketCode}${market.marketName ? ` — ${inline(market.marketName)}` : ''}${part('Channel block', market.channelBlock && inline(market.channelBlock))}`,
     );
     if (market.blocks.length) {
-      const blockText = ({ lowMhz, highMhz, channelWidthMhz, partitionAreaIds: ids }: Block) =>
-        [
-          lowMhz !== undefined && bandText(lowMhz, highMhz),
-          channelWidthMhz !== undefined && `${channelWidthMhz} MHz channel, no frequency filed`,
-          ids?.length && `(partition area${ids.length > 1 ? 's' : ''} ${ids.join(', ')})`,
-        ]
-          .filter(Boolean)
-          .join(' ');
-      lines.push(`**Spectrum blocks:** ${market.blocks.map(blockText).join(', ')}`);
+      const blocks = market.blocks.map(
+        ({ lowMhz, highMhz, channelWidthMhz, partitionAreaIds: ids }) =>
+          [
+            lowMhz !== undefined && bandText(lowMhz, highMhz),
+            channelWidthMhz !== undefined && `${channelWidthMhz} MHz channel, no frequency filed`,
+            ids?.length && `(partition area${ids.length > 1 ? 's' : ''} ${ids.join(', ')})`,
+          ]
+            .filter(Boolean)
+            .join(' '),
+      );
+      lines.push(`**Spectrum blocks:** ${blocks.join(', ')}`);
       if (
         license.radioServiceCode === 'PL' &&
         market.blocks.some((block) => block.channelWidthMhz !== undefined)
@@ -627,7 +636,7 @@ function licenseLines(license: z.infer<typeof LicenseSchema>): string[] {
   }
   if (license.leasedFrom.length) {
     lines.push(
-      `**Leased from:** ${license.leasedFrom.map((parent) => `${parent.callsign ? inline(parent.callsign) : '(no callsign)'} (USI ${parent.usi})`).join(', ')}`,
+      `**Leased from:** ${license.leasedFrom.map((parent) => `${callsignText(parent.callsign)} (USI ${parent.usi})`).join(', ')}`,
     );
   }
   lines.push(
@@ -635,7 +644,7 @@ function licenseLines(license: z.infer<typeof LicenseSchema>): string[] {
   );
   for (const lease of license.leases) {
     lines.push(
-      `- ${lease.callsign ? inline(lease.callsign) : '(no callsign)'} · USI ${lease.usi} · status ${lease.licenseStatus}`,
+      `- ${callsignText(lease.callsign)} · USI ${lease.usi} · status ${lease.licenseStatus}`,
     );
   }
   return lines;
@@ -659,9 +668,7 @@ function siteLines(heading: string, site: z.infer<typeof SiteSchema>): string[] 
     `**Type:** ${site.locationTypeCode ?? 'not filed'}${site.locationTypeLabel ? ` (${site.locationTypeLabel})` : ''}${part('Class', site.locationClassCode)} · **Coordinates:** ${coordinates}${part('Filed DMS', site.coordinatesDms && inline(site.coordinatesDms))}`,
   ];
   if (place || site.stateFromCoordinates !== undefined) {
-    lines.push(
-      `**Place:** ${place || 'not filed'}${site.stateFromCoordinates ? ' (state derived from coordinates)' : ''}${site.stateFromCoordinates === false ? ' (state as filed)' : ''}`,
-    );
+    lines.push(`**Place:** ${place || 'not filed'}${stateSourceText(site.stateFromCoordinates)}`);
   }
   const structure = `${part('Ground elevation m', site.groundElevationM)}${part('Support height m', site.supportHeightM)}${part('Overall height m', site.overallHeightM)}${part('Structure', site.structureType && inline(site.structureType))}${part('ASR', site.asrNumber)}${part('Radius km', site.radiusKm)}`;
   if (structure) lines.push(structure.slice(3));

@@ -145,9 +145,8 @@ export function emissionBandwidthMhz(designator: string): number | null {
   if (!match) return null;
   const [, whole = '', unit = '', fraction = ''] = match;
   if (whole.length + fraction.length !== 3) return null;
-  const value = Number(`${whole || '0'}.${fraction || '0'}`);
   const convert = BANDWIDTH_TO_MHZ[unit];
-  return convert && Number.isFinite(value) ? convert(value) : null;
+  return convert ? convert(Number(`${whole || '0'}.${fraction || '0'}`)) : null;
 }
 
 /**
@@ -157,19 +156,6 @@ export function emissionBandwidthMhz(designator: string): number | null {
  * licensed ULS stations are not ultra-wideband.
  */
 export const MAX_FRACTIONAL_BANDWIDTH = 0.2;
-
-/**
- * Occupied band of a site assignment in MHz: `[f − bw/2, (upper ?? f) + bw/2]`, where
- * `bw` is the widest necessary bandwidth among its emissions (0 when none parses).
- */
-export function occupiedBand(
-  frequencyMhz: number,
-  upperMhz: number | null,
-  bandwidthMhz: number | null,
-): { low: number; high: number } {
-  const half = (bandwidthMhz ?? 0) / 2;
-  return { low: frequencyMhz - half, high: (upperMhz ?? frequencyMhz) + half };
-}
 
 /** A parsed `counts` file: its creation time and per-record-type line counts. */
 export interface CountsFile {

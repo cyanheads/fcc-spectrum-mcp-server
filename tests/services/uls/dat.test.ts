@@ -22,7 +22,6 @@ import {
   decodeMk,
   emissionBandwidthMhz,
   numberField,
-  occupiedBand,
   parseCountsFile,
   parseUlsDate,
   RECORD_FIELD_COUNTS,
@@ -175,7 +174,7 @@ describe('coordinateFields', () => {
   });
 });
 
-describe('emissionBandwidthMhz / occupiedBand', () => {
+describe('emissionBandwidthMhz', () => {
   it.each([
     ['6M00D1D', 6],
     ['11K2F3E', 0.0112],
@@ -197,14 +196,6 @@ describe('emissionBandwidthMhz / occupiedBand', () => {
       expect(emissionBandwidthMhz(designator)).toBeNull();
     },
   );
-
-  it('widens a site assignment by half the bandwidth on each side', () => {
-    const narrow = occupiedBand(152.24, null, 0.016);
-    expect(narrow.low).toBeCloseTo(152.232, 9);
-    expect(narrow.high).toBeCloseTo(152.248, 9);
-    expect(occupiedBand(2500, 2506, 6)).toEqual({ low: 2497, high: 2509 });
-    expect(occupiedBand(152.24, null, null)).toEqual({ low: 152.24, high: 152.24 });
-  });
 });
 
 describe('parseCountsFile', () => {

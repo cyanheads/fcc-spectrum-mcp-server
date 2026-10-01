@@ -18,6 +18,7 @@ import {
   compactStamp,
   createUlsStore,
   generationFileName,
+  generationStamp,
   isGenerationFile,
   isMalformedPointer,
   isProcessAlive,
@@ -50,10 +51,15 @@ describe('compactStamp', () => {
   });
 });
 
-describe('generationFileName and isGenerationFile', () => {
+describe('generationFileName, generationStamp, and isGenerationFile', () => {
   it('names a generation from its stamp, with an optional suffix', () => {
     expect(generationFileName('20260927T133853Z')).toBe('fcc-uls-20260927T133853Z.db');
     expect(generationFileName('20260927T133853Z', '2')).toBe('fcc-uls-20260927T133853Z-2.db');
+  });
+
+  it('reads the stamp and suffix back from a generation file name', () => {
+    expect(generationStamp('fcc-uls-20260927T133853Z.db')).toBe('20260927T133853Z');
+    expect(generationStamp(generationFileName('20260927T133853Z', '2'))).toBe('20260927T133853Z-2');
   });
 
   it('recognizes generation files only', () => {

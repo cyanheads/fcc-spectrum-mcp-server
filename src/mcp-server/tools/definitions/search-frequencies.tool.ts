@@ -9,12 +9,13 @@ import { tool, z } from '@cyanheads/mcp-ts-core';
 import { JsonRpcErrorCode } from '@cyanheads/mcp-ts-core/errors';
 import {
   bandText,
+  callsignText,
   cell,
   inline,
-  joinNotice,
   licenseeText,
   orList,
   renderAppliedFilters,
+  stateSourceText,
   yesNo,
 } from '@/mcp-server/tools/format-helpers.js';
 import {
@@ -340,9 +341,8 @@ export const searchFrequencies = tool('fcc_spectrum_search_frequencies', {
         cap: input.limit,
         guidance: fragments.join(' '),
       });
-    } else {
-      const notice = joinNotice(fragments);
-      if (notice) ctx.enrich.notice(notice);
+    } else if (fragments.length) {
+      ctx.enrich.notice(fragments.join(' '));
     }
 
     return { assignments: page.rows, ...(page.nextCursor && { nextCursor: page.nextCursor }) };
@@ -355,7 +355,7 @@ export const searchFrequencies = tool('fcc_spectrum_search_frequencies', {
     for (const row of result.assignments) {
       lines.push(
         '',
-        `### ${bandText(row.frequencyMhz, row.upperMhz)} · ${row.kind} · ${row.callsign ? inline(row.callsign) : '(no callsign)'} · USI ${row.usi}`,
+        `### ${bandText(row.frequencyMhz, row.upperMhz)} · ${row.kind} · ${callsignText(row.callsign)} · USI ${row.usi}`,
         `- **Licensee:** ${licenseeText(row.licenseeName, row.licenseeRedacted)} · **Redacted:** ${yesNo(row.licenseeRedacted)} · **Lease:** ${yesNo(row.isLease)}`,
         `- **Status:** ${row.licenseStatus} · **Service:** ${row.radioServiceCode} (${inline(row.radioServiceLabel)})`,
       );
@@ -367,7 +367,7 @@ export const searchFrequencies = tool('fcc_spectrum_search_frequencies', {
       ) {
         const place = [row.county && inline(row.county), row.state].filter(Boolean).join(', ');
         lines.push(
-          `- **Site:** location ${row.locationNumber ?? '—'}${row.latitude !== undefined && row.longitude !== undefined ? ` · ${row.latitude}, ${row.longitude}` : ''}${place ? ` · ${place}` : ''}${row.stateFromCoordinates ? ' (state derived from coordinates)' : ''}${row.stateFromCoordinates === false ? ' (state as filed)' : ''}${row.sitesSharingNumber !== undefined ? ` · ${row.sitesSharingNumber} sites share this location number; ULS does not say which uses this frequency` : ''}`,
+          `- **Site:** location ${row.locationNumber ?? '—'}${row.latitude !== undefined && row.longitude !== undefined ? ` · ${row.latitude}, ${row.longitude}` : ''}${place ? ` · ${place}` : ''}${stateSourceText(row.stateFromCoordinates)}${row.sitesSharingNumber !== undefined ? ` · ${row.sitesSharingNumber} sites share this location number; ULS does not say which uses this frequency` : ''}`,
         );
       }
       const technical = [

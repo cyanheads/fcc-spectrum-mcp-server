@@ -1,8 +1,8 @@
 /**
  * @fileoverview Markdown helpers shared by the tools' `format()` functions: flattening
  * upstream-authored text for inline slots, escaping table cells, and rendering the
- * values every data tool repeats (licensee names, frequency bands, applied filters), and
- * composing enrichment notices.
+ * values every data tool repeats (callsigns, licensee names, state sources, frequency
+ * bands, applied filters, option lists).
  * @module mcp-server/tools/format-helpers
  */
 
@@ -15,10 +15,20 @@ export const cell = (text: string) => inline(text).replace(/\\/g, '\\\\').replac
 /** A boolean as `yes`/`no`. */
 export const yesNo = (value: boolean) => (value ? 'yes' : 'no');
 
+/** A callsign for display; the few records filed without one read `(no callsign)`. */
+export const callsignText = (callsign: string | undefined) =>
+  callsign ? inline(callsign) : '(no callsign)';
+
 /** A licensee name for display, distinguishing a redacted individual from a name ULS never filed. */
 export function licenseeText(name: string | null, redacted: boolean): string {
   if (name !== null) return inline(name);
   return redacted ? 'Redacted (individual licensee)' : 'Not on file';
+}
+
+/** Where a site's state came from, as a suffix: derived, as filed, or nothing when unknown. */
+export function stateSourceText(stateFromCoordinates: boolean | undefined): string {
+  if (stateFromCoordinates === undefined) return '';
+  return stateFromCoordinates ? ' (state derived from coordinates)' : ' (state as filed)';
 }
 
 /** A frequency or band in MHz: `851.0125 MHz` or `851–869 MHz`. */
@@ -44,9 +54,4 @@ export function orList(options: readonly (string | false | undefined)[]): string
   return kept.length === 2
     ? `${kept[0]} or ${kept[1]}`
     : `${kept.slice(0, -1).join(', ')}, or ${kept.at(-1)}`;
-}
-
-/** Join notice fragments into one enrichment notice; `undefined` when there are none. */
-export function joinNotice(fragments: readonly string[]): string | undefined {
-  return fragments.length ? fragments.join(' ') : undefined;
 }
