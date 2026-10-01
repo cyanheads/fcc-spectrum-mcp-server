@@ -164,11 +164,23 @@ export const searchFrequencies = tool('fcc_spectrum_search_frequencies', {
     nextCursor: z
       .string()
       .optional()
-      .describe('Pass as cursor with the same inputs for the next page; absent on the last page.'),
+      .describe(
+        'Pass as cursor with the same inputs for the next page; absent on the last page. A page over a dense band can hold fewer rows than limit and still carry one.',
+      ),
   }),
   enrichment: {
     dataAsOf: z.string().describe('Creation time of the newest applied ULS file (ISO 8601).'),
-    totalCount: z.number().describe('Rows matching the filters, across every page.'),
+    totalCount: z
+      .number()
+      .describe(
+        'Rows matching the filters, across every page; at least this many when totalIsLowerBound is true.',
+      ),
+    totalIsLowerBound: z
+      .boolean()
+      .optional()
+      .describe(
+        'True when a dense band was counted only in part, so totalCount is a lower bound; absent when the count is exact.',
+      ),
     truncated: z.boolean().describe('True when more rows follow this page.'),
     shown: z.number().describe('Rows on this page.'),
     cap: z.number().describe('The page limit applied.'),
@@ -194,7 +206,10 @@ export const searchFrequencies = tool('fcc_spectrum_search_frequencies', {
         'Why nothing matched, what the state and redaction rules skipped, or how to page further.',
       ),
   },
-  enrichmentTrailer: { appliedFilters: { render: renderAppliedFilters } },
+  enrichmentTrailer: {
+    appliedFilters: { render: renderAppliedFilters },
+    totalIsLowerBound: { label: 'Total is a lower bound' },
+  },
   errors: [
     {
       reason: 'index_not_ready',
@@ -290,12 +305,13 @@ export const searchFrequencies = tool('fcc_spectrum_search_frequencies', {
     });
     if (!page.ok) throw ctx.fail('invalid_cursor');
 
+    const lowerBound = page.totalIsLowerBound === true;
     ctx.enrich.total(page.total);
-    ctx.enrich({ shown: page.rows.length });
-    ctx.log.info('Frequency search', { total: page.total, shown: page.rows.length });
+    ctx.enrich({ shown: page.rows.length, ...(lowerBound && { totalIsLowerBound: true }) });
+    ctx.log.info('Frequency search', { total: page.total, lowerBound, shown: page.rows.length });
 
     const fragments: string[] = [];
-    if (page.total === 0) {
+    if (page.total === 0 && !lowerBound) {
       if (input.status === 'A') {
         fragments.push(
           'Only active records were searched; pass status "any" to include pending-legal and term-pending ones.',
@@ -333,16 +349,28 @@ export const searchFrequencies = tool('fcc_spectrum_search_frequencies', {
       );
     }
     if (page.nextCursor) {
-      fragments.push(
-        `Showing ${page.rows.length} of ${page.total} rows; pass nextCursor as cursor with the same inputs for the next page.`,
-      );
+      if (page.rows.length < input.limit) {
+        fragments.push(
+          'The scan stopped partway through the band to keep the call short; pass nextCursor as cursor with the same inputs to continue it.',
+        );
+        if (lowerBound && page.total > 0) fragments.push(`At least ${page.total} rows match.`);
+      } else {
+        fragments.push(
+          `Showing ${page.rows.length} of ${lowerBound ? 'at least ' : ''}${page.total} rows; pass nextCursor as cursor with the same inputs for the next page.`,
+        );
+      }
       ctx.enrich.truncated({
         shown: page.rows.length,
         cap: input.limit,
         guidance: fragments.join(' '),
       });
-    } else if (fragments.length) {
-      ctx.enrich.notice(fragments.join(' '));
+    } else {
+      if (lowerBound) {
+        fragments.push(
+          `This is the last page${page.total > 0 ? `; at least ${page.total} rows match across every page` : ''}.`,
+        );
+      }
+      if (fragments.length) ctx.enrich.notice(fragments.join(' '));
     }
 
     return { assignments: page.rows, ...(page.nextCursor && { nextCursor: page.nextCursor }) };
@@ -383,7 +411,14 @@ export const searchFrequencies = tool('fcc_spectrum_search_frequencies', {
         );
       }
     }
-    if (result.assignments.length === 0) lines.push('', 'No authorizations matched.');
+    if (result.assignments.length === 0) {
+      lines.push(
+        '',
+        result.nextCursor
+          ? 'No rows on this page; nextCursor continues the scan.'
+          : 'No authorizations matched.',
+      );
+    }
     if (result.nextCursor) lines.push('', `**nextCursor:** ${result.nextCursor}`);
     return [{ type: 'text', text: lines.join('\n') }];
   },

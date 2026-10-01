@@ -164,7 +164,7 @@ describe('warm index', () => {
       ['limit 0', { callsign: 'KZZ901', limit: 0 }],
       ['limit 101', { callsign: 'KZZ901', limit: 101 }],
       ['a prefix-portable callsign', { callsign: 'VE3/N0CALL' }],
-      ['a prefix-portable callsign with a 4-character base', { callsign: 'KL7/AA0A' }],
+      ['a prefix-portable callsign with a 4-character base', { callsign: 'KL7/AZ0Z' }],
       ['an 11-digit FRN', { frn: '12345678901' }],
       ['an unknown state name', { state: 'Atlantis' }],
       ['an unknown status', { callsign: 'KZZ901', status: 'Q' }],

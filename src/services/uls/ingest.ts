@@ -11,7 +11,7 @@
  */
 
 import { existsSync } from 'node:fs';
-import { mkdir, readdir, rm, stat, writeFile } from 'node:fs/promises';
+import { mkdir, readdir, rm, stat } from 'node:fs/promises';
 import { basename, join } from 'node:path';
 import { conflict, serializationError } from '@cyanheads/mcp-ts-core/errors';
 import {
@@ -50,7 +50,9 @@ import {
   type RecordType,
   toIsoSeconds,
 } from './dat.js';
+import { hasOrganizationWord } from './organization-names.js';
 import {
+  acquireIngestLock,
   bandClassSql,
   compactStamp,
   createUlsStore,
@@ -61,7 +63,7 @@ import {
   type IngestStage,
   isGenerationFile,
   isMalformedPointer,
-  isProcessAlive,
+  isRebuildRequired,
   LEASE_CALLSIGN,
   LIVE_STATUSES,
   LOCK_FILE,
@@ -69,8 +71,8 @@ import {
   MIRROR_NAME,
   POINTER_FILE,
   type RecordStats,
-  readIngestLock,
   readPointer,
+  releaseIngestLock,
   writePointer,
 } from './schema.js';
 import { stateAt } from './state-lookup.js';
@@ -197,11 +199,11 @@ export class UlsIngester {
 
       const target = targetGeneration(remote, pointer);
       await this.deleteStaleGenerations([target, pointer?.file]);
-      if (await this.builtFromOtherSnapshots(target, remote)) {
-        this.logger.info?.(
-          'Discarding a retired generation built from other snapshots; building it afresh.',
-          { generation: target },
-        );
+      const unresumable = await this.unresumableTarget(target, remote);
+      if (unresumable) {
+        this.logger.info?.(`Discarding ${unresumable}; building it afresh.`, {
+          generation: target,
+        });
         for (const file of generationFiles(target)) {
           await rm(join(this.mirrorDir, file), { force: true });
         }
@@ -231,6 +233,8 @@ export class UlsIngester {
    * Daily refresh of the published generation: applies every `daily/l_*.zip` whose
    * `Last-Modified` is newer than the checkpoint and not yet applied, oldest first, each in
    * one transaction. Stops at the first failure with the checkpoint at the last applied file.
+   * A generation carrying the rebuild-required mark is never refreshed: that fails with a
+   * conflict carrying `reason: rebuild_required`.
    */
   async refresh(signal: AbortSignal = NEVER_ABORT): Promise<RefreshResult> {
     await mkdir(this.tempDir, { recursive: true });
@@ -245,6 +249,12 @@ export class UlsIngester {
       const applied: string[] = [];
       const store = createUlsStore(join(this.mirrorDir, pointer.file));
       try {
+        if (isRebuildRequired(await store.raw())) {
+          throw conflict(
+            'The published index was built by an earlier version of this server and must be rebuilt before it is refreshed; run mirror:init to rebuild it.',
+            { generation: pointer.file, reason: 'rebuild_required' },
+          );
+        }
         const checkpoint = await this.refreshCheckpoint(store);
         const mirror = this.defineMirror(store, (ctx) =>
           this.refreshPages(ctx, store, checkpoint, applied),
@@ -329,8 +339,9 @@ export class UlsIngester {
   }
 
   /**
-   * True when a selected group is missing from the published generation or its snapshot's
-   * `Last-Modified` is newer than the one recorded when the generation was built.
+   * True when the published generation carries the rebuild-required mark, or a selected group
+   * is missing from it, or that group's snapshot `Last-Modified` is newer than the one
+   * recorded when the generation was built.
    */
   private async needsRebuild(
     pointer: GenerationPointer,
@@ -338,32 +349,39 @@ export class UlsIngester {
   ): Promise<boolean> {
     const path = join(this.mirrorDir, pointer.file);
     if (!existsSync(path)) return true;
-    const recorded = await readWeeklyRows(path);
+    const { rebuildRequired, weekly } = await readGenerationState(path);
+    if (rebuildRequired) return true;
     return [...remote].some(([group, head]) => {
-      const row = recorded.get(weeklyZipPath(group));
+      const row = weekly.get(weeklyZipPath(group));
       if (row?.stage !== 'complete') return true;
       return head.lastModified > row.last_modified;
     });
   }
 
   /**
-   * True when the target generation file exists and records a weekly snapshot other than the
-   * current one for its group, or a group no longer selected. The target alternates between
-   * the primary name and its `-2` form, so it can be a retired generation, complete for older
-   * snapshots: building into it would skip those groups and publish their stale data. An
-   * interrupted build of the current snapshots matches, and resumes.
+   * What the existing target generation file is, when it cannot be built into: one an earlier
+   * schema started (its rows carry the old derived values), or one that records a weekly
+   * snapshot other than the current one for its group, or a group no longer selected. The
+   * target alternates between the primary name and its `-2` form, so it can be a retired
+   * generation, complete for older snapshots: building into it would skip those groups and
+   * publish their stale data. `undefined` when there is no file, or it is an interrupted build
+   * of the current snapshots, which resumes.
    */
-  private async builtFromOtherSnapshots(
+  private async unresumableTarget(
     target: string,
     remote: Map<ServiceGroup, UlsRemoteFile>,
-  ): Promise<boolean> {
+  ): Promise<string | undefined> {
     const path = join(this.mirrorDir, target);
-    if (!existsSync(path)) return false;
+    if (!existsSync(path)) return;
+    const { rebuildRequired, weekly } = await readGenerationState(path);
+    if (rebuildRequired) return 'a generation an earlier version of this server started';
     const current = new Map(
       [...remote].map(([group, head]) => [weeklyZipPath(group), head.lastModified]),
     );
-    const recorded = await readWeeklyRows(path);
-    return [...recorded.values()].some((row) => current.get(row.path) !== row.last_modified);
+    const otherSnapshots = [...weekly.values()].some(
+      (row) => current.get(row.path) !== row.last_modified,
+    );
+    return otherSnapshots ? 'a retired generation built from other snapshots' : undefined;
   }
 
   /** Delete every generation file (and its WAL sidecars) except the ones named in `keep`. */
@@ -660,34 +678,31 @@ export class UlsIngester {
     }
   }
 
-  /** Run `fn` holding the ingest lock; a lock whose recorded PID is dead is reclaimed. */
+  /**
+   * Run `fn` holding the ingest lock ({@link acquireIngestLock}); a lock whose recorded process
+   * is gone is reclaimed.
+   */
   private async withLock<T>(mode: 'init' | 'refresh', fn: () => Promise<T>): Promise<T> {
     const lockPath = join(this.mirrorDir, LOCK_FILE);
     const holder = { pid: process.pid, mode, startedAt: toIsoSeconds(this.now()) };
-    for (let attempt = 0; ; attempt++) {
-      try {
-        await writeFile(lockPath, JSON.stringify(holder), { flag: 'wx' });
-        break;
-      } catch (err) {
-        if ((err as NodeJS.ErrnoException).code !== 'EEXIST' || attempt > 0) throw err;
-        const current = await readIngestLock(this.mirrorDir);
-        if (current && isProcessAlive(current.pid)) {
-          throw conflict(
-            `Another ULS ingest (${current.mode}, PID ${current.pid}, started ${current.startedAt}) holds ${lockPath}; wait for it to finish.`,
-            { lockPath, pid: current.pid, reason: 'ingest_locked' },
-          );
-        }
-        this.logger.warning?.('Reclaiming an ingest lock left by a process that is gone.', {
-          lockPath,
-          pid: current?.pid,
-        });
-        await rm(lockPath, { force: true });
-      }
+    const attempt = await acquireIngestLock(this.mirrorDir, holder);
+    if (!attempt.taken) {
+      const current = attempt.holder;
+      throw conflict(
+        `Another ULS ingest (${current.mode}, PID ${current.pid}, started ${current.startedAt}) holds ${lockPath}; wait for it to finish.`,
+        { lockPath, pid: current.pid, reason: 'ingest_locked' },
+      );
+    }
+    if (attempt.reclaimed) {
+      this.logger.warning?.('Reclaiming an ingest lock left by a process that is gone.', {
+        lockPath,
+        pid: attempt.reclaimed.pid,
+      });
     }
     try {
       return await fn();
     } finally {
-      await rm(lockPath, { force: true });
+      await releaseIngestLock(this.mirrorDir, holder);
     }
   }
 }
@@ -733,11 +748,17 @@ function readIngestRows(db: SqliteHandle, kind: IngestFileRow['kind']): Map<stri
   return new Map(rows.map((row) => [row.path, row]));
 }
 
-/** The weekly `ingest_files` rows of a generation file, read through a short-lived connection. */
-async function readWeeklyRows(path: string): Promise<Map<string, IngestFileRow>> {
+/**
+ * The weekly `ingest_files` rows of a generation file, and whether it carries the
+ * rebuild-required mark, read through a short-lived connection.
+ */
+async function readGenerationState(
+  path: string,
+): Promise<{ rebuildRequired: boolean; weekly: Map<string, IngestFileRow> }> {
   const store = createUlsStore(path);
   try {
-    return readIngestRows(await store.raw(), 'weekly');
+    const db = await store.raw();
+    return { rebuildRequired: isRebuildRequired(db), weekly: readIngestRows(db, 'weekly') };
   } finally {
     await store.close();
   }
@@ -783,7 +804,7 @@ CREATE TEMP TABLE stage_hd (
 DROP TABLE IF EXISTS temp.stage_en;
 CREATE TEMP TABLE stage_en (
   usi INTEGER PRIMARY KEY, licensee_name TEXT, licensee_city TEXT, licensee_state TEXT,
-  frn TEXT, applicant_type TEXT
+  frn TEXT, applicant_type TEXT, name_parts INTEGER NOT NULL, organization_word INTEGER NOT NULL
 );
 DROP TABLE IF EXISTS temp.stage_am;
 CREATE TEMP TABLE stage_am (
@@ -929,10 +950,20 @@ async function stageRecords(
     decodeEn,
     (en) =>
       en.entityType === 'L'
-        ? [en.usi, en.entityName, en.city, en.state, en.frn, en.applicantType]
+        ? [
+            en.usi,
+            en.entityName,
+            en.city,
+            en.state,
+            en.frn,
+            en.applicantType,
+            en.hasNameParts ? 1 : 0,
+            hasOrganizationWord(en.entityName) ? 1 : 0,
+          ]
         : null,
-    `INSERT OR IGNORE INTO temp.stage_en (usi, licensee_name, licensee_city, licensee_state, frn, applicant_type)
-     VALUES (?, ?, ?, ?, ?, ?)`,
+    `INSERT OR IGNORE INTO temp.stage_en (usi, licensee_name, licensee_city, licensee_state, frn,
+       applicant_type, name_parts, organization_word)
+     VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
   );
   await stageType(
     pass,
@@ -1093,6 +1124,11 @@ async function stageTechnical(
 /**
  * Insert the staged HD/EN/AM/MK rows of every USI in `temp.apply` into `licenses`, and
  * their LL rows into `lease_links`; register their service codes. Returns licenses inserted.
+ *
+ * A licensee is individual when its applicant type is `I`; when the type is blank under a
+ * service in {@link INDIVIDUAL_BY_DEFAULT_SERVICES}; or when the type is blank or `H` (Other)
+ * and the entity files any person-name part or its name holds no organization word
+ * (`organization-names.ts`). Only the resulting flag is stored.
  */
 function insertRecords(db: SqliteHandle): number {
   db.prepare(
@@ -1108,6 +1144,8 @@ function insertRecords(db: SqliteHandle): number {
          mk.market_code, mk.channel_block, mk.market_name, mk.market_states, a.service_group,
          CASE WHEN e.applicant_type = 'I'
                 OR (e.applicant_type IS NULL AND h.radio_service_code IN (${INDIVIDUAL_SQL}))
+                OR (COALESCE(e.applicant_type, 'H') = 'H'
+                    AND (e.name_parts = 1 OR e.organization_word = 0))
               THEN 1 ELSE 0 END,
          h.is_lease
        FROM temp.stage_hd h
@@ -1138,7 +1176,9 @@ function insertRecords(db: SqliteHandle): number {
 /**
  * Insert staged technical rows. Frequencies take their emissions (distinct, comma-joined)
  * and widest necessary bandwidth from EM rows joined on `(usi, location, antenna,
- * freq_seq_id)`, and the occupied band `[f − bw/2, (upper ?? f) + bw/2]`. A bandwidth of
+ * freq_seq_id)`, and the occupied band `[f − bw/2, max(upper, f) + bw/2]`: an upper edge
+ * filed below its frequency is ignored, so that row occupies its assigned frequency alone
+ * (the stored `upper_mhz` keeps the filed value). A bandwidth of
  * {@link MAX_FRACTIONAL_BANDWIDTH} × f or more is a filing error and counts as none.
  * Frequencies and market blocks take the {@link bandClassSql band class} of their width. EM
  * rows with no FR partner are dropped and counted in `stats.EM.orphaned`. Sites a license
@@ -1167,7 +1207,8 @@ function insertTechnical(db: SqliteHandle, stats: RecordStats): void {
            f.transmitter_make, f.transmitter_model, group_concat(DISTINCT e.emission_code),
            ${bandwidth},
            f.frequency_mhz - COALESCE(${bandwidth}, 0) / 2.0 AS occ_low,
-           COALESCE(f.upper_mhz, f.frequency_mhz) + COALESCE(${bandwidth}, 0) / 2.0 AS occ_high
+           CASE WHEN f.upper_mhz > f.frequency_mhz THEN f.upper_mhz ELSE f.frequency_mhz END
+             + COALESCE(${bandwidth}, 0) / 2.0 AS occ_high
          FROM temp.stage_fr f
          LEFT JOIN temp.stage_em e ON e.usi = f.usi AND e.location_number = f.location_number
            AND e.antenna_number = f.antenna_number AND e.freq_seq_id = f.freq_seq_id

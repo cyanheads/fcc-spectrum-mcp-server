@@ -12,7 +12,7 @@ import { rename, rm } from 'node:fs/promises';
 import { Readable, Transform, type TransformCallback } from 'node:stream';
 import { pipeline } from 'node:stream/promises';
 import { config } from '@cyanheads/mcp-ts-core/config';
-import { notFound, serviceUnavailable } from '@cyanheads/mcp-ts-core/errors';
+import { notFound, serializationError, serviceUnavailable } from '@cyanheads/mcp-ts-core/errors';
 import {
   createPacer,
   httpErrorFromResponse,
@@ -28,6 +28,13 @@ export const WEEKLY_DOWNLOAD_DEADLINE_MS = 20 * 60_000;
 /** Total budget for one daily zip download, a HEAD, or the listing, retries included. */
 export const DAILY_REQUEST_DEADLINE_MS = 60_000;
 
+/**
+ * Most bytes one download may carry, about five times the largest weekly zip. A larger
+ * `Content-Length` is refused before the body is read, and a body that passes it is cut
+ * off; neither is retried.
+ */
+export const MAX_DOWNLOAD_BYTES = 2 * 1024 ** 3;
+
 const RETRY_BASE_DELAY_MS = 2000;
 const MAX_RETRIES = 3;
 const ZIP_MAGIC = Buffer.from([0x50, 0x4b, 0x03, 0x04]);
@@ -42,11 +49,13 @@ export function dailyZipPath(fileName: string): string {
   return `daily/${fileName}`;
 }
 
-/** Constructor options. `fetch` and `now` are the test seams. */
+/** Constructor options. `fetch`, `now`, and `maxDownloadBytes` are the test seams. */
 export interface UlsBulkClientOptions {
   /** Bulk host root, no trailing slash (`https://data.fcc.gov/download/pub/uls`). */
   baseUrl: string;
   fetch?: typeof globalThis.fetch;
+  /** Download size ceiling; defaults to {@link MAX_DOWNLOAD_BYTES}. */
+  maxDownloadBytes?: number;
   now?: () => number;
   /** Server version for the User-Agent; defaults to the application's package version. */
   version?: string;
@@ -75,6 +84,7 @@ export interface UlsDownload extends UlsRemoteFile {
 export class UlsBulkClient {
   private readonly baseUrl: string;
   private readonly fetchFn: typeof globalThis.fetch;
+  private readonly maxDownloadBytes: number;
   private readonly now: () => number;
   private readonly userAgent: string;
   private readonly pacer: Pacer;
@@ -82,6 +92,7 @@ export class UlsBulkClient {
   constructor(options: UlsBulkClientOptions) {
     this.baseUrl = options.baseUrl.replace(/\/+$/, '');
     this.fetchFn = options.fetch ?? globalThis.fetch;
+    this.maxDownloadBytes = options.maxDownloadBytes ?? MAX_DOWNLOAD_BYTES;
     this.now = options.now ?? Date.now;
     this.userAgent = `fcc-spectrum-mcp-server/${options.version ?? config.mcpServerVersion}`;
     this.pacer = createPacer({
@@ -120,7 +131,8 @@ export class UlsBulkClient {
    * Stream a zip to `destination`, writing through `<destination>.part` and renaming on
    * success so a partial file is never left under the final name. A body that is not a
    * zip (an HTML error page served as 200) or is shorter than its `Content-Length` is a
-   * transient `ServiceUnavailable`, retried like a 5xx. A missing file is `NotFound`.
+   * transient `ServiceUnavailable`, retried like a 5xx. A missing file is `NotFound`. A
+   * file larger than the size ceiling is a `SerializationError`, not retried.
    */
   download(path: string, destination: string, signal?: AbortSignal): Promise<UlsDownload> {
     const deadlineMs = path.startsWith('complete/')
@@ -132,9 +144,13 @@ export class UlsBulkClient {
         throw notFound(`The ULS bulk host has no file at ${path}.`, { path });
       }
       const remote = this.remoteFile(path, response);
+      if (remote.sizeBytes !== undefined && remote.sizeBytes > this.maxDownloadBytes) {
+        await response.body?.cancel();
+        throw tooLarge(path, this.maxDownloadBytes);
+      }
       if (!response.body) throw serviceUnavailable(`Empty response body for ${path}.`, { path });
       const partial = `${destination}.part`;
-      const guard = new ZipBodyGuard(path);
+      const guard = new ZipBodyGuard(path, this.maxDownloadBytes);
       try {
         await pipeline(Readable.fromWeb(response.body), guard, createWriteStream(partial), {
           signal: attempt.signal,
@@ -227,15 +243,26 @@ export class UlsBulkClient {
   }
 }
 
+function tooLarge(path: string, maxBytes: number): Error {
+  return serializationError(
+    `The ULS bulk host sent more than ${maxBytes} bytes for ${path}; no ULS file is that large.`,
+    { path, maxBytes },
+  );
+}
+
 /**
  * Pass-through that counts bytes and fails the stream when the first four bytes are not
- * a ZIP local-file header — the host's error pages arrive as `200 text/html`.
+ * a ZIP local-file header — the host's error pages arrive as `200 text/html` — or when
+ * the body passes the size ceiling.
  */
 class ZipBodyGuard extends Transform {
   bytes = 0;
   private head = Buffer.alloc(0);
 
-  constructor(private readonly path: string) {
+  constructor(
+    private readonly path: string,
+    private readonly maxBytes: number,
+  ) {
     super();
   }
 
@@ -248,6 +275,10 @@ class ZipBodyGuard extends Transform {
       }
     }
     this.bytes += chunk.length;
+    if (this.bytes > this.maxBytes) {
+      callback(tooLarge(this.path, this.maxBytes));
+      return;
+    }
     callback(null, chunk);
   }
 

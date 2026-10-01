@@ -6,12 +6,15 @@
  */
 
 import { spawnSync } from 'node:child_process';
-import { mkdtemp, readdir, readFile, rm, writeFile } from 'node:fs/promises';
+import { existsSync } from 'node:fs';
+import { mkdtemp, readdir, readFile, rm, utimes, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { JsonRpcErrorCode, McpError, serializationError } from '@cyanheads/mcp-ts-core/errors';
 import { afterEach, beforeEach, describe, expect, it } from 'vitest';
+import { toIsoSeconds } from '@/services/uls/dat.js';
 import {
+  acquireIngestLock,
   bandClassBounds,
   bandClassSql,
   clearInheritedLock,
@@ -26,10 +29,22 @@ import {
   LICENSE_COLUMNS,
   LOCK_FILE,
   POINTER_FILE,
+  RECLAIM_FILE,
   readIngestLock,
   readPointer,
+  releaseIngestLock,
   writePointer,
 } from '@/services/uls/schema.js';
+
+/** A well-formed generation file name. */
+const GENERATION = 'fcc-uls-20260927T133853Z.db';
+
+/** A PID that belonged to a process that has already exited. */
+function deadPid(): number {
+  const pid = spawnSync(process.execPath, ['-e', ''], { stdio: 'ignore' }).pid;
+  if (!pid) throw new Error('Could not spawn a short-lived process.');
+  return pid;
+}
 
 let dir: string;
 
@@ -71,6 +86,18 @@ describe('generationFileName, generationStamp, and isGenerationFile', () => {
     expect(isGenerationFile('ingest.lock')).toBe(false);
     expect(isGenerationFile('other-20260927.db')).toBe(false);
     expect(isGenerationFile('')).toBe(false);
+  });
+
+  it.each([
+    'fcc-uls-/../../elsewhere/victim.db',
+    'fcc-uls-20260927T133853Z/../victim.db',
+    'fcc-uls-20260927T133853Z-2/x.db',
+    'fcc-uls-20260927T133853Z-x.db',
+    'fcc-uls-20260927T1338Z.db',
+    'fcc-uls-20260927T133853.db',
+    'fcc-uls-x.db',
+  ])('rejects %s, which no generation is named', (name) => {
+    expect(isGenerationFile(name)).toBe(false);
   });
 
   it('accepts what generationFileName produces', () => {
@@ -149,22 +176,30 @@ describe('readPointer', () => {
   it('ignores extra fields', async () => {
     await writeFile(
       join(dir, POINTER_FILE),
-      JSON.stringify({ file: 'fcc-uls-1.db', publishedAt: 'now', extra: true }),
+      JSON.stringify({ file: GENERATION, publishedAt: 'now', extra: true }),
     );
-    expect(await readPointer(dir)).toEqual({ file: 'fcc-uls-1.db', publishedAt: 'now' });
+    expect(await readPointer(dir)).toEqual({ file: GENERATION, publishedAt: 'now' });
   });
 
   it.each([
-    ['invalid JSON', '{"file": "fcc-uls-1.db"'],
+    ['invalid JSON', `{"file": "${GENERATION}"`],
     ['an empty file', ''],
     ['a JSON array', '[]'],
     ['null', 'null'],
-    ['a missing publishedAt', JSON.stringify({ file: 'fcc-uls-1.db' })],
+    ['a missing publishedAt', JSON.stringify({ file: GENERATION })],
     ['a missing file', JSON.stringify({ publishedAt: 'now' })],
     ['a non-string file', JSON.stringify({ file: 7, publishedAt: 'now' })],
     ['a non-generation file name', JSON.stringify({ file: 'evil.db', publishedAt: 'now' })],
-    ['a WAL sidecar name', JSON.stringify({ file: 'fcc-uls-1.db-wal', publishedAt: 'now' })],
-    ['a non-string publishedAt', JSON.stringify({ file: 'fcc-uls-1.db', publishedAt: 5 })],
+    ['a WAL sidecar name', JSON.stringify({ file: `${GENERATION}-wal`, publishedAt: 'now' })],
+    [
+      'a path leaving the mirror directory',
+      JSON.stringify({ file: 'fcc-uls-/../../elsewhere/victim.db', publishedAt: 'now' }),
+    ],
+    [
+      'a generation name inside a subdirectory',
+      JSON.stringify({ file: `sub/${GENERATION}`, publishedAt: 'now' }),
+    ],
+    ['a non-string publishedAt', JSON.stringify({ file: GENERATION, publishedAt: 5 })],
   ])('throws a path-free malformed_pointer SerializationError for %s', async (_label, body) => {
     await writeFile(join(dir, POINTER_FILE), body);
     const error = await readPointer(dir).catch((err: unknown) => err);
@@ -195,9 +230,10 @@ describe('writePointer', () => {
   });
 
   it('replaces an existing pointer', async () => {
-    await writePointer(dir, { file: 'fcc-uls-1.db', publishedAt: 'first' });
-    await writePointer(dir, { file: 'fcc-uls-2.db', publishedAt: 'second' });
-    expect(await readPointer(dir)).toEqual({ file: 'fcc-uls-2.db', publishedAt: 'second' });
+    const second = generationFileName('20260927T133853Z', '2');
+    await writePointer(dir, { file: GENERATION, publishedAt: 'first' });
+    await writePointer(dir, { file: second, publishedAt: 'second' });
+    expect(await readPointer(dir)).toEqual({ file: second, publishedAt: 'second' });
     expect(await readdir(dir)).toEqual([POINTER_FILE]);
   });
 });
@@ -245,11 +281,22 @@ describe('readIngestLock', () => {
 });
 
 describe('clearInheritedLock', () => {
-  it('removes a lock naming this process and returns its holder', async () => {
+  it('removes a lock naming this process, taken before it started, and returns its holder', async () => {
     const holder = { pid: process.pid, mode: 'init', startedAt: '2026-09-29T19:00:00Z' };
     await writeFile(join(dir, LOCK_FILE), JSON.stringify(holder));
     expect(await clearInheritedLock(dir)).toEqual(holder);
     expect(await readdir(dir)).toEqual([]);
+  });
+
+  it.each([
+    ['taken after this process started', () => toIsoSeconds(Date.now())],
+    ['taken in the second this process started', () => toIsoSeconds(performance.timeOrigin)],
+    ['with no start time', () => ''],
+  ])('leaves a lock naming this process %s', async (_label, startedAt) => {
+    const body = JSON.stringify({ pid: process.pid, mode: 'init', startedAt: startedAt() });
+    await writeFile(join(dir, LOCK_FILE), body);
+    expect(await clearInheritedLock(dir)).toBeUndefined();
+    expect(await readFile(join(dir, LOCK_FILE), 'utf8')).toBe(body);
   });
 
   it('leaves a lock naming any other process', async () => {
@@ -278,6 +325,106 @@ describe('isProcessAlive', () => {
 
   it('is false for NaN, the value a truncated lock file yields', () => {
     expect(isProcessAlive(Number.NaN)).toBe(false);
+  });
+
+  it.each([0, -1, -4242, 1.5])('is false for %s, which names no single process', (pid) => {
+    expect(isProcessAlive(pid)).toBe(false);
+  });
+
+  it('treats PID 1 as alive: a server running as a container init holds locks under it', () => {
+    expect(isProcessAlive(1)).toBe(true);
+  });
+});
+
+describe('acquireIngestLock and releaseIngestLock', () => {
+  const lockPath = () => join(dir, LOCK_FILE);
+  const holder = (mode: string, pid = process.pid) => ({
+    pid,
+    mode,
+    startedAt: '2026-09-29T20:00:00Z',
+  });
+  const deadLock = () => JSON.stringify({ pid: deadPid(), mode: 'init', startedAt: '' });
+
+  it('takes a free lock and releases it', async () => {
+    const mine = holder('init');
+    expect(await acquireIngestLock(dir, mine)).toEqual({ taken: true });
+    expect(JSON.parse(await readFile(lockPath(), 'utf8'))).toEqual(mine);
+    await releaseIngestLock(dir, mine);
+    expect(await readdir(dir)).toEqual([]);
+  });
+
+  it('reports a live holder and leaves its lock', async () => {
+    const body = JSON.stringify(holder('refresh'));
+    await writeFile(lockPath(), body);
+    expect(await acquireIngestLock(dir, holder('init'))).toEqual({
+      taken: false,
+      holder: holder('refresh'),
+    });
+    expect(await readFile(lockPath(), 'utf8')).toBe(body);
+  });
+
+  it.each([
+    ['a dead PID', deadLock],
+    ['a truncated lock file', () => '{"pid": 12'],
+    ['PID 0', () => JSON.stringify({ pid: 0, mode: 'init', startedAt: '' })],
+    ['a negative PID', () => JSON.stringify({ pid: -1, mode: 'init', startedAt: '' })],
+  ])('reclaims a lock left with %s, reporting what it replaced', async (_label, body) => {
+    const stale = body();
+    await writeFile(lockPath(), stale);
+    const mine = holder('init');
+    const attempt = await acquireIngestLock(dir, mine);
+    expect(attempt).toMatchObject({ taken: true, reclaimed: expect.any(Object) });
+    expect(JSON.parse(await readFile(lockPath(), 'utf8'))).toEqual(mine);
+    expect((await readdir(dir)).sort()).toEqual([LOCK_FILE]);
+  });
+
+  it('lets exactly one of several concurrent reclaimers take a dead lock', async () => {
+    for (let round = 0; round < 40; round++) {
+      await writeFile(lockPath(), deadLock());
+      const contenders = Array.from({ length: 4 }, (_, i) => holder(`contender-${round}-${i}`));
+      const attempts = await Promise.all(contenders.map((h) => acquireIngestLock(dir, h)));
+      const winners = contenders.filter((_, i) => attempts[i]?.taken);
+      expect(winners, `round ${round}`).toHaveLength(1);
+      expect(JSON.parse(await readFile(lockPath(), 'utf8'))).toEqual(winners[0]);
+      expect((await readdir(dir)).sort()).toEqual([LOCK_FILE]);
+      await rm(lockPath());
+    }
+  });
+
+  it('leaves a dead lock alone while another reclaim holds the claim, reporting the claimant', async () => {
+    const stale = deadLock();
+    await writeFile(lockPath(), stale);
+    const claimant = JSON.stringify(holder('refresh'));
+    await writeFile(join(dir, RECLAIM_FILE), claimant);
+    expect(await acquireIngestLock(dir, holder('init'))).toEqual({
+      taken: false,
+      holder: holder('refresh'),
+    });
+    expect(await readFile(lockPath(), 'utf8')).toBe(stale);
+    expect(await readFile(join(dir, RECLAIM_FILE), 'utf8')).toBe(claimant);
+  });
+
+  it('clears a claim left by a reclaim that died mid-step, then takes the lock on the next call', async () => {
+    await writeFile(lockPath(), deadLock());
+    const claim = join(dir, RECLAIM_FILE);
+    await writeFile(claim, JSON.stringify(holder('refresh', deadPid())));
+    const longAgo = new Date(Date.now() - 10 * 60_000);
+    await utimes(claim, longAgo, longAgo);
+    expect(await acquireIngestLock(dir, holder('init'))).toMatchObject({ taken: false });
+    expect(existsSync(claim)).toBe(false);
+    expect(await acquireIngestLock(dir, holder('init'))).toMatchObject({ taken: true });
+  });
+
+  it('releases only its own lock', async () => {
+    const other = JSON.stringify(holder('refresh'));
+    await writeFile(lockPath(), other);
+    await releaseIngestLock(dir, holder('init'));
+    expect(await readFile(lockPath(), 'utf8')).toBe(other);
+  });
+
+  it('releases nothing when the lock is already gone', async () => {
+    await releaseIngestLock(dir, holder('init'));
+    expect(await readdir(dir)).toEqual([]);
   });
 });
 

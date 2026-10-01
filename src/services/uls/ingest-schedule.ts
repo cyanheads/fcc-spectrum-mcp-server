@@ -155,9 +155,12 @@ async function refresh(state: ScheduleState, context: RequestContext): Promise<v
       withExtra(context, { generation: outcome.generation, applied: outcome.applied.length }),
     );
   } catch (err) {
-    if (reasonOf(err) !== 'stale_checkpoint') throw err;
+    const reason = reasonOf(err);
+    if (reason !== 'stale_checkpoint' && reason !== 'rebuild_required') throw err;
     logger.notice(
-      'The index checkpoint is older than the daily window; running the weekly rebuild instead.',
+      reason === 'stale_checkpoint'
+        ? 'The index checkpoint is older than the daily window; running the weekly rebuild instead.'
+        : 'The published index was built by an earlier version of this server; running the weekly rebuild instead.',
       context,
     );
     await rebuild(state, context);

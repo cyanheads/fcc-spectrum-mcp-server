@@ -1,6 +1,7 @@
 /**
- * @fileoverview Tests for the `format()` helpers: CR/LF flattening for inline slots, table
- * cell escaping, callsign and licensee display text, the state-source suffix, band text,
+ * @fileoverview Tests for the `format()` helpers: CR/LF flattening and link, image, and HTML
+ * escaping for inline slots, table cell escaping, callsign and licensee display text, the
+ * state-source suffix, band text,
  * the applied-filters line, and option lists.
  * @module tests/tools/format-helpers.test
  */
@@ -27,6 +28,25 @@ describe('inline', () => {
   ])('flattens %s to one space', (_label, input, expected) => {
     expect(inline(input)).toBe(expected);
   });
+
+  it.each([
+    ['a link', '[Acme](https://x.test)', '\\[Acme\\](https://x.test)'],
+    ['an image', '![x](https://x.test/p.png)', '!\\[x\\](https://x.test/p.png)'],
+    ['a reference link', '[Acme][1]', '\\[Acme\\]\\[1\\]'],
+    ['an HTML tag', '<img src=x onerror=y>', '\\<img src=x onerror=y\\>'],
+    ['an autolink', '<https://x.test>', '\\<https://x.test\\>'],
+  ])('makes %s inert', (_label, input, expected) => {
+    expect(inline(input)).toBe(expected);
+  });
+
+  it('escapes the backslashes before a bracket, so a filed backslash cannot cancel the escape', () => {
+    expect(inline('\\[Acme](https://x.test)')).toBe('\\\\\\[Acme\\](https://x.test)');
+    expect(inline('\\\\<b>')).toBe('\\\\\\\\\\<b\\>');
+  });
+
+  it('leaves parentheses, exclamation marks, backticks, and other backslashes as filed', () => {
+    expect(inline('Acme (West) Radio! `HQ` C:\\dir')).toBe('Acme (West) Radio! `HQ` C:\\dir');
+  });
 });
 
 describe('cell', () => {
@@ -41,6 +61,12 @@ describe('cell', () => {
 
   it('flattens CR/LF as well', () => {
     expect(cell('Make\r\nModel | X')).toBe('Make Model \\| X');
+  });
+
+  it('makes link, image, and HTML syntax inert', () => {
+    expect(cell('![x](https://x.test)')).toBe('!\\[x\\](https://x.test)');
+    expect(cell('<b>Acme</b>')).toBe('\\<b\\>Acme\\</b\\>');
+    expect(cell('\\[Acme](y)')).toBe('\\\\\\[Acme\\](y)');
   });
 });
 

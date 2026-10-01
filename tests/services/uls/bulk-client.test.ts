@@ -17,6 +17,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import {
   DAILY_REQUEST_DEADLINE_MS,
   dailyZipPath,
+  MAX_DOWNLOAD_BYTES,
   UlsBulkClient,
   WEEKLY_DOWNLOAD_DEADLINE_MS,
   weeklyZipPath,
@@ -63,12 +64,17 @@ const status =
 const redirect = () => () =>
   new Response(null, { status: 302, headers: { location: 'https://uls.example.test/forbidden' } });
 
-function makeClient(overrides: { fetch?: typeof globalThis.fetch } = {}): UlsBulkClient {
+function makeClient(
+  overrides: { fetch?: typeof globalThis.fetch; maxDownloadBytes?: number } = {},
+): UlsBulkClient {
   client = new UlsBulkClient({
     baseUrl: BASE,
     fetch: overrides.fetch ?? http.fetch,
     now: () => NOW,
     version: '9.9.9',
+    ...(overrides.maxDownloadBytes !== undefined && {
+      maxDownloadBytes: overrides.maxDownloadBytes,
+    }),
   });
   return client;
 }
@@ -346,6 +352,58 @@ describe('download', () => {
     });
     expect(http.calls).toHaveLength(1);
     expect(await readdir(dir)).toEqual([]);
+  });
+
+  describe('size ceiling', () => {
+    it('refuses a Content-Length past the ceiling before reading the body, without retrying', async () => {
+      http.route({
+        match: `${BASE}/complete/l_paging.zip`,
+        respond: zipResponse(ZIP, { 'content-length': String(MAX_DOWNLOAD_BYTES + 1) }),
+      });
+      const error = await driveRejection(
+        makeClient().download('complete/l_paging.zip', join(dir, 'p.zip')),
+      );
+      expect(error).toMatchObject({
+        code: JsonRpcErrorCode.SerializationError,
+        message: expect.stringContaining(`more than ${MAX_DOWNLOAD_BYTES} bytes`),
+        data: { path: 'complete/l_paging.zip', maxBytes: MAX_DOWNLOAD_BYTES },
+      });
+      expect(http.calls).toHaveLength(1);
+      expect(await readdir(dir)).toEqual([]);
+    });
+
+    it('stops a body with no Content-Length once it passes the ceiling, without retrying', async () => {
+      http.route({
+        match: `${BASE}/daily/l_pg_mon.zip`,
+        respond: () => new Response(ZIP, { headers: { 'last-modified': LAST_MODIFIED } }),
+      });
+      const error = await driveRejection(
+        makeClient({ maxDownloadBytes: ZIP.length - 1 }).download(
+          'daily/l_pg_mon.zip',
+          join(dir, 'd.zip'),
+        ),
+      );
+      expect(error).toMatchObject({
+        code: JsonRpcErrorCode.SerializationError,
+        data: { path: 'daily/l_pg_mon.zip', maxBytes: ZIP.length - 1 },
+      });
+      expect(http.calls).toHaveLength(1);
+      expect(await readdir(dir)).toEqual([]);
+    });
+
+    it('accepts a body of exactly the ceiling', async () => {
+      http.route({
+        match: `${BASE}/daily/l_pg_mon.zip`,
+        respond: () => new Response(ZIP, { headers: { 'last-modified': LAST_MODIFIED } }),
+      });
+      const download = await drive(
+        makeClient({ maxDownloadBytes: ZIP.length }).download(
+          'daily/l_pg_mon.zip',
+          join(dir, 'd.zip'),
+        ),
+      );
+      expect(download.sizeBytes).toBe(ZIP.length);
+    });
   });
 });
 

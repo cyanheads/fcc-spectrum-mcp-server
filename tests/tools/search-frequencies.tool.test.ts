@@ -39,7 +39,7 @@ import {
 
 type Output = Parameters<NonNullable<typeof searchFrequencies.format>>[0];
 type Assignment = Output['assignments'][number];
-type Page = Output & PageEnrichment;
+type Page = Output & PageEnrichment & { totalIsLowerBound?: boolean };
 
 const DATA_AS_OF = '2026-09-27T13:44:10Z';
 
@@ -62,8 +62,13 @@ const STATE_IN_MARKET_NAMES =
   'State filtering on market licenses reads the state codes in the market name; markets with no state in their name are skipped.';
 const NAME_SEARCH_EXCLUDES_INDIVIDUALS =
   'Individual licensees are excluded from name search while redaction is on; search without licensee to see them.';
-const NEXT_PAGE = (shown: number, total: number) =>
+const NEXT_PAGE = (shown: number, total: number | string) =>
   `Showing ${shown} of ${total} rows; pass nextCursor as cursor with the same inputs for the next page.`;
+const STOPPED_PARTWAY =
+  'The scan stopped partway through the band to keep the call short; pass nextCursor as cursor with the same inputs to continue it.';
+
+/** The whole spectrum the tool accepts, in MHz. */
+const SPECTRUM = { frequency_low: 0.001, frequency_high: 300_000 };
 
 const run = (input: Record<string, unknown>) => runToolContract(searchFrequencies, input as never);
 const page = (result: ContractResult) => successOf<Page>(result);
@@ -396,6 +401,69 @@ describe('warm index', () => {
       expect(three.notice).toBeUndefined();
       expect(rowIds([...one.assignments, ...two.assignments, ...three.assignments])).toEqual(
         BRS_ORDER,
+      );
+    });
+  });
+
+  describe('band walk', () => {
+    it('says the scan stopped partway on a short page with a cursor, never that nothing matched', async () => {
+      await useIndex(fixture.mirrorDir, {
+        frequencySearch: { exactCap: 1, walkBudget: 2, windowTarget: 1 },
+      });
+      const input = { ...SPECTRUM, kind: 'site', licensee: 'sample broadband' };
+      const first = await run(input);
+      const one = page(first);
+      expect(one).toMatchObject({
+        assignments: [],
+        totalCount: 0,
+        totalIsLowerBound: true,
+        truncated: true,
+        shown: 0,
+        notice: `${NAME_SEARCH_EXCLUDES_INDIVIDUALS} ${STOPPED_PARTWAY}`,
+      });
+      expect(one.nextCursor).toBeDefined();
+      expect(contractText(first)).not.toContain('No authorization');
+
+      const rows: Assignment[] = [];
+      let cursor = one.nextCursor;
+      for (let calls = 0; cursor && calls < 100; calls++) {
+        const next = page(await run({ ...input, cursor }));
+        rows.push(...next.assignments);
+        cursor = next.nextCursor;
+      }
+      expect(cursor).toBeUndefined();
+      expect(rowIds(rows)).toEqual(['s2001:1@2500', 's2001:2@2512']);
+    });
+
+    it('says "at least" on both surfaces when the total is a lower bound', async () => {
+      await useIndex(fixture.mirrorDir, {
+        frequencySearch: { exactCap: 1, walkBudget: 1_000, windowTarget: 1 },
+      });
+      const result = await run({
+        frequency_low: 150,
+        frequency_high: 174,
+        status: 'any',
+        limit: 1,
+      });
+      const structured = page(result);
+      expect(structured).toMatchObject({ totalIsLowerBound: true, truncated: true, shown: 1 });
+      expect(structured.nextCursor).toBeDefined();
+      const atLeast = NEXT_PAGE(1, `at least ${structured.totalCount}`);
+      expect(structured.notice).toBe(atLeast);
+      const rendered = contractText(result);
+      expect(rendered).toContain(`> ${atLeast}`);
+      expect(rendered).toContain('**Total is a lower bound:** true');
+    });
+
+    it('keeps the zero-hit notice for an exact zero', async () => {
+      await useIndex(fixture.mirrorDir, {
+        frequencySearch: { exactCap: 1, walkBudget: 2, windowTarget: 1 },
+      });
+      const result = page(await run({ frequency_low: 100 }));
+      expect(result.totalCount).toBe(0);
+      expect(result.totalIsLowerBound).toBeUndefined();
+      expect(result.notice).toBe(
+        `${ACTIVE_ONLY} No authorization overlaps 100 MHz under these filters; widen the band.`,
       );
     });
   });

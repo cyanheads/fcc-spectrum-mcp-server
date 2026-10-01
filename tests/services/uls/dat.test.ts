@@ -21,6 +21,7 @@ import {
   decodeMf,
   decodeMk,
   emissionBandwidthMhz,
+  MAX_LINE_LENGTH,
   numberField,
   parseCountsFile,
   parseUlsDate,
@@ -94,6 +95,45 @@ describe('readLines', () => {
 
   it('yields nothing for an empty source', async () => {
     await expect(collect(chunks())).resolves.toEqual([]);
+  });
+
+  describe('line length ceiling', () => {
+    const atMax = 'x'.repeat(MAX_LINE_LENGTH);
+    const tooLong = {
+      code: JsonRpcErrorCode.SerializationError,
+      message: `A line longer than ${MAX_LINE_LENGTH} characters is not a ULS record.`,
+      data: { maxLength: MAX_LINE_LENGTH },
+    };
+
+    it('accepts a line of exactly the ceiling, its CRLF split across chunks', async () => {
+      await expect(collect(chunks(`${atMax}\r`, '\nHD|2\n'))).resolves.toEqual([atMax, 'HD|2']);
+    });
+
+    it('rejects a longer line inside one chunk', async () => {
+      await expect(collect(chunks(`HD|1\n${atMax}x\nHD|3\n`))).rejects.toMatchObject(tooLong);
+    });
+
+    it('rejects a longer line split across chunks', async () => {
+      await expect(collect(chunks(atMax, 'xx\n'))).rejects.toMatchObject(tooLong);
+      await expect(collect(chunks(atMax, 'xx', '\n'))).rejects.toMatchObject(tooLong);
+    });
+
+    it('rejects a longer unterminated last line', async () => {
+      await expect(collect(chunks(`HD|1\n${atMax}x`))).rejects.toMatchObject(tooLong);
+    });
+
+    it('stops reading a source that never sends a newline', async () => {
+      let pulls = 0;
+      async function* endless(): AsyncGenerator<Uint8Array> {
+        const block = Buffer.alloc(4096, 'x');
+        while (true) {
+          pulls++;
+          yield block;
+        }
+      }
+      await expect(collect(endless())).rejects.toMatchObject(tooLong);
+      expect(pulls).toBeLessThanOrEqual(MAX_LINE_LENGTH / 4096 + 2);
+    });
   });
 });
 
@@ -265,11 +305,13 @@ describe('record decoders', () => {
     expect(decodeHd('HD|1|2')).toBeNull();
   });
 
-  it('decodes only the permitted EN fields', () => {
+  it('decodes only the permitted EN fields, keeping only whether name parts are filed', () => {
     const decoded = decodeEn(
       en({
         usi: 8,
         name: 'Example Co',
+        first: 'Privatefirst',
+        last: 'Privatelast',
         city: 'SEATTLE',
         state: 'WA',
         frn: '0001234567',
@@ -284,12 +326,30 @@ describe('record decoders', () => {
       usi: 8,
       entityType: 'L',
       entityName: 'Example Co',
+      hasNameParts: true,
       city: 'SEATTLE',
       state: 'WA',
       frn: '0001234567',
       applicantType: 'C',
     });
     expect(JSON.stringify(decoded)).not.toMatch(/Private|2065550100|example\.test|98101/);
+  });
+
+  it.each([
+    ['first name', { first: 'A' }],
+    ['middle initial', { mi: 'Q' }],
+    ['last name', { last: 'B' }],
+    ['suffix', { suffix: 'JR' }],
+  ])('reports name parts when only the %s is filed', (_label, parts) => {
+    expect(decodeEn(en({ usi: 9, name: 'X', ...parts }))?.hasNameParts).toBe(true);
+  });
+
+  it('reports no name parts when all four are blank or whitespace', () => {
+    expect(decodeEn(en({ usi: 9, name: 'X' }))?.hasNameParts).toBe(false);
+    expect(
+      decodeEn(en({ usi: 9, name: 'X', first: ' ', mi: ' ', last: ' ', suffix: ' ' }))
+        ?.hasNameParts,
+    ).toBe(false);
   });
 
   it('decodes AM and LL, requiring both LL USIs', () => {

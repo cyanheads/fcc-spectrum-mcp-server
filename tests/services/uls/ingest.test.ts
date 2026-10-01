@@ -36,6 +36,7 @@ import {
   DAILY_PG_TUE,
   DAILY_WIDE_MON,
   datFile,
+  en,
   FakeIngestClient,
   hd,
   lo,
@@ -503,6 +504,57 @@ describe('a status code filed in lower case', () => {
   });
 });
 
+describe('individual licensees with no applicant type, or type H', () => {
+  it('counts one as individual when it files name parts or its name has no organization word', async () => {
+    const mirror = await tempMirror();
+    const licensees: [usi: number, entry: Omit<Parameters<typeof en>[0], 'usi'>][] = [
+      [7101, { name: 'ALICE Q. EXAMPLE' }],
+      [7102, { name: 'NORTHWEST PAGING INC' }],
+      [7103, { name: 'SMITH TOWNSEND', applicantType: 'H' }],
+      [7104, { name: 'TOWN OF EXAMPLE', applicantType: 'H' }],
+      [7105, { name: 'DOE RADIO SERVICE', first: 'Janeprivate', last: 'Doe' }],
+      [7106, { name: 'PAT EXAMPLE', applicantType: 'C' }],
+      [7107, { name: 'CASEY EXAMPLE', applicantType: 'I' }],
+    ];
+    const client = new FakeIngestClient().set('complete/l_paging.zip', {
+      ...PAGING_WEEKLY,
+      zip: buildZip([
+        { name: 'counts', data: countsFile('Sun Sep 27 09:38:53 EDT 2026', { HD: 7, EN: 7 }) },
+        {
+          name: 'HD.dat',
+          data: datFile(
+            licensees.map(([usi]) =>
+              hd({ usi, callsign: `KZZ${usi}`, status: 'A', service: 'CD' }),
+            ),
+          ),
+        },
+        {
+          name: 'EN.dat',
+          data: datFile(licensees.map(([usi, entry]) => en({ usi, city: 'SEATTLE', ...entry }))),
+        },
+      ]),
+    });
+    const { generation } = await fixtureIngester(mirror, { client, groups: ['paging'] }).rebuild();
+    await readDb(join(mirror.mirrorDir, generation), (db) => {
+      const rows = all<{ usi: number; is_individual: number }>(
+        db,
+        'SELECT usi, is_individual FROM licenses ORDER BY usi',
+      );
+      expect(rows).toEqual([
+        { usi: 7101, is_individual: 1 },
+        { usi: 7102, is_individual: 0 },
+        { usi: 7103, is_individual: 1 },
+        { usi: 7104, is_individual: 0 },
+        { usi: 7105, is_individual: 1 },
+        { usi: 7106, is_individual: 0 },
+        { usi: 7107, is_individual: 1 },
+      ]);
+      const stored = JSON.stringify(all(db, 'SELECT * FROM licenses'));
+      expect(stored).not.toContain('Janeprivate');
+    });
+  });
+});
+
 describe('resume rule', () => {
   it('does not replay a step whose commit landed before the crash', async () => {
     const mirror = await tempMirror();
@@ -581,6 +633,40 @@ describe('resume rule', () => {
       expect(count(db, 'SELECT count(*) AS n FROM lease_links')).toBe(3);
       expect(count(db, 'SELECT count(*) AS n FROM locations')).toBe(3);
       expect(count(db, 'SELECT count(*) AS n FROM market_blocks')).toBe(6);
+    });
+  });
+
+  it('discards a partial build an earlier schema started instead of resuming it', async () => {
+    const mirror = await tempMirror();
+    const client = new FakeIngestClient().withWeekly(['mdsitfs']);
+    let opens = 0;
+    const openArchive = (path: string) => {
+      opens++;
+      if (opens === 3) return Promise.reject(new Error('Archive read failed.'));
+      return openZipArchive(path);
+    };
+    const info: unknown[][] = [];
+    const ingester = fixtureIngester(mirror, {
+      client,
+      groups: ['mdsitfs'],
+      openArchive,
+      logger: { info: (...args) => info.push(args) },
+    });
+    await expect(ingester.rebuild()).rejects.toThrow('Archive read failed.');
+    const name = 'fcc-uls-20260927T134047Z.db';
+    const target = join(mirror.mirrorDir, name);
+    await readDb(target, (db) => db.exec('UPDATE schema_version SET version = 3'));
+
+    const rerun = await ingester.rebuild();
+    expect(rerun).toMatchObject({ status: 'rebuilt', generation: name });
+    expect(client.downloads('complete/l_mdsitfs.zip')).toBe(2);
+    expect(info).toContainEqual([
+      'Discarding a generation an earlier version of this server started; building it afresh.',
+      { generation: name },
+    ]);
+    await readDb(target, (db) => {
+      expect(count(db, 'SELECT count(*) AS n FROM licenses')).toBe(8);
+      expect(count(db, "SELECT count(*) AS n FROM meta WHERE key = 'rebuild_required'")).toBe(0);
     });
   });
 });

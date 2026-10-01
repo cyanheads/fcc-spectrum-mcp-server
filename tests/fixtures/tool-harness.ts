@@ -9,7 +9,11 @@
 import type { runToolContract } from '@cyanheads/mcp-ts-core/testing';
 import { expect } from 'vitest';
 import type { ServiceGroup } from '@/services/uls/codes.js';
-import { initUlsIndexService, type UlsIndexService } from '@/services/uls/uls-index-service.js';
+import {
+  type FrequencySearchLimits,
+  initUlsIndexService,
+  type UlsIndexService,
+} from '@/services/uls/uls-index-service.js';
 import { FIXTURE_GROUPS } from './uls-index.js';
 
 /** What `runToolContract` resolves to. */
@@ -51,7 +55,11 @@ let current: UlsIndexService | undefined;
  */
 export async function useIndex(
   mirrorDir: string,
-  options: { redactIndividuals?: boolean; services?: readonly ServiceGroup[] } = {},
+  options: {
+    frequencySearch?: Partial<FrequencySearchLimits>;
+    redactIndividuals?: boolean;
+    services?: readonly ServiceGroup[];
+  } = {},
 ): Promise<UlsIndexService> {
   await current?.close();
   current = initUlsIndexService({
@@ -59,6 +67,7 @@ export async function useIndex(
     pointerCheckMs: 0,
     redactIndividuals: options.redactIndividuals ?? true,
     services: options.services ?? FIXTURE_GROUPS,
+    ...(options.frequencySearch && { frequencySearch: options.frequencySearch }),
   });
   return current;
 }

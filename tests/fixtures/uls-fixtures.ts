@@ -53,11 +53,18 @@ export function hd(v: {
   });
 }
 
-/** EN — entity; the private fields are set so tests can prove they are never ingested. */
+/**
+ * EN — entity; the private fields (name parts and contact details) are set so tests can
+ * prove they are never ingested.
+ */
 export function en(v: {
   usi: number;
   entityType?: string;
   name?: string;
+  first?: string;
+  mi?: string;
+  last?: string;
+  suffix?: string;
   city?: string;
   state?: string;
   frn?: string;
@@ -71,6 +78,10 @@ export function en(v: {
     2: v.usi,
     6: v.entityType ?? 'L',
     8: v.name,
+    9: v.first,
+    10: v.mi,
+    11: v.last,
+    12: v.suffix,
     13: v.phone,
     15: v.email,
     16: v.street,
@@ -1447,8 +1458,9 @@ export const QUIRKS_WEEKLY: FixtureFile = {
 /**
  * A paging-slot snapshot of occupied widths at and past the band-class ceilings, every record
  * active: KZZ601 (USI 6001, CD) files 100 MHz on a 62.5 kHz emission (exactly 2^-4 MHz wide),
- * 200 MHz on a 62.6 kHz one (just past it), 300 MHz with no emission (zero width), and 9000
- * MHz on a 1.6 GHz radar emission (8200–9800 MHz); KZZ602 (USI 6002, RS) a 1000–20000 MHz
+ * 200 MHz on a 62.6 kHz one (just past it), 300 MHz with no emission (zero width), 400 MHz
+ * with its upper edge filed below it at 350 MHz on a 16 kHz emission (an inverted range), and
+ * 9000 MHz on a 1.6 GHz radar emission (8200–9800 MHz); KZZ602 (USI 6002, RS) a 1000–20000 MHz
  * range, wider than the largest power-of-two class; KZZ603 (USI 6003, CW) a 700–700.5 MHz
  * market block (exactly 2^-1 MHz) and a 10000–20000 MHz one.
  */
@@ -1494,6 +1506,7 @@ export const BAND_CLASS_WEEKLY: FixtureFile = {
         ...[100, 200, 300, 9000].map((frequency, i) =>
           fr({ usi: 6001, location: 1, antenna: 1, seq: i + 1, frequency }),
         ),
+        fr({ usi: 6001, location: 1, antenna: 1, seq: 5, frequency: 400, upper: 350 }),
         fr({ usi: 6002, location: 1, antenna: 1, seq: 1, frequency: 1000, upper: 20000 }),
       ]),
     },
@@ -1503,6 +1516,7 @@ export const BAND_CLASS_WEEKLY: FixtureFile = {
         em({ usi: 6001, location: 1, antenna: 1, seq: 1, code: '62K5F3E' }),
         em({ usi: 6001, location: 1, antenna: 1, seq: 2, code: '62K6F3E' }),
         em({ usi: 6001, location: 1, antenna: 1, seq: 4, code: '1G60N0N' }),
+        em({ usi: 6001, location: 1, antenna: 1, seq: 5, code: '16K0F3E' }),
       ]),
     },
     {

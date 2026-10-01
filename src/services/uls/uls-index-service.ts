@@ -15,6 +15,7 @@ import { internalError, type McpError, serviceUnavailable } from '@cyanheads/mcp
 import type { MirrorStore, SqliteHandle, SqlValue } from '@cyanheads/mcp-ts-core/mirror';
 import { logger, requestContextService } from '@cyanheads/mcp-ts-core/utils';
 import {
+  codeLabel,
   LICENSE_STATUSES,
   LOCATION_TYPES,
   OPERATOR_CLASSES,
@@ -31,6 +32,7 @@ import {
   isGenerationFile,
   isMalformedPointer,
   isProcessAlive,
+  isRebuildRequired,
   LIVE_STATUSES,
   META_KEYS,
   POINTER_FILE,
@@ -62,8 +64,31 @@ import type {
   TransmitterSite,
 } from './types.js';
 
-/** Constructor options. `mirrorDir`, `pointerCheckMs`, and `now` are the test seams. */
+/**
+ * Per-call work limits of `searchFrequencies`, in index entries. A side (site assignments or
+ * market blocks) whose candidates fit `exactCap` is counted and paged exactly; a larger one is
+ * walked in result order and its total reported as a lower bound.
+ */
+export interface FrequencySearchLimits {
+  /** Most candidates, by the band index or a filter's own index, a side may have to be counted and paged exactly. */
+  exactCap: number;
+  /** Index entries a band walk may read on one side in one call before it stops and returns a cursor. */
+  walkBudget: number;
+  /** In-window entries the first window of a band walk aims for; each later window in the call aims four times higher, within half the budget left. */
+  windowTarget: number;
+}
+
+/** The limits a deployment runs with (worst cases measured in docs/design.md). */
+const FREQUENCY_SEARCH_LIMITS: FrequencySearchLimits = {
+  exactCap: 50_000,
+  walkBudget: 200_000,
+  windowTarget: 2_000,
+};
+
+/** Constructor options. `mirrorDir`, `pointerCheckMs`, `now`, and `frequencySearch` are the test seams. */
 export interface UlsIndexServiceOptions {
+  /** Work limits of `searchFrequencies`, over {@link FREQUENCY_SEARCH_LIMITS}. */
+  frequencySearch?: Partial<FrequencySearchLimits>;
   /** Directory holding generation files and `current.json`. */
   mirrorDir: string;
   now?: () => number;
@@ -92,6 +117,12 @@ export const LICENSE_PAGE = { sites: 50, antennas: 100, leases: 100 } as const;
 
 /** Callsign-prefix candidates offered on a miss. */
 const MAX_CANDIDATES = 5;
+
+/** Width a band walk tries for its first window, MHz; it grows fourfold or bisects from there. */
+const FIRST_WINDOW_MHZ = 0.01;
+
+/** Narrowest span a band walk bisects a window's end within, MHz (one hertz). */
+const MIN_WINDOW_MHZ = 0.000001;
 
 /** A published generation, opened. */
 interface OpenGeneration {
@@ -203,6 +234,102 @@ const LICENSE_HEAD_COLUMNS =
 
 type CursorKey = (string | number)[];
 
+/** A SQL condition and the values it binds. */
+interface Condition {
+  args: SqlValue[];
+  sql: string;
+}
+
+function condition(sql: string, ...args: SqlValue[]): Condition {
+  return { sql, args };
+}
+
+const whereSql = (conditions: readonly Condition[]) => conditions.map((c) => c.sql).join(' AND ');
+const whereArgs = (conditions: readonly Condition[]) => conditions.flatMap((c) => c.args);
+
+/**
+ * A license or site filter of `searchFrequencies`. `pinned` states it with each index column
+ * behind a unary `+`, so it never steers the plan; `drive`, when an index can serve the filter,
+ * states the same test so that index drives the query.
+ */
+interface FrequencyFilter {
+  drive?: Condition[];
+  pinned: Condition[];
+}
+
+/** A search_frequencies result row with its cursor key. */
+interface KeyedAssignment {
+  key: CursorKey;
+  row: FrequencyAssignment;
+}
+
+/**
+ * One side of `searchFrequencies` (site assignments or market blocks): the SQL that its exact
+ * search and its band walk share. Rows are read from `table alias joins`, grouped by `group`,
+ * and ordered by `order`, whose leading column is `key`.
+ */
+interface AssignmentSide<Row> {
+  alias: 'f' | 'mb';
+  /** Lower-edge column of the band index `(band_class, edge)`. */
+  edge: 'occ_low' | 'lower';
+  /** License and site filters. */
+  filters: FrequencyFilter[];
+  group: string;
+  joins: string;
+  /** Result-order key column. */
+  key: string;
+  /** The full cursor key as a row value. */
+  keyTuple: string;
+  map: (row: Row) => KeyedAssignment;
+  order: string;
+  overlap: { high: number; low: number };
+  /** Farthest a row's key can sit above its indexed edge, in a band class of this bound. */
+  reach: (bound: number) => number;
+  select: string;
+  table: 'frequencies' | 'market_blocks';
+  /** The overlap test and the side's own row conditions, the edge column pinned. */
+  where: Condition[];
+  /** The table's widest stored band, MHz. */
+  widest: number;
+}
+
+/** One side's share of a search_frequencies page. */
+interface SidePage {
+  lowerBound: boolean;
+  rows: KeyedAssignment[];
+  /** Key through which `rows` holds every match past the cursor; absent when it holds them all. */
+  through?: CursorKey;
+  total: number;
+}
+
+type SiteAssignmentRow = LicenseHeadRow & {
+  bandwidth: number | null;
+  classes: string | null;
+  county: string | null;
+  emissions: string | null;
+  frequency: number;
+  lat: number | null;
+  location_number: number;
+  lon: number | null;
+  max_erp: number | null;
+  site_state: string | null;
+  sites: number;
+  state_derived: number | null;
+  upper: number | null;
+};
+
+type MarketBlockRow = LicenseHeadRow & {
+  channel_block: string | null;
+  lower: number;
+  market_code: string | null;
+  market_name: string | null;
+  partitions: string | null;
+  upper: number | null;
+};
+
+/** Licenses whose licensee name matches an FTS query ({@link ftsQuery}). */
+const LICENSEE_MATCH_SQL = 'l.usi IN (SELECT rowid FROM licenses_fts WHERE licenses_fts MATCH ?)';
+
 /** Omit a field whose value is null or undefined; with `exactOptionalPropertyTypes` a field is present or absent. */
 function opt<K extends string, V>(key: K, value: V | null | undefined): { [P in K]?: V } {
   return (value === null || value === undefined ? {} : { [key]: value }) as { [P in K]?: V };
@@ -210,12 +337,12 @@ function opt<K extends string, V>(key: K, value: V | null | undefined): { [P in 
 
 /** FCC label for a radio service code, falling back to the code itself. */
 export function radioServiceLabel(code: string): string {
-  return RADIO_SERVICES[code] ?? code;
+  return codeLabel(RADIO_SERVICES, code) ?? code;
 }
 
 /** FCC label for a license status code, falling back to the code itself. */
 function statusLabel(code: string): string {
-  return LICENSE_STATUSES[code] ?? code;
+  return codeLabel(LICENSE_STATUSES, code) ?? code;
 }
 
 /** SQL list of the statuses a live-status filter selects. */
@@ -413,7 +540,7 @@ function collapseFrequencies(
 function siteFields(lo: LocationRow, addressVisible: boolean): LicenseSite {
   return {
     ...opt('locationTypeCode', lo.location_type),
-    ...opt('locationTypeLabel', lo.location_type && LOCATION_TYPES[lo.location_type]),
+    ...opt('locationTypeLabel', lo.location_type && codeLabel(LOCATION_TYPES, lo.location_type)),
     ...opt('locationClassCode', lo.location_class),
     ...opt('latitude', lo.lat),
     ...opt('longitude', lo.lon),
@@ -440,8 +567,9 @@ export class UlsIndexService {
   private pointerMtime: number | undefined;
   private pendingCheck: Promise<OpenGeneration | undefined> | undefined;
   /**
-   * Why `current.json` serves no generation — it names a missing file, or does not parse —
-   * as caller-facing text free of filesystem paths; `undefined` otherwise.
+   * Why `current.json` serves no generation — it names a missing file, does not parse, or
+   * names a generation that must be rebuilt first — as caller-facing text free of filesystem
+   * paths; `undefined` otherwise.
    */
   private pointerProblem: string | undefined;
   private readonly mirrorDir: string;
@@ -451,6 +579,7 @@ export class UlsIndexService {
   readonly redactIndividuals: boolean;
   /** Service groups this deployment is configured to index. */
   readonly services: readonly ServiceGroup[];
+  private readonly frequencySearch: FrequencySearchLimits;
 
   constructor(options: UlsIndexServiceOptions) {
     this.mirrorDir = options.mirrorDir;
@@ -458,6 +587,7 @@ export class UlsIndexService {
     this.pointerCheckMs = options.pointerCheckMs ?? 60_000;
     this.redactIndividuals = options.redactIndividuals;
     this.services = options.services;
+    this.frequencySearch = { ...FREQUENCY_SEARCH_LIMITS, ...options.frequencySearch };
   }
 
   // --- Readiness and coverage -----------------------------------------------------------
@@ -948,7 +1078,10 @@ export class UlsIndexService {
       ...(hasAmateur && {
         amateur: {
           ...opt('operatorClass', row.operator_class),
-          ...opt('operatorClassLabel', row.operator_class && OPERATOR_CLASSES[row.operator_class]),
+          ...opt(
+            'operatorClassLabel',
+            row.operator_class && codeLabel(OPERATOR_CLASSES, row.operator_class),
+          ),
           ...opt('trusteeCallsign', row.trustee_callsign),
           ...(row.trustee_name !== null && { trusteeName: shown.trusteeName }),
           ...opt('previousCallsign', row.previous_callsign),
@@ -1217,16 +1350,17 @@ export class UlsIndexService {
    * Authorizations whose occupied band overlaps `band`: collapsed site assignments and
    * market blocks (collapsed across partition areas), merged in frequency order and
    * keyset-paginated on `(frequency, kind, usi, location_number or 0, upper edge ?? 0)`.
-   * Each band class is scanned from the query's low edge minus that class's widest band
-   * ({@link bandScan}), so a lookup reads only rows that can overlap it. A
-   * frequency filed against a location number several sites share is one row carrying
-   * `sitesSharingNumber` in place of a site's coordinates and place.
+   * Each side is searched exactly when an index reaches few enough candidates, and otherwise
+   * walked through the band in result order ({@link searchSide}). A walk can stop partway, so
+   * a page may hold fewer than `limit` rows and still carry a cursor, and its total may be a
+   * lower bound. A frequency filed against a location number several sites share is one row
+   * carrying `sitesSharingNumber` in place of a site's coordinates and place.
    */
   async searchFrequencies(
     params: SearchFrequenciesParams,
   ): Promise<PageResult<FrequencyAssignment>> {
     const { db, id } = await this.requireGeneration();
-    let after: CursorKey | undefined;
+    let after: number[] | undefined;
     if (params.cursor) {
       const key = decodeCursor(params.cursor, id, 'f', [
         'number',
@@ -1236,122 +1370,320 @@ export class UlsIndexService {
         'number',
       ]);
       if (!key) return { ok: false, reason: 'invalid_cursor' };
-      after = key as CursorKey;
+      after = key as number[];
     }
     const match = params.licensee === undefined ? undefined : ftsQuery(params.licensee);
     if (params.licensee !== undefined && !match) return { ok: true, rows: [], total: 0 };
 
-    const licenseWhere: string[] = [];
-    const licenseArgs: SqlValue[] = [];
     const statuses = liveStatuses(params.status);
-    licenseWhere.push(`l.license_status IN (${statuses.map(() => '?').join(', ')})`);
-    licenseArgs.push(...statuses);
+    const statusSql = `l.license_status IN (${statuses.map(() => '?').join(', ')})`;
+    const filters: FrequencyFilter[] = [
+      {
+        pinned: [condition(`+${statusSql}`, ...statuses)],
+        // A single pending status is rare: the (service, status) index finds it under every code.
+        ...(params.status !== 'A' &&
+          params.status !== 'any' &&
+          !params.radioService && {
+            drive: [
+              condition('l.radio_service_code IN (SELECT code FROM service_codes)'),
+              condition(statusSql, ...statuses),
+            ],
+          }),
+      },
+    ];
     if (params.radioService) {
-      licenseWhere.push('l.radio_service_code = ?');
-      licenseArgs.push(params.radioService);
+      filters.push({
+        pinned: [condition('+l.radio_service_code = ?', params.radioService)],
+        drive: [
+          condition('l.radio_service_code = ?', params.radioService),
+          condition(statusSql, ...statuses),
+        ],
+      });
     }
     if (match) {
-      licenseWhere.push('l.usi IN (SELECT rowid FROM licenses_fts WHERE licenses_fts MATCH ?)');
-      licenseArgs.push(match);
-      if (this.redactIndividuals) licenseWhere.push('l.is_individual = 0');
+      filters.push({
+        pinned: [condition(`+${LICENSEE_MATCH_SQL}`, match)],
+        drive: [condition(LICENSEE_MATCH_SQL, match)],
+      });
+      if (this.redactIndividuals) filters.push({ pinned: [condition('l.is_individual = 0')] });
     }
 
+    const overlap = this.overlapArgs(params.band);
     const fetch = params.limit + 1;
-    const sites =
-      params.kind === 'market'
-        ? { rows: [], total: 0 }
-        : this.siteAssignments(db, params, licenseWhere, licenseArgs, after, fetch);
-    const markets =
-      params.kind === 'site'
-        ? { rows: [], total: 0 }
-        : this.marketAssignments(db, params, licenseWhere, licenseArgs, after, fetch);
+    const sides: SidePage[] = [];
+    if (params.kind !== 'market') {
+      sides.push(this.searchSide(db, this.siteSide(db, params, overlap, filters), after, fetch));
+    }
+    if (params.kind !== 'site') {
+      sides.push(this.searchSide(db, this.marketSide(db, params, overlap, filters), after, fetch));
+    }
 
-    const merged = [...sites.rows, ...markets.rows].sort((a, b) => compareKeys(a.key, b.key));
+    // Rows past the key one side is complete through may sort after rows that side has not read.
+    let through: CursorKey | undefined;
+    for (const side of sides) {
+      if (side.through && (!through || compareKeys(side.through, through) < 0)) {
+        through = side.through;
+      }
+    }
+    const merged = sides
+      .flatMap((side) => side.rows)
+      .filter((entry) => !through || compareKeys(entry.key, through) <= 0)
+      .sort((a, b) => compareKeys(a.key, b.key));
     const page = merged.slice(0, params.limit);
-    const last = page.at(-1);
+    const next = merged.length > params.limit ? page.at(-1)?.key : through;
     return {
       ok: true,
       rows: page.map((entry) => entry.row),
-      total: sites.total + markets.total,
-      ...(merged.length > params.limit && last && { nextCursor: encodeCursor(id, 'f', last.key) }),
+      total: sides.reduce((sum, side) => sum + side.total, 0),
+      ...(sides.some((side) => side.lowerBound) && { totalIsLowerBound: true }),
+      ...(next && { nextCursor: encodeCursor(id, 'f', next) }),
     };
   }
 
-  private siteAssignments(
+  /**
+   * One side of a frequency search. The candidates the band index reaches, and those each
+   * filter's own index reaches, are counted up to `exactCap`; when the fewest fit, that index
+   * drives an exact count and page ({@link exactSide}), and otherwise the side is walked
+   * ({@link walkSide}).
+   */
+  private searchSide<Row>(
     db: SqliteHandle,
-    params: SearchFrequenciesParams,
-    licenseWhere: string[],
-    licenseArgs: SqlValue[],
-    after: CursorKey | undefined,
+    side: AssignmentSide<Row>,
+    after: number[] | undefined,
     fetch: number,
-  ): { rows: { key: CursorKey; row: FrequencyAssignment }[]; total: number } {
-    const overlap = this.overlapArgs(params.band);
-    const scan = bandScan('f', 'occ_low', overlap, readMetaNumber(db, META_KEYS.maxSiteBand));
-    const where = [
-      'f.occ_low <= ?',
-      'f.occ_high >= ?',
-      scan.sql,
-      'f.frequency_mhz IS NOT NULL',
-      ...licenseWhere,
-    ];
-    const args: SqlValue[] = [overlap.high, overlap.low, ...scan.args, ...licenseArgs];
-    if (params.state) {
-      where.push('lo.site_state = ?');
-      args.push(params.state);
+  ): SidePage {
+    const { exactCap } = this.frequencySearch;
+    const band = classRanges(side.widest, (bound) => side.overlap.low - bound, side.overlap.high);
+    let fewest = coverCount(db, side.table, side.edge, band, exactCap + 1);
+    let driver: FrequencyFilter | undefined;
+    for (const filter of side.filters) {
+      if (!filter.drive || fewest === 0) continue;
+      const visits =
+        db
+          .prepare<{ n: number }>(
+            `SELECT count(*) AS n FROM (SELECT 1 FROM ${side.table} ${side.alias} ${side.joins}
+             WHERE ${whereSql(filter.drive)} LIMIT ?)`,
+          )
+          .get(...whereArgs(filter.drive), Math.min(fewest, exactCap + 1))?.n ?? 0;
+      if (visits < fewest) {
+        fewest = visits;
+        driver = filter;
+      }
     }
-    const from = `FROM frequencies f JOIN licenses l ON l.usi = f.usi
-      ${params.state ? 'JOIN' : 'LEFT JOIN'} locations lo
-        ON lo.usi = f.usi AND lo.location_number = f.location_number`;
-    const group = 'GROUP BY f.frequency_mhz, f.usi, f.location_number, f.upper_mhz';
+    return fewest <= exactCap
+      ? this.exactSide(db, side, band, driver, after, fetch)
+      : this.walkSide(db, side, band, after, fetch);
+  }
+
+  /**
+   * The exact count and page of one side, the plan driven by `driver`'s index or, without one,
+   * by the band index; every other filter is pinned.
+   */
+  private exactSide<Row>(
+    db: SqliteHandle,
+    side: AssignmentSide<Row>,
+    band: readonly ClassRange[],
+    driver: FrequencyFilter | undefined,
+    after: number[] | undefined,
+    fetch: number,
+  ): SidePage {
+    const conditions = [
+      ...side.where,
+      ...(driver?.drive ?? [rangeCondition(side.alias, side.edge, band)]),
+      ...side.filters.flatMap((filter) => (filter === driver ? [] : filter.pinned)),
+    ];
     const total =
       db
         .prepare<{ n: number }>(
-          `SELECT count(*) AS n FROM (SELECT 1 ${from} WHERE ${where.join(' AND ')} ${group})`,
+          `SELECT count(*) AS n FROM (SELECT 1 FROM ${side.table} ${side.alias} ${side.joins}
+           WHERE ${whereSql(conditions)} ${side.group})`,
         )
-        .get(...args)?.n ?? 0;
-
-    const pageWhere = [...where];
-    const pageArgs = [...args];
-    if (after) {
-      pageWhere.push(
-        'f.frequency_mhz >= ?',
-        '(f.frequency_mhz, 1, f.usi, f.location_number, COALESCE(f.upper_mhz, 0)) > (?, ?, ?, ?, ?)',
-      );
-      pageArgs.push(after[0] ?? 0, ...after);
-    }
-    const rows = db
-      .prepare<
-        LicenseHeadRow & {
-          bandwidth: number | null;
-          classes: string | null;
-          county: string | null;
-          emissions: string | null;
-          frequency: number;
-          lat: number | null;
-          location_number: number;
-          lon: number | null;
-          max_erp: number | null;
-          site_state: string | null;
-          sites: number;
-          state_derived: number | null;
-          upper: number | null;
-        }
-      >(
-        `SELECT ${LICENSE_HEAD_COLUMNS}, f.location_number, f.frequency_mhz AS frequency,
-           f.upper_mhz AS upper, max(f.bandwidth_mhz) AS bandwidth,
-           group_concat(f.class_station, '|') AS classes, max(f.erp_w) AS max_erp,
-           group_concat(f.emissions, ',') AS emissions,
-           lo.lat, lo.lon, lo.county, lo.site_state, lo.state_derived,
-           (SELECT count(*) FROM locations s
-            WHERE s.usi = f.usi AND s.location_number = f.location_number) AS sites
-         ${from} WHERE ${pageWhere.join(' AND ')} ${group}
-         ORDER BY f.frequency_mhz, f.usi, f.location_number, COALESCE(f.upper_mhz, 0)
-         LIMIT ?`,
-      )
-      .all(...pageArgs, fetch);
+        .get(...whereArgs(conditions))?.n ?? 0;
+    const rows = this.sideRows(db, side, [...conditions, ...followingKey(side, after)], fetch);
+    const last = rows.at(-1);
     return {
+      rows,
       total,
-      rows: rows.map((row) => ({
+      lowerBound: false,
+      ...(rows.length === fetch && last && { through: last.key }),
+    };
+  }
+
+  /**
+   * The band walk over one side: rows in result order, read window by window along the key,
+   * from the cursor or the band's lowest indexed edge, whichever is higher. A window `(start, end]` reads one index
+   * range per band class, from the lowest edge a row keyed past `start` can have up to `end`,
+   * and is sized by covering counts so it holds `target` to twice that many entries past the
+   * lookback below `start`; the target grows fourfold each window, capped at half the budget
+   * left. The walk stops when the page fills, the key range ends, or the budget left falls
+   * under `windowTarget`, returning the window end as the key it is complete through. Its
+   * total is exact only when one call read the whole band; otherwise it counts the matches
+   * among the band index's first `exactCap` candidates, a lower bound.
+   */
+  private walkSide<Row>(
+    db: SqliteHandle,
+    side: AssignmentSide<Row>,
+    band: readonly ClassRange[],
+    after: number[] | undefined,
+    fetch: number,
+  ): SidePage {
+    const { exactCap, walkBudget, windowTarget } = this.frequencySearch;
+    const { overlap, reach, widest } = side;
+    const pinned = side.filters.flatMap((filter) => filter.pinned);
+    const ranges = (start: number, end: number) =>
+      classRanges(
+        widest,
+        (bound) => Math.max(start - reach(bound), overlap.low - bound),
+        Math.min(end, overlap.high),
+      );
+    const cover = (start: number, end: number) =>
+      coverCount(db, side.table, side.edge, ranges(start, end));
+    const keyEnd = overlap.high + reach(widest);
+
+    const rows: KeyedAssignment[] = [];
+    let following = after;
+    let start = Math.max(
+      after?.[0] ?? Number.NEGATIVE_INFINITY,
+      lowestEdge(db, side.table, side.edge, band) ?? overlap.low - widest,
+    );
+    let width = FIRST_WINDOW_MHZ;
+    let target = windowTarget;
+    let spent = 0;
+    let through: CursorKey | undefined;
+    for (;;) {
+      const lookback = cover(start, start);
+      // Grow fourfold to the first end holding `target`, then bisect back toward the last end
+      // short of it while the window holds over twice that: a band turning dense past a gap
+      // would otherwise land the whole dense stretch in one window.
+      let short = start;
+      let end = Math.min(start + width, keyEnd);
+      let entries = cover(start, end);
+      while (entries - lookback < target && end < keyEnd) {
+        short = end;
+        width *= 4;
+        end = Math.min(start + width, keyEnd);
+        entries = cover(start, end);
+      }
+      while (entries - lookback > 2 * target && end - short > MIN_WINDOW_MHZ) {
+        const middle = (short + end) / 2;
+        const held = cover(start, middle);
+        if (held - lookback < target) {
+          short = middle;
+        } else {
+          end = middle;
+          entries = held;
+        }
+      }
+      width = end - start;
+      const conditions = [
+        ...side.where,
+        rangeCondition(side.alias, side.edge, ranges(start, end)),
+        condition(`${side.key} <= ?`, end),
+        ...followingKey(side, following),
+        ...pinned,
+      ];
+      rows.push(...this.sideRows(db, side, conditions, fetch - rows.length));
+      spent += entries;
+      const last = rows.at(-1);
+      if (rows.length === fetch && last) {
+        through = last.key;
+        break;
+      }
+      if (end >= keyEnd) break;
+      // Sorts after every row keyed at `end`, so the next window starts past them.
+      following = [end, 2, 0, 0, 0];
+      start = end;
+      // At most twice the target lands past the lookback, so half the budget left caps it.
+      target = Math.min(target * 4, (walkBudget - spent) / 2);
+      if (target < windowTarget) {
+        through = following;
+        break;
+      }
+    }
+
+    if (!after && !through) return { rows, total: rows.length, lowerBound: false };
+    const conditions = [...side.where, ...pinned];
+    const counted =
+      db
+        .prepare<{ n: number }>(
+          `SELECT count(*) AS n FROM (SELECT 1
+           FROM (SELECT rowid AS id FROM ${side.table} c WHERE ${rangeCondition('c', side.edge, band).sql}
+                 LIMIT ?) candidate
+           JOIN ${side.table} ${side.alias} ON ${side.alias}.rowid = candidate.id ${side.joins}
+           WHERE ${whereSql(conditions)} ${side.group})`,
+        )
+        .get(...band.flat(), exactCap, ...whereArgs(conditions))?.n ?? 0;
+    return {
+      rows,
+      total: Math.max(counted, rows.length),
+      lowerBound: true,
+      ...(through && { through }),
+    };
+  }
+
+  /** One page of a side's rows matching `conditions`, in result order. */
+  private sideRows<Row>(
+    db: SqliteHandle,
+    side: AssignmentSide<Row>,
+    conditions: readonly Condition[],
+    limit: number,
+  ): KeyedAssignment[] {
+    return db
+      .prepare<Row>(
+        `SELECT ${side.select} FROM ${side.table} ${side.alias} ${side.joins}
+         WHERE ${whereSql(conditions)} ${side.group} ${side.order} LIMIT ?`,
+      )
+      .all(...whereArgs(conditions), limit)
+      .map(side.map);
+  }
+
+  /**
+   * Site assignments as a search side. Every row's frequency sits at most half its occupied
+   * width above its lower edge (an upper edge filed below the frequency is left out of the
+   * occupied band at ingest), which bounds how far the band walk looks below a window.
+   */
+  private siteSide(
+    db: SqliteHandle,
+    params: SearchFrequenciesParams,
+    overlap: { high: number; low: number },
+    filters: FrequencyFilter[],
+  ): AssignmentSide<SiteAssignmentRow> {
+    return {
+      table: 'frequencies',
+      alias: 'f',
+      edge: 'occ_low',
+      key: 'f.frequency_mhz',
+      keyTuple: '(f.frequency_mhz, 1, f.usi, f.location_number, COALESCE(f.upper_mhz, 0))',
+      overlap,
+      reach: (bound) => bound / 2 + OVERLAP_EPSILON_MHZ,
+      widest: readMetaNumber(db, META_KEYS.maxSiteBand),
+      joins: `JOIN licenses l ON l.usi = f.usi
+        ${params.state ? 'JOIN' : 'LEFT JOIN'} locations lo
+          ON lo.usi = f.usi AND lo.location_number = f.location_number`,
+      where: [
+        condition('+f.occ_low <= ?', overlap.high),
+        condition('f.occ_high >= ?', overlap.low),
+        condition('f.frequency_mhz IS NOT NULL'),
+      ],
+      filters: params.state
+        ? [
+            ...filters,
+            {
+              pinned: [condition('+lo.site_state = ?', params.state)],
+              drive: [condition('lo.site_state = ?', params.state)],
+            },
+          ]
+        : filters,
+      select: `${LICENSE_HEAD_COLUMNS}, f.location_number, f.frequency_mhz AS frequency,
+        f.upper_mhz AS upper, max(f.bandwidth_mhz) AS bandwidth,
+        group_concat(f.class_station, '|') AS classes, max(f.erp_w) AS max_erp,
+        group_concat(f.emissions, ',') AS emissions,
+        lo.lat, lo.lon, lo.county, lo.site_state, lo.state_derived,
+        (SELECT count(*) FROM locations s
+         WHERE s.usi = f.usi AND s.location_number = f.location_number) AS sites`,
+      group: 'GROUP BY f.frequency_mhz, f.usi, f.location_number, f.upper_mhz',
+      order: 'ORDER BY f.frequency_mhz, f.usi, f.location_number, COALESCE(f.upper_mhz, 0)',
+      map: (row) => ({
         key: [row.frequency, 1, row.usi, row.location_number, row.upper ?? 0],
         row: {
           kind: 'site',
@@ -1373,70 +1705,40 @@ export class UlsIndexService {
                 ...(row.site_state !== null && { stateFromCoordinates: row.state_derived === 1 }),
               }),
         },
-      })),
+      }),
     };
   }
 
-  private marketAssignments(
+  /** Market blocks as a search side; the key is the indexed lower edge itself. */
+  private marketSide(
     db: SqliteHandle,
     params: SearchFrequenciesParams,
-    licenseWhere: string[],
-    licenseArgs: SqlValue[],
-    after: CursorKey | undefined,
-    fetch: number,
-  ): { rows: { key: CursorKey; row: FrequencyAssignment }[]; total: number } {
-    const overlap = this.overlapArgs(params.band);
-    const scan = bandScan('mb', 'lower', overlap, readMetaNumber(db, META_KEYS.maxMarketBand));
-    const where = [
-      'mb.lower <= ?',
-      'mb.lower > 0',
-      'COALESCE(mb.upper, mb.lower) >= ?',
-      scan.sql,
-      ...licenseWhere,
-    ];
-    const args: SqlValue[] = [overlap.high, overlap.low, ...scan.args, ...licenseArgs];
-    if (params.state) {
-      where.push('l.market_states LIKE ?');
-      args.push(`%,${params.state},%`);
-    }
-    const from = 'FROM market_blocks mb JOIN licenses l ON l.usi = mb.usi';
-    const group = 'GROUP BY mb.usi, mb.lower, mb.upper';
-    const total =
-      db
-        .prepare<{ n: number }>(
-          `SELECT count(*) AS n FROM (SELECT 1 ${from} WHERE ${where.join(' AND ')} ${group})`,
-        )
-        .get(...args)?.n ?? 0;
-
-    const pageWhere = [...where];
-    const pageArgs = [...args];
-    if (after) {
-      pageWhere.push(
-        'mb.lower >= ?',
-        '(mb.lower, 0, mb.usi, 0, COALESCE(mb.upper, 0)) > (?, ?, ?, ?, ?)',
-      );
-      pageArgs.push(after[0] ?? 0, ...after);
-    }
-    const rows = db
-      .prepare<
-        LicenseHeadRow & {
-          channel_block: string | null;
-          lower: number;
-          market_code: string | null;
-          market_name: string | null;
-          partitions: string | null;
-          upper: number | null;
-        }
-      >(
-        `SELECT ${LICENSE_HEAD_COLUMNS}, l.market_code, l.market_name, l.channel_block,
-           mb.lower, mb.upper, ${PARTITION_AREAS_SQL} AS partitions
-         ${from} WHERE ${pageWhere.join(' AND ')} ${group}
-         ORDER BY mb.lower, mb.usi, COALESCE(mb.upper, 0) LIMIT ?`,
-      )
-      .all(...pageArgs, fetch);
+    overlap: { high: number; low: number },
+    filters: FrequencyFilter[],
+  ): AssignmentSide<MarketBlockRow> {
     return {
-      total,
-      rows: rows.map((row) => ({
+      table: 'market_blocks',
+      alias: 'mb',
+      edge: 'lower',
+      key: 'mb.lower',
+      keyTuple: '(mb.lower, 0, mb.usi, 0, COALESCE(mb.upper, 0))',
+      overlap,
+      reach: () => 0,
+      widest: readMetaNumber(db, META_KEYS.maxMarketBand),
+      joins: 'JOIN licenses l ON l.usi = mb.usi',
+      where: [
+        condition('+mb.lower <= ?', overlap.high),
+        condition('+mb.lower > 0'),
+        condition('COALESCE(mb.upper, mb.lower) >= ?', overlap.low),
+      ],
+      filters: params.state
+        ? [...filters, { pinned: [condition('l.market_states LIKE ?', `%,${params.state},%`)] }]
+        : filters,
+      select: `${LICENSE_HEAD_COLUMNS}, l.market_code, l.market_name, l.channel_block,
+        mb.lower, mb.upper, ${PARTITION_AREAS_SQL} AS partitions`,
+      group: 'GROUP BY mb.usi, mb.lower, mb.upper',
+      order: 'ORDER BY mb.lower, mb.usi, COALESCE(mb.upper, 0)',
+      map: (row) => ({
         key: [row.lower, 0, row.usi, 0, row.upper ?? 0],
         row: {
           kind: 'market',
@@ -1448,7 +1750,7 @@ export class UlsIndexService {
           ...opt('channelBlock', row.channel_block),
           ...opt('partitionAreaIds', partitionAreaIds(row.partitions)),
         },
-      })),
+      }),
     };
   }
 
@@ -1523,14 +1825,16 @@ export class UlsIndexService {
    * The published generation, re-reading `current.json` at most once per `pointerCheckMs`.
    * When the pointer names a new generation, the new one is opened, swapped in, and the old
    * handle closed. Every query runs synchronously once it holds the handle, so a swap never
-   * closes a handle mid-query. A failure to read the pointer or open the generation reaches
-   * callers through {@link unreadable}.
+   * closes a handle mid-query. A call that arrives while a check is in flight waits for it,
+   * so concurrent first calls never see the not-yet-opened state. A failure to read the
+   * pointer or open the generation reaches callers through {@link unreadable}.
    */
   private generation(): Promise<OpenGeneration | undefined> {
+    if (this.pendingCheck) return this.pendingCheck;
     if (this.now() - this.lastPointerCheck < this.pointerCheckMs) {
       return Promise.resolve(this.current);
     }
-    this.pendingCheck ??= this.syncPointer()
+    this.pendingCheck = this.syncPointer()
       .catch((err: unknown) => {
         throw this.unreadable(err);
       })
@@ -1597,9 +1901,14 @@ export class UlsIndexService {
     const missingFile =
       pointer && !existsSync(join(this.mirrorDir, pointer.file)) ? pointer.file : undefined;
     if (missingFile) {
-      problem = `current.json names ${missingFile}, which is missing from the mirror directory; run mirror:init to rebuild the index.`;
+      problem =
+        'current.json names a generation file that is missing from the mirror directory; run mirror:init to rebuild the index.';
     }
     const next = pointer && !missingFile ? await this.open(pointer) : undefined;
+    if (next && isRebuildRequired(next.db)) {
+      problem =
+        'The published index was built by an earlier version of this server and must be rebuilt before it is served; run mirror:init to rebuild it.';
+    }
     const previous = this.current;
     this.current = next;
     this.pointerProblem = problem;
@@ -1619,6 +1928,11 @@ export class UlsIndexService {
       .replaceAll(this.mirrorDir, 'the mirror directory');
   }
 
+  /**
+   * Open a published generation. It is ready once its build completed, unless it carries
+   * the rebuild-required mark (its migration to the current schema adds the mark when the
+   * rows it holds cannot be recomputed in place).
+   */
   private async open(pointer: GenerationPointer): Promise<OpenGeneration> {
     const store = createUlsStore(join(this.mirrorDir, pointer.file));
     try {
@@ -1630,7 +1944,7 @@ export class UlsIndexService {
         file: pointer.file,
         id: generationStamp(pointer.file),
         publishedAt: pointer.publishedAt,
-        ready: Boolean(state.completedAt),
+        ready: Boolean(state.completedAt) && !isRebuildRequired(db),
       };
     } catch (err) {
       await store.close();
@@ -1694,26 +2008,86 @@ function readRefreshState(db: SqliteHandle): string {
   return `${state?.applied ?? 0}.${state?.latest ?? ''}`;
 }
 
+/** One range of a band index `(band_class, edge)`: a class and its lowest and highest edge. */
+type ClassRange = [bandClass: number, from: number, to: number];
+
 /**
- * The overlap test's lower-edge range scan as one index range per band class: a row of class
- * `c` that overlaps `[low, high]` has its lower edge in `[low − bound(c), high]`
- * ({@link bandClassBounds}), so a narrow lookup never reads rows only a wide filing could
- * reach. `widest` is the table's stored widest band, which bounds the open class. Callers put
- * the overlap test itself ahead of it, so a plan that reaches rows by license or state checks
- * that before the per-class ranges.
+ * One index range per band class ({@link bandClassBounds}), edges from `from(bound)` to `to`,
+ * where `bound` is the widest band the class holds: its ceiling, capped at `widest`, the
+ * table's stored widest band. A row of class `c` overlapping `[low, high]` has its lower edge
+ * in `[low − bound(c), high]`, so a narrow lookup never reads rows only a wide filing could
+ * reach.
  */
-function bandScan(
-  alias: string,
-  lowerEdge: string,
-  overlap: { high: number; low: number },
-  widest: number,
-): { args: SqlValue[]; sql: string } {
-  const bounds = bandClassBounds(widest);
-  const range = `(${alias}.band_class = ? AND ${alias}.${lowerEdge} BETWEEN ? AND ?)`;
-  return {
-    sql: `(${bounds.map(() => range).join(' OR ')})`,
-    args: bounds.flatMap(([bandClass, bound]) => [bandClass, overlap.low - bound, overlap.high]),
-  };
+function classRanges(widest: number, from: (bound: number) => number, to: number): ClassRange[] {
+  return bandClassBounds(widest).map(([bandClass, ceiling]) => [
+    bandClass,
+    from(Math.min(ceiling, widest)),
+    to,
+  ]);
+}
+
+/**
+ * The ranges as an OR of index ranges, for a plan the band index drives. Callers put the
+ * overlap test ahead of it, so a plan that reaches rows another way checks that first.
+ */
+function rangeCondition(alias: string, edge: string, ranges: readonly ClassRange[]): Condition {
+  const range = `(${alias}.band_class = ? AND ${alias}.${edge} BETWEEN ? AND ?)`;
+  return { sql: `(${ranges.map(() => range).join(' OR ')})`, args: ranges.flat() };
+}
+
+/**
+ * Index entries in `ranges`, summed from per-class counts the index alone answers; with
+ * `limit`, each class counts at most that many.
+ */
+function coverCount(
+  db: SqliteHandle,
+  table: string,
+  edge: string,
+  ranges: readonly ClassRange[],
+  limit?: number,
+): number {
+  const range = `band_class = ? AND ${edge} BETWEEN ? AND ?`;
+  const count =
+    limit === undefined
+      ? `(SELECT count(*) FROM ${table} WHERE ${range})`
+      : `(SELECT count(*) FROM (SELECT 1 FROM ${table} WHERE ${range} LIMIT ?))`;
+  const args = ranges.flatMap((range) => (limit === undefined ? range : [...range, limit]));
+  return (
+    db.prepare<{ n: number }>(`SELECT ${ranges.map(() => count).join(' + ')} AS n`).get(...args)
+      ?.n ?? 0
+  );
+}
+
+/**
+ * The lowest edge in `ranges`, one index seek per class. No row they reach is keyed below it,
+ * since a row's key never sits below its indexed edge.
+ */
+function lowestEdge(
+  db: SqliteHandle,
+  table: string,
+  edge: string,
+  ranges: readonly ClassRange[],
+): number | undefined {
+  const lowest = `SELECT min(${edge}) AS m FROM ${table} WHERE band_class = ? AND ${edge} BETWEEN ? AND ?`;
+  return (
+    db
+      .prepare<{ m: number | null }>(
+        `SELECT min(m) AS m FROM (${ranges.map(() => lowest).join(' UNION ALL ')})`,
+      )
+      .get(...ranges.flat())?.m ?? undefined
+  );
+}
+
+/** Conditions keeping a side's rows keyed after the cursor key `after`; none without one. */
+function followingKey(
+  side: { key: string; keyTuple: string },
+  after: readonly number[] | undefined,
+): Condition[] {
+  if (!after) return [];
+  return [
+    condition(`${side.key} >= ?`, after[0] ?? 0),
+    condition(`${side.keyTuple} > (?, ?, ?, ?, ?)`, ...after),
+  ];
 }
 
 /**

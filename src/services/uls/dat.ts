@@ -30,9 +30,17 @@ export type RecordType = keyof typeof RECORD_FIELD_COUNTS;
 export type RecordFields = readonly string[];
 
 /**
+ * Longest line, in characters, the line reader accepts. The longest ULS record runs to a
+ * few hundred characters, so anything near this is not a record.
+ */
+export const MAX_LINE_LENGTH = 16_384;
+
+/**
  * Stream UTF-8 text lines from a byte source. Decoding is non-fatal (a malformed
  * sequence becomes U+FFFD rather than aborting the file); lines split on `\n` with one
- * trailing `\r` stripped; empty lines are skipped.
+ * trailing `\r` stripped; empty lines are skipped. A line longer than
+ * {@link MAX_LINE_LENGTH} fails the read with `SerializationError`, so a source that
+ * never sends a newline stops after one line's worth of text.
  */
 export async function* readLines(source: AsyncIterable<Uint8Array>): AsyncGenerator<string> {
   const decoder = new TextDecoder('utf-8');
@@ -42,20 +50,36 @@ export async function* readLines(source: AsyncIterable<Uint8Array>): AsyncGenera
     let start = 0;
     let newline = pending.indexOf('\n', start);
     while (newline !== -1) {
-      const line = stripCarriageReturn(pending.slice(start, newline));
+      const line = checkedLine(pending.slice(start, newline));
       if (line) yield line;
       start = newline + 1;
       newline = pending.indexOf('\n', start);
     }
     pending = pending.slice(start);
+    // One extra character leaves room for the CR of a CRLF whose LF is in the next chunk.
+    if (pending.length > MAX_LINE_LENGTH + 1) throw lineTooLong();
   }
   pending += decoder.decode();
-  const last = stripCarriageReturn(pending);
+  const last = checkedLine(pending);
   if (last) yield last;
+}
+
+/** The line with one trailing `\r` stripped, refused when longer than the ceiling. */
+function checkedLine(text: string): string {
+  const line = stripCarriageReturn(text);
+  if (line.length > MAX_LINE_LENGTH) throw lineTooLong();
+  return line;
 }
 
 function stripCarriageReturn(line: string): string {
   return line.endsWith('\r') ? line.slice(0, -1) : line;
+}
+
+function lineTooLong(): Error {
+  return serializationError(
+    `A line longer than ${MAX_LINE_LENGTH} characters is not a ULS record.`,
+    { maxLength: MAX_LINE_LENGTH },
+  );
 }
 
 /**
@@ -247,8 +271,9 @@ export function decodeHd(line: string): HdRecord | null {
 }
 
 /**
- * EN — entity. Only the name, city, state, FRN, and applicant type are read; street
- * address, ZIP, PO box, attention line, phone, fax, email, and split name parts never are.
+ * EN — entity. Only the name, city, state, FRN, and applicant type are read, plus whether
+ * any split name part (first, middle initial, last, suffix) is filed; the parts themselves,
+ * street address, ZIP, PO box, attention line, phone, fax, and email never are.
  */
 export interface EnRecord {
   applicantType: string | null;
@@ -257,6 +282,8 @@ export interface EnRecord {
   /** `L` licensee (the lessee on a lease), `CL` contact, `O` owner, … */
   entityType: string | null;
   frn: string | null;
+  /** True when any of the person-name fields 9–12 is filed. */
+  hasNameParts: boolean;
   state: string | null;
   usi: number;
 }
@@ -270,6 +297,7 @@ export function decodeEn(line: string): EnRecord | null {
     usi,
     entityType: textField(f, 6),
     entityName: textField(f, 8),
+    hasNameParts: [9, 10, 11, 12].some((position) => textField(f, position) !== null),
     city: textField(f, 17),
     state: textField(f, 18),
     frn: textField(f, 23),

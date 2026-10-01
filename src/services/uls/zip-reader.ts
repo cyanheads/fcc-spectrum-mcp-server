@@ -27,6 +27,12 @@ const U32_MAX = 0xffffffff;
 const METHOD_STORED = 0;
 const METHOD_DEFLATE = 8;
 
+/**
+ * Most bytes {@link ZipArchive.readText} reads before refusing the entry. The one text
+ * entry it serves, a weekly `counts` file, is under 2 KB.
+ */
+export const MAX_TEXT_ENTRY_BYTES = 65_536;
+
 /** One file inside the archive, as the central directory describes it. */
 export interface ZipEntry {
   compressedSize: number;
@@ -49,7 +55,10 @@ export interface ZipArchive {
   /** Stream an entry's uncompressed bytes. */
   openEntry(entry: ZipEntry): Promise<Readable>;
   readonly path: string;
-  /** Read a small entry (such as `counts`) whole as UTF-8 text. */
+  /**
+   * Read a small entry (such as `counts`) whole as UTF-8 text; an entry longer than
+   * {@link MAX_TEXT_ENTRY_BYTES} fails with `SerializationError`.
+   */
   readText(entry: ZipEntry): Promise<string>;
 }
 
@@ -180,7 +189,18 @@ function createArchive(path: string, handle: FileHandle, entries: ZipEntry[]): Z
     },
     async readText(entry) {
       const chunks: Buffer[] = [];
-      for await (const chunk of await openEntry(entry)) chunks.push(chunk as Buffer);
+      let bytes = 0;
+      for await (const chunk of await openEntry(entry)) {
+        bytes += (chunk as Buffer).length;
+        // Leaving the loop destroys the entry stream.
+        if (bytes > MAX_TEXT_ENTRY_BYTES) {
+          throw zipError(
+            path,
+            `ZIP entry "${entry.name}" holds more than ${MAX_TEXT_ENTRY_BYTES} bytes of text`,
+          );
+        }
+        chunks.push(chunk as Buffer);
+      }
       return Buffer.concat(chunks).toString('utf8');
     },
     close: () => handle.close(),

@@ -12,7 +12,7 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import type { MirrorLogger } from '@cyanheads/mcp-ts-core/mirror';
 import { type IngestClient, UlsIngester } from '@/services/uls/ingest.js';
-import { UlsIndexService } from '@/services/uls/uls-index-service.js';
+import { type FrequencySearchLimits, UlsIndexService } from '@/services/uls/uls-index-service.js';
 import type { ZipArchive } from '@/services/uls/zip-reader.js';
 import { at, FakeIngestClient, type FixtureFile, type WEEKLY_FIXTURES } from './uls-fixtures.js';
 
@@ -80,6 +80,7 @@ export function fixtureIngester(mirror: TempMirror, options: FixtureIngesterOpti
 
 /** Options for {@link UlsIndexService} instances handed out by a fixture index. */
 export interface FixtureServiceOptions {
+  frequencySearch?: Partial<FrequencySearchLimits>;
   pointerCheckMs?: number;
   redactIndividuals?: boolean;
 }
@@ -130,12 +131,13 @@ export async function buildFixtureIndex(options: FixtureIndexOptions = {}): Prom
     ingester,
     mirror,
     mirrorDir: mirror.mirrorDir,
-    service({ redactIndividuals = true, pointerCheckMs = 0 } = {}) {
+    service({ redactIndividuals = true, pointerCheckMs = 0, frequencySearch } = {}) {
       const service = new UlsIndexService({
         mirrorDir: mirror.mirrorDir,
         pointerCheckMs,
         redactIndividuals,
         services: groups,
+        ...(frequencySearch && { frequencySearch }),
       });
       services.push(service);
       return service;

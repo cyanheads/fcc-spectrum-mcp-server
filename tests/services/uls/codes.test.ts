@@ -1,6 +1,7 @@
 /**
  * @fileoverview Tests for the bundled ULS code tables: radio service, status, and USPS
- * vocabularies, the full-state-name lookup, the weekly service groups, and `toEntries`.
+ * vocabularies, the full-state-name lookup, the weekly service groups, `toEntries`, and
+ * `codeLabel`.
  * @module tests/services/uls/codes.test
  */
 
@@ -8,6 +9,7 @@ import { describe, expect, it } from 'vitest';
 import {
   ANTENNA_TYPES,
   APPLICANT_TYPES,
+  codeLabel,
   DEFAULT_SERVICE_GROUPS,
   LICENSE_STATUSES,
   LOCATION_TYPES,
@@ -130,5 +132,22 @@ describe('toEntries', () => {
 
   it('returns an empty list for an empty table', () => {
     expect(toEntries({})).toEqual([]);
+  });
+});
+
+describe('codeLabel', () => {
+  it('returns the label of a code the table holds', () => {
+    expect(codeLabel(LOCATION_TYPES, 'F')).toBe('Fixed');
+    expect(codeLabel(OPERATOR_CLASSES, 'E')).toBe('Amateur Extra');
+    expect(codeLabel(RADIO_SERVICES, 'ZQ')).toBeUndefined();
+  });
+
+  it('has no label for a code named like an object member', () => {
+    for (const code of ['constructor', 'toString', 'valueOf', '__proto__', 'hasOwnProperty']) {
+      expect(codeLabel(RADIO_SERVICES, code)).toBeUndefined();
+      expect(codeLabel(LICENSE_STATUSES, code)).toBeUndefined();
+      expect(codeLabel(LOCATION_TYPES, code)).toBeUndefined();
+      expect(codeLabel(OPERATOR_CLASSES, code)).toBeUndefined();
+    }
   });
 });

@@ -191,6 +191,17 @@ describe('latitudeSchema and longitudeSchema', () => {
     expect(latitudeSchema.safeParse('47-61-00N').success).toBe(false);
     expect(latitudeSchema.safeParse('north').success).toBe(false);
   });
+
+  it('reject coordinate text over 48 characters at once, however it is spaced', () => {
+    const run = ' '.repeat(5000);
+    for (const schema of [latitudeSchema, longitudeSchema]) {
+      const started = performance.now();
+      expect(schema.safeParse(`1 2 3${run}"${run}Q`).success).toBe(false);
+      expect(schema.safeParse(`1${run}2${run}X`).success).toBe(false);
+      expect(schema.safeParse(`47.6${'0'.repeat(45)}`).success).toBe(false);
+      expect(performance.now() - started).toBeLessThan(10);
+    }
+  });
 });
 
 describe('cursorSchema', () => {

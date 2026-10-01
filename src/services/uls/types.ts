@@ -29,6 +29,8 @@ export interface Page<T> {
   rows: T[];
   /** Matches before the limit. */
   total: number;
+  /** True when `total` is a lower bound: the search counted only part of a large match set. */
+  totalIsLowerBound?: boolean;
 }
 
 /** A page, or the reason the cursor could not be used. */

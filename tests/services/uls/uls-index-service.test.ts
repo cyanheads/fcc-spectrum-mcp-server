@@ -31,7 +31,7 @@ import type {
   SearchLicensesParams,
   TransmitterSite,
 } from '@/services/uls/types.js';
-import { UlsIndexService } from '@/services/uls/uls-index-service.js';
+import { radioServiceLabel, UlsIndexService } from '@/services/uls/uls-index-service.js';
 import {
   BAND_CLASS_WEEKLY,
   DAILY_PG_MON,
@@ -60,7 +60,12 @@ const forgeCursor = (...parts: unknown[]) =>
   Buffer.from(JSON.stringify(parts)).toString('base64url');
 
 /** Unwrap an `ok` page or fail the test. */
-function page<T>(result: PageResult<T>): { nextCursor?: string; rows: T[]; total: number } {
+function page<T>(result: PageResult<T>): {
+  nextCursor?: string;
+  rows: T[];
+  total: number;
+  totalIsLowerBound?: boolean;
+} {
   if (!result.ok) throw new Error(`Expected a page, got ${result.reason}.`);
   return result;
 }
@@ -109,6 +114,35 @@ const frequencies = (overrides: Partial<SearchFrequenciesParams>): SearchFrequen
   status: 'A',
   ...overrides,
 });
+
+/**
+ * search_frequencies limits that send every side with more than one candidate through the
+ * band walk, one window or two per call: the early stop runs on nearly every page.
+ */
+const WALK_LIMITS = { exactCap: 1, walkBudget: 2, windowTarget: 1 } as const;
+
+/**
+ * Every row of a frequency search, following each nextCursor, with the pages that ended
+ * short of the limit while still carrying a cursor, and whether any total was a lower bound.
+ */
+async function walkFrequencies(
+  service: UlsIndexService,
+  params: SearchFrequenciesParams,
+): Promise<{ lowerBound: boolean; rows: FrequencyAssignment[]; shortPages: number }> {
+  const rows: FrequencyAssignment[] = [];
+  let cursor: string | undefined;
+  let shortPages = 0;
+  let lowerBound = false;
+  for (let calls = 0; ; calls++) {
+    if (calls > 1000) throw new Error('The cursor walk did not end.');
+    const next = page(await service.searchFrequencies({ ...params, cursor }));
+    rows.push(...next.rows);
+    if (next.nextCursor && next.rows.length < params.limit) shortPages++;
+    lowerBound ||= next.totalIsLowerBound === true;
+    cursor = next.nextCursor;
+    if (!cursor) return { lowerBound, rows, shortPages };
+  }
+}
 
 /** `kind:usi:location-or-frequency` labels for search_frequencies rows. */
 const assignmentKeys = (rows: FrequencyAssignment[]) =>
@@ -218,7 +252,7 @@ describe('cold index', () => {
       publishedAt: '2026-01-01T00:00:00Z',
     });
     const message =
-      'current.json names fcc-uls-20260101T000000Z.db, which is missing from the mirror directory; run mirror:init to rebuild the index.';
+      'current.json names a generation file that is missing from the mirror directory; run mirror:init to rebuild the index.';
     expect(await service.ready()).toBe(false);
     expect((await service.coverage()).index).toEqual({
       ready: false,
@@ -236,6 +270,48 @@ describe('cold index', () => {
     }).rebuild();
     expect(await service.ready()).toBe(true);
     expect((await service.coverage()).index.error).toBeUndefined();
+  });
+
+  it('serves no generation built before schema 4, reports why, and serves the rebuilt one', async () => {
+    const { mirror, service } = await coldService();
+    const ingester = fixtureIngester(mirror, {
+      client: new FakeIngestClient().withWeekly(['paging']),
+      groups: ['paging'],
+    });
+    const first = await ingester.rebuild();
+    const store = createUlsStore(join(mirror.mirrorDir, first.generation));
+    try {
+      (await store.raw()).exec('UPDATE schema_version SET version = 3');
+    } finally {
+      await store.close();
+    }
+
+    const message =
+      'The published index was built by an earlier version of this server and must be rebuilt before it is served; run mirror:init to rebuild it.';
+    expect(await service.ready()).toBe(false);
+    expect(await service.dataAsOf()).toBeUndefined();
+    expect((await service.coverage()).index).toEqual({
+      ready: false,
+      status: 'none',
+      error: message,
+    });
+    await expect(service.searchLicenses(licenses({}))).rejects.toMatchObject({
+      ...notReady,
+      message,
+    });
+
+    await expect(ingester.refresh()).rejects.toMatchObject({
+      code: JsonRpcErrorCode.Conflict,
+      data: { reason: 'rebuild_required' },
+    });
+    const rebuilt = await ingester.rebuild();
+    expect(rebuilt).toMatchObject({
+      status: 'rebuilt',
+      generation: `${first.generation.slice(0, -3)}-2.db`,
+    });
+    expect(await service.ready()).toBe(true);
+    expect((await service.coverage()).index.error).toBeUndefined();
+    expect(await ingester.rebuild()).toMatchObject({ status: 'skipped' });
   });
 
   it('reports a malformed pointer without its path, logs the path once, and recovers once mirror:init republishes', async () => {
@@ -1248,6 +1324,103 @@ describe('searchFrequencies', () => {
   });
 });
 
+describe('searchFrequencies band walk', () => {
+  let walker: UlsIndexService;
+  beforeAll(() => {
+    walker = fixture.service({ frequencySearch: WALK_LIMITS });
+  });
+
+  const SPECTRUM = band(0.001, 300_000);
+
+  it.each<[string, Partial<SearchFrequenciesParams>]>([
+    ['the whole spectrum', { band: SPECTRUM }],
+    ['the whole spectrum at any live status', { band: SPECTRUM, status: 'any' }],
+    ['site assignments across the spectrum', { band: SPECTRUM, kind: 'site', status: 'any' }],
+    ['market blocks across the spectrum', { band: SPECTRUM, kind: 'market' }],
+    ['the spectrum in one state', { band: SPECTRUM, state: 'ND' }],
+    ['the spectrum for one licensee', { band: SPECTRUM, licensee: 'sample' }],
+    ['the spectrum for one radio service', { band: SPECTRUM, radioService: 'BR' }],
+    ['the spectrum at pending-legal status', { band: SPECTRUM, status: 'L' }],
+    ['the VHF land mobile band', { band: band(150, 174), status: 'any' }],
+    ['the BRS/EBS band', {}],
+    ['one frequency', { band: band(2509) }],
+  ])(
+    'pages %s through the walk with exactly the rows, in order, of the exact search',
+    async (_label, overrides) => {
+      const exact = page(await on.searchFrequencies(frequencies({ ...overrides, limit: 200 })));
+      expect(exact.nextCursor).toBeUndefined();
+      expect(exact.totalIsLowerBound).toBeUndefined();
+      for (const limit of [1, 2, 3, 200]) {
+        const walked = await walkFrequencies(walker, frequencies({ ...overrides, limit }));
+        expect(walked.rows, `limit ${limit}`).toEqual(exact.rows);
+      }
+    },
+  );
+
+  it('stops partway on a dense band with a short page that carries a cursor', async () => {
+    const first = page(
+      await walker.searchFrequencies(frequencies({ band: SPECTRUM, status: 'any', limit: 50 })),
+    );
+    expect(first.rows.length).toBeLessThan(50);
+    expect(first.nextCursor).toBeDefined();
+    const walked = await walkFrequencies(
+      walker,
+      frequencies({ band: SPECTRUM, status: 'any', limit: 50 }),
+    );
+    expect(walked.shortPages).toBeGreaterThan(1);
+    expect(walked.lowerBound).toBe(true);
+  });
+
+  it('reports a total counted over part of the band as a lower bound', async () => {
+    const exact = page(await on.searchFrequencies(frequencies({ band: SPECTRUM, limit: 200 })));
+    const first = page(await walker.searchFrequencies(frequencies({ band: SPECTRUM, limit: 1 })));
+    expect(first.totalIsLowerBound).toBe(true);
+    expect(first.total).toBeGreaterThanOrEqual(first.rows.length);
+    expect(first.total).toBeLessThanOrEqual(exact.total);
+  });
+
+  it('returns an empty page with a cursor, not a zero total, when the scan stops before any match', async () => {
+    const result = page(
+      await walker.searchFrequencies(
+        frequencies({ band: SPECTRUM, kind: 'site', licensee: 'sample broadband' }),
+      ),
+    );
+    expect(result.rows).toEqual([]);
+    expect(result.nextCursor).toBeDefined();
+    expect(result.totalIsLowerBound).toBe(true);
+    const walked = await walkFrequencies(
+      walker,
+      frequencies({ band: SPECTRUM, kind: 'site', licensee: 'sample broadband' }),
+    );
+    expect(assignmentKeys(walked.rows)).toEqual(['site:2001:1', 'site:2001:2']);
+  });
+
+  it('counts exactly when a walk sees the whole band in one call', async () => {
+    const wide = fixture.service({ frequencySearch: { exactCap: 1, walkBudget: 1_000_000 } });
+    const result = page(await wide.searchFrequencies(frequencies({ band: SPECTRUM, limit: 200 })));
+    const exact = page(await on.searchFrequencies(frequencies({ band: SPECTRUM, limit: 200 })));
+    expect(result.rows).toEqual(exact.rows);
+    expect(result.total).toBe(exact.total);
+    expect(result.totalIsLowerBound).toBeUndefined();
+    expect(result.nextCursor).toBeUndefined();
+  });
+
+  it('keeps the exact count on a filter its index can narrow under the cap', async () => {
+    const narrow = fixture.service({ frequencySearch: { exactCap: 4 } });
+    const result = page(
+      await narrow.searchFrequencies(
+        frequencies({ band: SPECTRUM, licensee: 'sample broadband', limit: 1 }),
+      ),
+    );
+    expect(result.totalIsLowerBound).toBeUndefined();
+    expect(result.total).toBe(
+      page(
+        await on.searchFrequencies(frequencies({ band: SPECTRUM, licensee: 'sample broadband' })),
+      ).total,
+    );
+  });
+});
+
 describe('generation switch', () => {
   it('picks up a newly published generation and rejects cursors from the old one', async () => {
     const index = await buildFixtureIndex({ groups: ['paging'] });
@@ -1270,6 +1443,26 @@ describe('generation switch', () => {
       });
       expect(page(await service.searchLicenses(licenses({}))).total).toBe(8);
     } finally {
+      await index.dispose();
+    }
+  });
+
+  it('serves calls that arrive while the first pointer read is still in flight', async () => {
+    const index = await buildFixtureIndex({ groups: ['paging'] });
+    const service = new UlsIndexService({
+      mirrorDir: index.mirrorDir,
+      redactIndividuals: true,
+      services: ['paging'],
+    });
+    try {
+      const [first, second] = await Promise.all([
+        service.searchLicenses(licenses({ limit: 1 })),
+        service.searchLicenses(licenses({ limit: 1 })),
+      ]);
+      expect(page(first).total).toBeGreaterThan(0);
+      expect(page(second).total).toBe(page(first).total);
+    } finally {
+      await service.close();
       await index.dispose();
     }
   });
@@ -1589,6 +1782,7 @@ describe('band classes', () => {
         { f: 100, c: -4 },
         { f: 200, c: -3 },
         { f: 300, c: -14 },
+        { f: 400, c: -5 },
         { f: 1000, c: 14 },
         { f: 9000, c: 11 },
       ]);
@@ -1619,5 +1813,70 @@ describe('band classes', () => {
     expect(await matches('site', 20001)).toEqual([]);
     expect(await matches('market', 19999)).toEqual(['6003@10000']);
     expect(await matches('market', 9999, 10000)).toEqual(['6003@10000']);
+  });
+
+  it('matches a frequency filed with its upper edge below it at its assigned frequency alone, in both tools', async () => {
+    /** `usi@frequency` of every frequency the transmitter search finds at 6001's site. */
+    const transmitterMatches = async (lowMhz: number, highMhz = lowMhz) =>
+      page(
+        await service.findTransmitters(
+          transmitters({
+            latitude: dms(47, 32, 0),
+            longitude: dms(122, 32, 0, true),
+            radiusKm: 1,
+            band: band(lowMhz, highMhz),
+          }),
+        ),
+      ).rows.flatMap((row) => row.frequencies.map((f) => `${row.usi}@${f.frequencyMhz}`));
+
+    const cases: [low: number, high: number, expected: string[]][] = [
+      [400, 400, ['6001@400']],
+      [350, 400, ['6001@400']],
+      [300, 500, ['6001@300', '6001@400']],
+      [350, 350, []],
+      [360, 390, []],
+    ];
+    for (const [low, high, expected] of cases) {
+      expect(await matches('site', low, high), `${low}–${high}`).toEqual(expected);
+      expect(await transmitterMatches(low, high), `${low}–${high}`).toEqual(expected);
+    }
+    const [row] = page(
+      await service.searchFrequencies(frequencies({ band: band(400), kind: 'site' })),
+    ).rows;
+    expect(row).toMatchObject({ frequencyMhz: 400, upperMhz: 350 });
+  });
+
+  it.each<[string, Partial<SearchFrequenciesParams>]>([
+    ['every kind', { kind: 'both' }],
+    ['site assignments', { kind: 'site' }],
+    ['market blocks', { kind: 'market' }],
+  ])(
+    'walks wide filings for %s with exactly the rows of the exact search',
+    async (_label, overrides) => {
+      const walker = classes.service({ frequencySearch: WALK_LIMITS });
+      for (const searched of [band(0.001, 300_000), band(150, 9000), band(9500, 19_999)]) {
+        const params = frequencies({ band: searched, ...overrides });
+        const exact = page(await service.searchFrequencies({ ...params, limit: 200 }));
+        for (const limit of [1, 2, 200]) {
+          const walked = await walkFrequencies(walker, { ...params, limit });
+          expect(walked.rows, `${searched.lowMhz}–${searched.highMhz}, limit ${limit}`).toEqual(
+            exact.rows,
+          );
+        }
+      }
+    },
+  );
+});
+
+describe('radioServiceLabel', () => {
+  it('labels a known code and falls back to the code itself', () => {
+    expect(radioServiceLabel('CD')).toBe('Paging and Radiotelephone');
+    expect(radioServiceLabel('ZQ')).toBe('ZQ');
+  });
+
+  it('falls back to the code for one named like an object member', () => {
+    for (const code of ['constructor', 'toString', '__proto__']) {
+      expect(radioServiceLabel(code)).toBe(code);
+    }
   });
 });

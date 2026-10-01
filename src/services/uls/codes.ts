@@ -347,6 +347,18 @@ export const DEFAULT_SERVICE_GROUPS: readonly ServiceGroup[] = [
   'amat',
 ];
 
+/**
+ * The label `table` gives a code as filed, or `undefined` when the table has no entry of its
+ * own for it. Codes come from upstream records, so a code named like an object member
+ * (`constructor`, `toString`) must not read through to the prototype.
+ */
+export function codeLabel(
+  table: Readonly<Record<string, string>>,
+  code: string,
+): string | undefined {
+  return Object.hasOwn(table, code) ? table[code] : undefined;
+}
+
 /** Convert a code table to its entry list, in code order. */
 export function toEntries(table: Readonly<Record<string, string>>): CodeEntry[] {
   return Object.entries(table)

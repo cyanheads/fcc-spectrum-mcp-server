@@ -2,8 +2,8 @@
  * @fileoverview Tests for the HTTP ingest schedule: job registration on the real
  * `schedulerService`, each job fired through node-cron's `task.execute()`. Covers the skip
  * while no generation is published, the skip on a held ingest lock, the removal at startup of
- * a lock naming this PID, the stale-checkpoint
- * fallback from the daily refresh to the weekly rebuild, failures logged at the job boundary,
+ * a lock naming this PID, the stale-checkpoint and rebuild-required
+ * fallbacks from the daily refresh to the weekly rebuild, failures logged at the job boundary,
  * the ingester's log lines routed through the framework logger, and `stopIngestSchedule()`
  * (abort, job removal, client disposal; a no-op before start; safe after a half-finished
  * start). Ingester calls that would reach the bulk host are spied; `fetch` throws if called.
@@ -352,6 +352,26 @@ describe('published generation', () => {
       } finally {
         await dangling.remove();
       }
+    });
+
+    it('runs the weekly rebuild instead when the published index needs a rebuild', async () => {
+      vi.spyOn(UlsIngester.prototype, 'refresh').mockRejectedValue(
+        conflict('Rebuild required.', { reason: 'rebuild_required' }),
+      );
+      const rebuild = vi
+        .spyOn(UlsIngester.prototype, 'rebuild')
+        .mockResolvedValue({ status: 'rebuilt', generation: FIXTURE_GENERATION });
+      await start(fixture.mirrorDir);
+      await fire(REFRESH_ID);
+
+      expect(messages('notice')).toContain(
+        'The published index was built by an earlier version of this server; running the weekly rebuild instead.',
+      );
+      expect(rebuild).toHaveBeenCalledTimes(1);
+      expect(extraOf('info', 'Scheduled ULS weekly rebuild rebuilt')).toMatchObject({
+        generation: FIXTURE_GENERATION,
+      });
+      expect(messages('error')).toEqual([]);
     });
 
     it('logs a failure carrying a different reason without falling back', async () => {

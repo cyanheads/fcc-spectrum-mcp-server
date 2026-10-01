@@ -10,7 +10,11 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { JsonRpcErrorCode } from '@cyanheads/mcp-ts-core/errors';
 import { afterEach, beforeEach, describe, expect, it } from 'vitest';
-import { openZipArchive, type ZipArchive } from '@/services/uls/zip-reader.js';
+import {
+  MAX_TEXT_ENTRY_BYTES,
+  openZipArchive,
+  type ZipArchive,
+} from '@/services/uls/zip-reader.js';
 import {
   buildZip,
   datFile,
@@ -171,6 +175,25 @@ describe('reading entries', () => {
     open.push(archive);
     await expect(archive.readText(archive.entries[0] as never)).rejects.toThrow();
   });
+
+  it.each(['deflate', 'store'] as const)(
+    'reads a %s text entry up to the size ceiling and refuses one byte more',
+    async (method) => {
+      const archive = await openBuilt([
+        { name: 'counts', data: 'c'.repeat(MAX_TEXT_ENTRY_BYTES), method },
+        { name: 'big', data: 'c'.repeat(MAX_TEXT_ENTRY_BYTES + 1), method },
+      ]);
+      expect(await archive.readText(archive.find('counts') as never)).toHaveLength(
+        MAX_TEXT_ENTRY_BYTES,
+      );
+      await expect(archive.readText(archive.find('big') as never)).rejects.toMatchObject({
+        code: JsonRpcErrorCode.SerializationError,
+        message: expect.stringContaining(
+          `ZIP entry "big" holds more than ${MAX_TEXT_ENTRY_BYTES} bytes of text`,
+        ),
+      });
+    },
+  );
 });
 
 describe('refusals at open', () => {

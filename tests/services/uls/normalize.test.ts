@@ -82,6 +82,35 @@ describe('parseCoordinateText', () => {
   it('leaves the numeric bound check to the schema for decimal text', () => {
     expect(parseCoordinateText('91', 'latitude')).toBe(91);
   });
+
+  it('accepts whitespace runs and tabs around the DMS separators', () => {
+    const expected = 47 + 37 / 60 + 13.8 / 3600;
+    expect(parseCoordinateText('47  °  37  ′  13.8  ″  N', 'latitude')).toBeCloseTo(expected, 9);
+    expect(parseCoordinateText('47\t-\t37 - 13.8\tN', 'latitude')).toBeCloseTo(expected, 9);
+    expect(parseCoordinateText("47   37   13.8 '' N", 'latitude')).toBeCloseTo(expected, 9);
+    expect(parseCoordinateText('47 - - 37 13.8N', 'latitude')).toBeUndefined();
+  });
+
+  it('reads at most 48 characters of coordinate text', () => {
+    expect(parseCoordinateText(`47.62${'0'.repeat(43)}`, 'latitude')).toBe(47.62);
+    expect(parseCoordinateText(`47.62${'0'.repeat(44)}`, 'latitude')).toBeUndefined();
+    expect(parseCoordinateText(`47-37-13.8N${' '.repeat(38)}`, 'latitude')).toBeUndefined();
+  });
+
+  it('answers long separator runs at once', () => {
+    const run = ' '.repeat(5000);
+    for (const text of [
+      `1${run}X`,
+      `1 2${run}X`,
+      `1 2 3${run}X`,
+      `1${run}2${run}X`,
+      `1 2 3${run}"${run}Q`,
+    ]) {
+      const started = performance.now();
+      expect(parseCoordinateText(text, 'latitude')).toBeUndefined();
+      expect(performance.now() - started).toBeLessThan(10);
+    }
+  });
 });
 
 describe('normalizeCallsign', () => {
@@ -101,7 +130,7 @@ describe('normalizeCallsign', () => {
     expect(normalizeCallsign('VE3/N0CALL')).toBe('VE3/N0CALL');
     // A base callsign short enough to fit the suffix length is still a callsign, not a suffix.
     expect(normalizeCallsign('KH6/W1AW')).toBe('KH6/W1AW');
-    expect(normalizeCallsign('kl7/aa0a')).toBe('KL7/AA0A');
+    expect(normalizeCallsign('kl7/az0z')).toBe('KL7/AZ0Z');
     expect(normalizeCallsign('W1/K1A')).toBe('W1/K1A');
     expect(normalizeCallsign('N0CALL/MOBILE')).toBe('N0CALL/MOBILE');
   });

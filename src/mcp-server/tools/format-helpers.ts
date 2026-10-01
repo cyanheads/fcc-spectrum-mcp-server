@@ -1,16 +1,27 @@
 /**
  * @fileoverview Markdown helpers shared by the tools' `format()` functions: flattening
- * upstream-authored text for inline slots, escaping table cells, and rendering the
- * values every data tool repeats (callsigns, licensee names, state sources, frequency
- * bands, applied filters, option lists).
+ * upstream-authored text for inline slots and escaping its link, image, and HTML syntax,
+ * escaping table cells, and rendering the values every data tool repeats (callsigns,
+ * licensee names, state sources, frequency bands, applied filters, option lists).
  * @module mcp-server/tools/format-helpers
  */
 
-/** Flatten CR/LF runs to one space so registry text cannot break an inline markdown slot. */
-export const inline = (text: string) => text.replace(/[\r\n]+/g, ' ');
+const flatten = (text: string) => text.replace(/[\r\n]+/g, ' ');
 
-/** Inline text escaped for a markdown table cell: backslash first, then pipe. */
-export const cell = (text: string) => inline(text).replace(/\\/g, '\\\\').replace(/\|/g, '\\|');
+/**
+ * Registry text for an inline markdown slot: CR/LF runs flattened to one space, and `[`, `]`,
+ * `<`, and `>` backslash-escaped so a filed name renders as text, never as a link, image, or
+ * HTML. A backslash run right before one of them is doubled, so a filed backslash cannot
+ * cancel the escape. Everything else stays as filed, so names read cleanly as raw text.
+ */
+export const inline = (text: string) =>
+  flatten(text).replace(
+    /(\\*)([[\]<>])/g,
+    (_match, slashes: string, char: string) => `${slashes}${slashes}\\${char}`,
+  );
+
+/** Registry text for a markdown table cell: every backslash, pipe, bracket, and angle bracket escaped. */
+export const cell = (text: string) => flatten(text).replace(/[\\|[\]<>]/g, '\\$&');
 
 /** A boolean as `yes`/`no`. */
 export const yesNo = (value: boolean) => (value ? 'yes' : 'no');

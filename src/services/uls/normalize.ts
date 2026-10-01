@@ -46,17 +46,27 @@ export function dmsToDecimal(
   return direction === negative ? -decimal : decimal;
 }
 
+/** Longest coordinate text read; longer text is never a coordinate and is left to the schema. */
+export const MAX_COORDINATE_TEXT_LENGTH = 48;
+
 const DECIMAL_TEXT = /^[+-]?(?:\d+(?:\.\d*)?|\.\d+)$/;
+/**
+ * DMS over text whose whitespace runs are collapsed to one space. Each separator is a mark
+ * with at most one space on either side, or a lone space, so no two parts of the pattern
+ * can claim the same character and a failed match never backtracks across a run.
+ */
 const DMS_TEXT =
-  /^(\d{1,3})\s*(?:°|-|\s)\s*(\d{1,2})\s*(?:'|′|-|\s)\s*(\d{1,2}(?:\.\d+)?)\s*(?:"|''|″)?\s*([NSEW])$/;
+  /^(\d{1,3})(?: ?[°-] ?| )(\d{1,2})(?: ?['′-] ?| )(\d{1,2}(?:\.\d+)?)(?: ?(?:"|''|″))? ?([NSEW])$/;
 
 /**
  * Parse a coordinate typed as text: a decimal string (`"47.62"`) or a DMS string
  * (`47-37-13.8N`, `47 37 13.8 N`, `47°37'13.8"N`). Returns `undefined` when the text is
- * neither, or when a DMS value fails {@link dmsToDecimal}'s rule.
+ * neither, when it is longer than {@link MAX_COORDINATE_TEXT_LENGTH} (checked before any
+ * pattern runs), or when a DMS value fails {@link dmsToDecimal}'s rule.
  */
 export function parseCoordinateText(text: string, axis: CoordinateAxis): number | undefined {
-  const trimmed = text.trim().toUpperCase();
+  if (text.length > MAX_COORDINATE_TEXT_LENGTH) return;
+  const trimmed = text.trim().toUpperCase().replace(/\s+/g, ' ');
   if (DECIMAL_TEXT.test(trimmed)) return Number(trimmed);
   const match = DMS_TEXT.exec(trimmed);
   if (!match) return;
