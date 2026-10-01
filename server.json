@@ -31,6 +31,34 @@
           "format": "string",
           "isRequired": false,
           "default": "info"
+        },
+        {
+          "name": "FCC_SPECTRUM_MIRROR_DIR",
+          "description": "Directory for the local ULS index generations, current.json, the ingest lock, and temp zips. A relative path resolves against the working directory, so set an absolute path.",
+          "format": "string",
+          "isRequired": false,
+          "default": ".mirror/fcc-uls"
+        },
+        {
+          "name": "FCC_SPECTRUM_SERVICES",
+          "description": "Comma list of weekly ULS service groups to index, case-insensitive. Opt-in: gmrs, ship, aircr.",
+          "format": "string",
+          "isRequired": false,
+          "default": "LMpriv,LMcomm,LMbcast,micro,cell,market,paging,coast,mdsitfs,amat"
+        },
+        {
+          "name": "FCC_SPECTRUM_REDACT_INDIVIDUALS",
+          "description": "Redact individual licensees and trustee names and exclude individuals from name search. Only false/0/no/off disables it.",
+          "format": "string",
+          "isRequired": false,
+          "default": "true"
+        },
+        {
+          "name": "FCC_SPECTRUM_BASE_URL",
+          "description": "ULS bulk file host root, read at ingest time only.",
+          "format": "string",
+          "isRequired": false,
+          "default": "https://data.fcc.gov/download/pub/uls"
         }
       ],
       "transport": {
@@ -88,6 +116,34 @@
           "format": "string",
           "isRequired": false,
           "default": "info"
+        },
+        {
+          "name": "FCC_SPECTRUM_MIRROR_DIR",
+          "description": "Directory for the local ULS index generations, current.json, the ingest lock, and temp zips. A relative path resolves against the working directory, so set an absolute path.",
+          "format": "string",
+          "isRequired": false,
+          "default": ".mirror/fcc-uls"
+        },
+        {
+          "name": "FCC_SPECTRUM_SERVICES",
+          "description": "Comma list of weekly ULS service groups to index, case-insensitive. Opt-in: gmrs, ship, aircr.",
+          "format": "string",
+          "isRequired": false,
+          "default": "LMpriv,LMcomm,LMbcast,micro,cell,market,paging,coast,mdsitfs,amat"
+        },
+        {
+          "name": "FCC_SPECTRUM_REDACT_INDIVIDUALS",
+          "description": "Redact individual licensees and trustee names and exclude individuals from name search. Only false/0/no/off disables it.",
+          "format": "string",
+          "isRequired": false,
+          "default": "true"
+        },
+        {
+          "name": "FCC_SPECTRUM_BASE_URL",
+          "description": "ULS bulk file host root, read at ingest time only.",
+          "format": "string",
+          "isRequired": false,
+          "default": "https://data.fcc.gov/download/pub/uls"
         }
       ],
       "transport": {

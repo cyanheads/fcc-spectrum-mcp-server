@@ -1,45 +1,55 @@
 /**
- * @fileoverview Smoke coverage for every definition shipped by the scaffold.
+ * @fileoverview Smoke coverage for every registered definition.
  * @module tests/smoke/definitions.smoke.test
  */
 
-import { createMockContext } from '@cyanheads/mcp-ts-core/testing';
-import { describe, expect, it } from 'vitest';
-import { echoPrompt } from '@/mcp-server/prompts/definitions/echo.prompt.js';
-import { echoResource } from '@/mcp-server/resources/definitions/echo.resource.js';
-import { echoAppUiResource } from '@/mcp-server/resources/definitions/echo-app-ui.app-resource.js';
-import { echoTool } from '@/mcp-server/tools/definitions/echo.tool.js';
-import { echoAppTool } from '@/mcp-server/tools/definitions/echo-app.app-tool.js';
+import { mkdtempSync, rmSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
+import { createMockContext, getEnrichment } from '@cyanheads/mcp-ts-core/testing';
+import { afterAll, beforeAll, describe, expect, it } from 'vitest';
+import { allToolDefinitions } from '@/mcp-server/tools/definitions/index.js';
+import { listReference } from '@/mcp-server/tools/definitions/list-reference.tool.js';
+import { getUlsIndexService, initUlsIndexService } from '@/services/uls/uls-index-service.js';
 
-describe('scaffold definition smoke test', () => {
-  it('executes the shipped tool, resource, and prompt definitions', async () => {
-    // `echoTool` declares an error contract, so its handler wants a context
-    // typed against it — passing `errors` narrows what `createMockContext` returns.
-    const ctx = createMockContext({ errors: echoTool.errors });
-    const toolResult = await echoTool.handler(echoTool.input.parse({ message: 'smoke' }), ctx);
-    const resourceResult = await echoResource.handler(
-      echoResource.params!.parse({ message: 'smoke' }),
-      ctx,
-    );
-    const promptMessages = await echoPrompt.generate(echoPrompt.args!.parse({ message: 'smoke' }));
-    const appResult = await echoAppTool.handler(
-      echoAppTool.input.parse({ message: 'smoke app' }),
-      ctx,
-    );
-    const appContent = echoAppTool.format?.(appResult);
-    const appHtml = await echoAppUiResource.handler(
-      echoAppUiResource.params!.parse({}),
-      createMockContext({ uri: new URL('ui://template-echo-app/app.html') }),
-    );
+describe('registered definition smoke test', () => {
+  const mirrorDir = mkdtempSync(join(tmpdir(), 'fcc-spectrum-smoke-'));
 
-    expect(toolResult).toEqual({ message: 'smoke' });
-    expect(resourceResult).toEqual({ message: 'smoke' });
-    expect(promptMessages).toEqual([
-      { role: 'user', content: { type: 'text', text: 'Echo: smoke' } },
+  beforeAll(() => {
+    initUlsIndexService({ mirrorDir, redactIndividuals: true, services: ['paging'] });
+  });
+
+  afterAll(async () => {
+    await getUlsIndexService().close();
+    rmSync(mirrorDir, { recursive: true, force: true });
+  });
+
+  it('registers the five fcc_spectrum tools', () => {
+    expect(allToolDefinitions.map((definition) => definition.name)).toEqual([
+      'fcc_spectrum_search_licenses',
+      'fcc_spectrum_get_license',
+      'fcc_spectrum_find_transmitters',
+      'fcc_spectrum_search_frequencies',
+      'fcc_spectrum_list_reference',
     ]);
-    expect(appResult).toEqual(expect.schemaMatching(echoAppTool.output));
-    expect(appContent?.[0]).toEqual({ type: 'text', text: JSON.stringify(appResult) });
-    expect(appHtml).toContain('<title>Echo App</title>');
-    expect(appHtml).toContain('app.callServerTool');
+  });
+
+  it('decodes a vocabulary topic and reports a cold index', async () => {
+    const ctx = createMockContext();
+    const statuses = await listReference.handler(
+      listReference.input.parse({ topic: 'license_statuses' }),
+      ctx,
+    );
+    expect(statuses).toEqual(expect.schemaMatching(listReference.output));
+    expect(statuses.entries?.find((entry) => entry.code === 'A')?.label).toBe('Active');
+
+    const coverageCtx = createMockContext();
+    const coverage = await listReference.handler(
+      listReference.input.parse({ topic: 'coverage', filter: '' }),
+      coverageCtx,
+    );
+    expect(coverage.index).toEqual({ ready: false, status: 'none' });
+    expect(getEnrichment(coverageCtx).notice).toContain('mirror:init');
+    expect(listReference.format?.(coverage)[0]).toMatchObject({ type: 'text' });
   });
 });

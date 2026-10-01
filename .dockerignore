@@ -196,3 +196,5 @@ repomix-output*
 duckdata/
 .claude
 .agents
+# Local ULS index generations (GBs); the image mounts its own volume over .mirror
+.mirror/

@@ -15,7 +15,7 @@
   "interface": {
     "displayName": "fcc-spectrum-mcp-server",
     "shortDescription": "Search FCC radio licenses, frequencies, and transmitter locations.",
-    "longDescription": "Queries US radio spectrum licensing from the FCC Universal Licensing System (ULS): callsign and licensee search, licensed frequencies, and transmitter locations with antenna parameters. Covers commercial wireless, land mobile, microwave, paging, GMRS, marine and aircraft radio, auxiliary broadcast, and amateur radio. Built on the public ULS bulk data, which is keyless. Full-power AM/FM/TV broadcast stations and satellite earth stations are separate FCC systems and are not included.",
+    "longDescription": "Queries US radio spectrum licensing from the FCC Universal Licensing System (ULS): callsign and licensee search, licensed frequencies, and transmitter locations with antenna parameters. Covers cellular and market-area wireless, land mobile, microwave, paging, coast stations, broadband radio service, auxiliary broadcast, and amateur radio, plus spectrum leases; GMRS, ship, and aircraft licensee records can be added. Built on the public ULS bulk data, which is keyless. Full-power AM/FM/TV broadcast stations and satellite earth stations are separate FCC systems and are not included.",
     "developerName": "cyanheads",
     "category": "Research",
     "capabilities": ["Read"],

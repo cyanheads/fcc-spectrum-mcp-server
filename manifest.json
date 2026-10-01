@@ -15,7 +15,11 @@
       "env": {
         "MCP_TRANSPORT_TYPE": "stdio",
         "MCP_AUTH_MODE": "none",
-        "NODE_ENV": "production"
+        "NODE_ENV": "production",
+        "FCC_SPECTRUM_MIRROR_DIR": "${user_config.FCC_SPECTRUM_MIRROR_DIR}",
+        "FCC_SPECTRUM_SERVICES": "${user_config.FCC_SPECTRUM_SERVICES}",
+        "FCC_SPECTRUM_REDACT_INDIVIDUALS": "${user_config.FCC_SPECTRUM_REDACT_INDIVIDUALS}",
+        "FCC_SPECTRUM_BASE_URL": "${user_config.FCC_SPECTRUM_BASE_URL}"
       }
     }
   },
@@ -24,5 +28,34 @@
   },
   "tools_generated": true,
   "prompts_generated": true,
-  "user_config": {}
+  "user_config": {
+    "FCC_SPECTRUM_MIRROR_DIR": {
+      "type": "string",
+      "title": "Index directory",
+      "description": "Absolute path of the directory holding the local ULS index (built once with the mirror:init script). Blank uses .mirror/fcc-uls under the working directory.",
+      "required": false,
+      "default": ""
+    },
+    "FCC_SPECTRUM_SERVICES": {
+      "type": "string",
+      "title": "Service groups",
+      "description": "Comma list of weekly ULS service groups to index. Blank uses the default set (LMpriv, LMcomm, LMbcast, micro, cell, market, paging, coast, mdsitfs, amat).",
+      "required": false,
+      "default": ""
+    },
+    "FCC_SPECTRUM_REDACT_INDIVIDUALS": {
+      "type": "string",
+      "title": "Redact individual licensees",
+      "description": "Only false, 0, no, or off disables redaction of individual licensees; blank keeps it on.",
+      "required": false,
+      "default": ""
+    },
+    "FCC_SPECTRUM_BASE_URL": {
+      "type": "string",
+      "title": "ULS bulk host",
+      "description": "ULS bulk file host root, used only when building or refreshing the index. Blank uses https://data.fcc.gov/download/pub/uls.",
+      "required": false,
+      "default": ""
+    }
+  }
 }

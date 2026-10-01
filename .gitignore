@@ -68,6 +68,7 @@ worker-configuration.d.ts
 # APPLICATION SPECIFIC
 # =============================================================================
 .storage/
+.mirror/
 repomix-output*
 /data/
 docs/api/

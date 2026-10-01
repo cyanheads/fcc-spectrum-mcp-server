@@ -4,6 +4,12 @@
     "args": ["-y", "@cyanheads/fcc-spectrum-mcp-server"],
     "env": {
       "MCP_TRANSPORT_TYPE": "stdio"
-    }
+    },
+    "env_vars": [
+      "FCC_SPECTRUM_MIRROR_DIR",
+      "FCC_SPECTRUM_SERVICES",
+      "FCC_SPECTRUM_REDACT_INDIVIDUALS",
+      "FCC_SPECTRUM_BASE_URL"
+    ]
   }
 }
