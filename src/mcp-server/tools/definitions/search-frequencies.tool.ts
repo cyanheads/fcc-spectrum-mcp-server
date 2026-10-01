@@ -228,6 +228,7 @@ export const searchFrequencies = tool('fcc_spectrum_search_frequencies', {
       reason: 'invalid_cursor',
       code: JsonRpcErrorCode.ValidationError,
       when: 'The cursor does not decode or belongs to an earlier index generation.',
+      severity: 'notice',
       recovery:
         'Call fcc_spectrum_search_frequencies again with the same inputs and no cursor to start from the first page.',
     },

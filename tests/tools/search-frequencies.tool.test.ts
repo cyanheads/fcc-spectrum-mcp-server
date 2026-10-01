@@ -224,6 +224,12 @@ describe('warm index', () => {
       expect(Object.keys(result.structuredContent ?? {})).toEqual(['error']);
     });
 
+    it('logs invalid_cursor at notice, as a caller-input rejection rather than a fault', () => {
+      expect(
+        searchFrequencies.errors?.find((entry) => entry.reason === 'invalid_cursor')?.severity,
+      ).toBe('notice');
+    });
+
     it.each([
       ['a blank frequency_low', { frequency_low: '' }],
       ['a whitespace frequency_low', { frequency_low: '  ', frequency_high: 2530 }],

@@ -154,6 +154,12 @@ describe('warm index', () => {
       );
     });
 
+    it('logs invalid_cursor at notice, as a caller-input rejection rather than a fault', () => {
+      expect(
+        searchLicenses.errors?.find((entry) => entry.reason === 'invalid_cursor')?.severity,
+      ).toBe('notice');
+    });
+
     it.each([
       ['limit 0', { callsign: 'KZZ901', limit: 0 }],
       ['limit 101', { callsign: 'KZZ901', limit: 101 }],

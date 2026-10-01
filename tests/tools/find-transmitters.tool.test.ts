@@ -214,6 +214,12 @@ describe('warm index', () => {
       expect(Object.keys(result.structuredContent ?? {})).toEqual(['error']);
     });
 
+    it('logs invalid_cursor at notice, as a caller-input rejection rather than a fault', () => {
+      expect(
+        findTransmitters.errors?.find((entry) => entry.reason === 'invalid_cursor')?.severity,
+      ).toBe('notice');
+    });
+
     it.each([
       ['DMS minutes of 61', { ...SEATTLE, latitude: '47-61-00 N' }],
       ['a DMS latitude with no hemisphere', { ...SEATTLE, latitude: '47-36-22.3' }],

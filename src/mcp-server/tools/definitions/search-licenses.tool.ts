@@ -184,6 +184,7 @@ export const searchLicenses = tool('fcc_spectrum_search_licenses', {
       reason: 'invalid_cursor',
       code: JsonRpcErrorCode.ValidationError,
       when: 'The cursor does not decode, belongs to an earlier index generation, or is from a licensee search the daily refresh has since changed.',
+      severity: 'notice',
       recovery:
         'Call fcc_spectrum_search_licenses again with the same filters and no cursor to start from the first page.',
     },
