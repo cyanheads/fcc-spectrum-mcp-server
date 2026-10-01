@@ -12,6 +12,8 @@ import { join } from 'node:path';
 import { JsonRpcErrorCode, McpError, serializationError } from '@cyanheads/mcp-ts-core/errors';
 import { afterEach, beforeEach, describe, expect, it } from 'vitest';
 import {
+  bandClassBounds,
+  bandClassSql,
   clearInheritedLock,
   compactStamp,
   createUlsStore,
@@ -78,6 +80,47 @@ describe('LEASE_CALLSIGN', () => {
     expect(LEASE_CALLSIGN.test('L00001234')).toBe(false);
     expect(LEASE_CALLSIGN.test('L0000123456')).toBe(false);
     expect(LEASE_CALLSIGN.test('KA1234567')).toBe(false);
+  });
+});
+
+describe('band classes', () => {
+  /** Widths in MHz paired with the class bandClassSql assigns them. */
+  const CASES: [width: number | null, bandClass: number | null][] = [
+    [0, -14],
+    [2 ** -14, -14],
+    [2 ** -14 * 1.001, -13],
+    [0.0125, -6],
+    [0.0625, -4],
+    [0.0626, -3],
+    [3100, 12],
+    [8192, 13],
+    [8192.5, 14],
+    [1e6, 14],
+    [null, null],
+  ];
+
+  it('assigns the smallest power-of-two class a width fits, the open class above 8192 MHz', async () => {
+    const store = createUlsStore(join(dir, 'gen.db'));
+    try {
+      const query = (await store.raw()).prepare<{ c: number | null }>(
+        `SELECT ${bandClassSql('w')} AS c FROM (SELECT ? AS w)`,
+      );
+      for (const [width, bandClass] of CASES) {
+        expect(query.get(width)?.c, String(width)).toBe(bandClass);
+      }
+    } finally {
+      await store.close();
+    }
+  });
+
+  it('bounds every class by a width no row in it exceeds, the open class by the widest band', () => {
+    const bounds = new Map(bandClassBounds(19_000));
+    expect([...bounds.keys()]).toEqual(Array.from({ length: 29 }, (_, i) => i - 14));
+    expect(bounds.get(14)).toBe(19_000);
+    for (const [width, bandClass] of CASES) {
+      if (width === null || bandClass === null || bandClass === 14) continue;
+      expect(bounds.get(bandClass), String(width)).toBeGreaterThanOrEqual(width);
+    }
   });
 });
 
@@ -294,9 +337,9 @@ describe('createUlsStore', () => {
         'locations_site_state',
         'antennas_key',
         'frequencies_key',
-        'frequencies_occ_low',
+        'frequencies_band',
         'market_blocks_usi',
-        'market_blocks_lower',
+        'market_blocks_band',
       ]) {
         expect(indexes, index).toContain(index);
       }
@@ -368,6 +411,50 @@ describe('createUlsStore', () => {
         [8, 1, 1],
         [7, 1, 3],
       ]);
+    } finally {
+      await upgraded.close();
+    }
+  });
+
+  it('classes the frequencies and market blocks by width when upgrading a schema 2 generation', async () => {
+    const path = join(dir, 'gen.db');
+    const v2 = createUlsStore(path);
+    try {
+      // The schema 2 layout: no band_class columns, lower-edge-only indexes, stamped version 2.
+      (await v2.raw()).exec(
+        `DROP INDEX frequencies_band;
+         DROP INDEX market_blocks_band;
+         ALTER TABLE frequencies DROP COLUMN band_class;
+         ALTER TABLE market_blocks DROP COLUMN band_class;
+         CREATE INDEX frequencies_occ_low ON frequencies (occ_low);
+         CREATE INDEX market_blocks_lower ON market_blocks (lower);
+         INSERT INTO frequencies (usi, location_number, antenna_number, freq_seq_id, occ_low, occ_high)
+           VALUES (1, 1, 1, 1, 152.24, 152.24), (1, 1, 1, 2, 152.234, 152.246),
+                  (1, 1, 1, 3, 15700, 17300), (1, 1, 1, 4, NULL, NULL);
+         INSERT INTO market_blocks (usi, partition_area_id, lower, upper)
+           VALUES (2, 0, 1850, 1865), (2, 0, 0, 10), (2, 0, 3000, 8000), (2, 0, 3700, NULL);
+         UPDATE schema_version SET version = 2;`,
+      );
+    } finally {
+      await v2.close();
+    }
+    const upgraded = createUlsStore(path);
+    try {
+      const db = await upgraded.raw();
+      const classes = (table: string) =>
+        db
+          .prepare<{ band_class: number | null }>(`SELECT band_class FROM ${table} ORDER BY rowid`)
+          .all()
+          .map((row) => row.band_class);
+      expect(classes('frequencies')).toEqual([-14, -6, 11, null]);
+      expect(classes('market_blocks')).toEqual([4, 4, 13, -14]);
+      const indexes = db
+        .prepare<{ name: string }>("SELECT name FROM sqlite_master WHERE type = 'index'")
+        .all()
+        .map((row) => row.name);
+      expect(indexes).toEqual(expect.arrayContaining(['frequencies_band', 'market_blocks_band']));
+      expect(indexes).not.toContain('frequencies_occ_low');
+      expect(indexes).not.toContain('market_blocks_lower');
     } finally {
       await upgraded.close();
     }

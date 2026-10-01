@@ -23,6 +23,7 @@ import {
   type ServiceGroup,
 } from './codes.js';
 import {
+  bandClassBounds,
   createUlsStore,
   type GenerationPointer,
   type GroupStats,
@@ -1217,7 +1218,8 @@ export class UlsIndexService {
    * Authorizations whose occupied band overlaps `band`: collapsed site assignments and
    * market blocks (collapsed across partition areas), merged in frequency order and
    * keyset-paginated on `(frequency, kind, usi, location_number or 0, upper edge ?? 0)`.
-   * Each range scan is bounded by the widest stored band, so no query scans the index. A
+   * Each band class is scanned from the query's low edge minus that class's widest band
+   * ({@link bandScan}), so a lookup reads only rows that can overlap it. A
    * frequency filed against a location number several sites share is one row carrying
    * `sitesSharingNumber` in place of a site's coordinates and place.
    */
@@ -1285,14 +1287,15 @@ export class UlsIndexService {
     fetch: number,
   ): { rows: { key: CursorKey; row: FrequencyAssignment }[]; total: number } {
     const overlap = this.overlapArgs(params.band);
-    const maxBand = readMetaNumber(db, META_KEYS.maxSiteBand);
+    const scan = bandScan('f', 'occ_low', overlap, readMetaNumber(db, META_KEYS.maxSiteBand));
     const where = [
-      'f.occ_low BETWEEN ? AND ?',
+      'f.occ_low <= ?',
       'f.occ_high >= ?',
+      scan.sql,
       'f.frequency_mhz IS NOT NULL',
       ...licenseWhere,
     ];
-    const args: SqlValue[] = [overlap.low - maxBand, overlap.high, overlap.low, ...licenseArgs];
+    const args: SqlValue[] = [overlap.high, overlap.low, ...scan.args, ...licenseArgs];
     if (params.state) {
       where.push('lo.site_state = ?');
       args.push(params.state);
@@ -1384,14 +1387,15 @@ export class UlsIndexService {
     fetch: number,
   ): { rows: { key: CursorKey; row: FrequencyAssignment }[]; total: number } {
     const overlap = this.overlapArgs(params.band);
-    const maxBand = readMetaNumber(db, META_KEYS.maxMarketBand);
+    const scan = bandScan('mb', 'lower', overlap, readMetaNumber(db, META_KEYS.maxMarketBand));
     const where = [
-      'mb.lower BETWEEN ? AND ?',
+      'mb.lower <= ?',
       'mb.lower > 0',
       'COALESCE(mb.upper, mb.lower) >= ?',
+      scan.sql,
       ...licenseWhere,
     ];
-    const args: SqlValue[] = [overlap.low - maxBand, overlap.high, overlap.low, ...licenseArgs];
+    const args: SqlValue[] = [overlap.high, overlap.low, ...scan.args, ...licenseArgs];
     if (params.state) {
       where.push('l.market_states LIKE ?');
       args.push(`%,${params.state},%`);
@@ -1689,6 +1693,28 @@ function readRefreshState(db: SqliteHandle): string {
     )
     .get();
   return `${state?.applied ?? 0}.${state?.latest ?? ''}`;
+}
+
+/**
+ * The overlap test's lower-edge range scan as one index range per band class: a row of class
+ * `c` that overlaps `[low, high]` has its lower edge in `[low − bound(c), high]`
+ * ({@link bandClassBounds}), so a narrow lookup never reads rows only a wide filing could
+ * reach. `widest` is the table's stored widest band, which bounds the open class. Callers put
+ * the overlap test itself ahead of it, so a plan that reaches rows by license or state checks
+ * that before the per-class ranges.
+ */
+function bandScan(
+  alias: string,
+  lowerEdge: string,
+  overlap: { high: number; low: number },
+  widest: number,
+): { args: SqlValue[]; sql: string } {
+  const bounds = bandClassBounds(widest);
+  const range = `(${alias}.band_class = ? AND ${alias}.${lowerEdge} BETWEEN ? AND ?)`;
+  return {
+    sql: `(${bounds.map(() => range).join(' OR ')})`,
+    args: bounds.flatMap(([bandClass, bound]) => [bandClass, overlap.low - bound, overlap.high]),
+  };
 }
 
 /**

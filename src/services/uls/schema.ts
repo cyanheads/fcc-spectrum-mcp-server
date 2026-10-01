@@ -19,7 +19,7 @@ import {
 export const MIRROR_NAME = 'fcc-uls';
 
 /** Current store schema version; bump it and add a migration on any schema change. */
-export const SCHEMA_VERSION = 2;
+export const SCHEMA_VERSION = 3;
 
 /** License statuses whose records keep sites, antennas, frequencies, and market blocks. */
 export const LIVE_STATUSES = ['A', 'L', 'X'] as const;
@@ -142,19 +142,21 @@ CREATE TABLE IF NOT EXISTS frequencies (
   emissions TEXT,
   bandwidth_mhz REAL,
   occ_low REAL,
-  occ_high REAL
+  occ_high REAL,
+  band_class INTEGER
 );
 CREATE INDEX IF NOT EXISTS frequencies_key ON frequencies (usi, location_number);
-CREATE INDEX IF NOT EXISTS frequencies_occ_low ON frequencies (occ_low);
+CREATE INDEX IF NOT EXISTS frequencies_band ON frequencies (band_class, occ_low);
 
 CREATE TABLE IF NOT EXISTS market_blocks (
   usi INTEGER NOT NULL,
   partition_area_id INTEGER NOT NULL,
   lower REAL NOT NULL,
-  upper REAL
+  upper REAL,
+  band_class INTEGER
 );
 CREATE INDEX IF NOT EXISTS market_blocks_usi ON market_blocks (usi);
-CREATE INDEX IF NOT EXISTS market_blocks_lower ON market_blocks (lower);
+CREATE INDEX IF NOT EXISTS market_blocks_band ON market_blocks (band_class, lower);
 
 CREATE TABLE IF NOT EXISTS service_codes (
   code TEXT PRIMARY KEY NOT NULL,
@@ -183,9 +185,9 @@ CREATE TABLE IF NOT EXISTS meta (
 
 /** Keys of the `meta` table. */
 export const META_KEYS = {
-  /** Widest occupied band among site frequency rows, in MHz — bounds the `occ_low` range scan. */
+  /** Widest occupied band among site frequency rows, in MHz — bounds the open band class's scan. */
   maxSiteBand: 'max_site_band_mhz',
-  /** Widest market block, in MHz — bounds the `market_blocks.lower` range scan. */
+  /** Widest market block, in MHz — bounds the open band class's scan of `market_blocks`. */
   maxMarketBand: 'max_market_band_mhz',
   /** Per-group record, site, and frequency counts, as JSON. */
   groupStats: 'group_stats',
@@ -205,6 +207,39 @@ export type RecordStats = Record<
   string,
   { kept: number; read: number; rejected: number; orphaned?: number }
 >;
+
+/** Lowest band class: occupied widths up to 2^-14 MHz (about 61 Hz), zero included. */
+const MIN_BAND_CLASS = -14;
+
+/** Highest power-of-two band class (8,192 MHz); a wider band falls in the open class above it. */
+const MAX_BAND_CLASS = 13;
+
+/**
+ * SQL for the band class of an occupied width in MHz, `NULL` for `NULL`: the smallest `c` from
+ * {@link MIN_BAND_CLASS} to {@link MAX_BAND_CLASS} with `width ≤ 2^c`, else the open class
+ * `MAX_BAND_CLASS + 1`. Rows are indexed on `(band_class, lower edge)`, so an overlap lookup
+ * scans each class from the query's low edge minus that class's widest band
+ * ({@link bandClassBounds}), and a narrow lookup never pays for a wide filing. A CASE ladder
+ * rather than `log2()`, which is a compile-time option of SQLite.
+ */
+export function bandClassSql(width: string): string {
+  const steps: string[] = [];
+  for (let c = MIN_BAND_CLASS; c <= MAX_BAND_CLASS; c++) {
+    steps.push(`WHEN ${width} <= ${2 ** c} THEN ${c}`);
+  }
+  return `CASE ${steps.join(' ')} WHEN ${width} IS NOT NULL THEN ${MAX_BAND_CLASS + 1} END`;
+}
+
+/**
+ * Every band class with the widest occupied band it can hold: a power-of-two class its
+ * ceiling, and the open class `widest`, the table's stored widest band (kept in `meta`).
+ */
+export function bandClassBounds(widest: number): [bandClass: number, bound: number][] {
+  const bounds: [number, number][] = [];
+  for (let c = MIN_BAND_CLASS; c <= MAX_BAND_CLASS; c++) bounds.push([c, 2 ** c]);
+  bounds.push([MAX_BAND_CLASS + 1, widest]);
+  return bounds;
+}
 
 /**
  * Schema 2: add `locations.site_seq` to a schema 1 generation, numbering the sites under each
@@ -228,6 +263,30 @@ function addSiteSeq(handle: SqliteHandle): void {
   );
 }
 
+/**
+ * Schema 3: give a schema 2 generation's frequencies and market blocks their
+ * {@link bandClassSql band class}, indexed with the lower edge in place of the lower-edge-only
+ * indexes. A database {@link AUX_DDL} just created already has both.
+ */
+function addBandClasses(handle: SqliteHandle): void {
+  const present = handle
+    .prepare<{ n: number }>(
+      "SELECT count(*) AS n FROM pragma_table_info('frequencies') WHERE name = 'band_class'",
+    )
+    .get()?.n;
+  if (present) return;
+  handle.exec(
+    `DROP INDEX IF EXISTS frequencies_occ_low;
+     DROP INDEX IF EXISTS market_blocks_lower;
+     ALTER TABLE frequencies ADD COLUMN band_class INTEGER;
+     UPDATE frequencies SET band_class = ${bandClassSql('occ_high - occ_low')};
+     CREATE INDEX frequencies_band ON frequencies (band_class, occ_low);
+     ALTER TABLE market_blocks ADD COLUMN band_class INTEGER;
+     UPDATE market_blocks SET band_class = ${bandClassSql('COALESCE(upper, lower) - lower')};
+     CREATE INDEX market_blocks_band ON market_blocks (band_class, lower);`,
+  );
+}
+
 /** Create the SQLite mirror store for one generation file. Nothing opens until first use. */
 export function createUlsStore(path: string): MirrorStore {
   return sqliteMirrorStore({
@@ -246,6 +305,7 @@ export function createUlsStore(path: string): MirrorStore {
     migrations: [
       { version: 1, up: (handle: SqliteHandle) => handle.exec(AUX_DDL) },
       { version: 2, up: addSiteSeq },
+      { version: 3, up: addBandClasses },
     ],
   });
 }

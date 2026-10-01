@@ -52,6 +52,7 @@ import {
   toIsoSeconds,
 } from './dat.js';
 import {
+  bandClassSql,
   compactStamp,
   createUlsStore,
   type GenerationPointer,
@@ -1183,7 +1184,8 @@ function insertRecords(db: SqliteHandle): number {
  * Insert staged technical rows. Frequencies take their emissions (distinct, comma-joined)
  * and widest necessary bandwidth from EM rows joined on `(usi, location, antenna,
  * freq_seq_id)`, and the occupied band `[f − bw/2, (upper ?? f) + bw/2]`. A bandwidth of
- * {@link MAX_FRACTIONAL_BANDWIDTH} × f or more is a filing error and counts as none. EM
+ * {@link MAX_FRACTIONAL_BANDWIDTH} × f or more is a filing error and counts as none.
+ * Frequencies and market blocks take the {@link bandClassSql band class} of their width. EM
  * rows with no FR partner are dropped and counted in `stats.EM.orphaned`. Sites a license
  * files under one location number take `site_seq` 1, 2, … in filing order.
  */
@@ -1203,17 +1205,22 @@ function insertTechnical(db: SqliteHandle, stats: RecordStats): void {
      INSERT INTO antennas SELECT * FROM temp.stage_an;
      INSERT INTO frequencies (usi, location_number, antenna_number, freq_seq_id, class_station,
        frequency_mhz, upper_mhz, power_output_w, erp_w, eirp_dbm, transmitter_make,
-       transmitter_model, emissions, bandwidth_mhz, occ_low, occ_high)
-       SELECT f.usi, f.location_number, f.antenna_number, f.freq_seq_id, f.class_station,
-         f.frequency_mhz, f.upper_mhz, f.power_output_w, f.erp_w, f.eirp_dbm, f.transmitter_make,
-         f.transmitter_model, group_concat(DISTINCT e.emission_code), ${bandwidth},
-         f.frequency_mhz - COALESCE(${bandwidth}, 0) / 2.0,
-         COALESCE(f.upper_mhz, f.frequency_mhz) + COALESCE(${bandwidth}, 0) / 2.0
-       FROM temp.stage_fr f
-       LEFT JOIN temp.stage_em e ON e.usi = f.usi AND e.location_number = f.location_number
-         AND e.antenna_number = f.antenna_number AND e.freq_seq_id = f.freq_seq_id
-       GROUP BY f.rowid;
-     INSERT INTO market_blocks SELECT * FROM temp.stage_mf;`,
+       transmitter_model, emissions, bandwidth_mhz, occ_low, occ_high, band_class)
+       SELECT *, ${bandClassSql('occ_high - occ_low')} FROM (
+         SELECT f.usi, f.location_number, f.antenna_number, f.freq_seq_id, f.class_station,
+           f.frequency_mhz, f.upper_mhz, f.power_output_w, f.erp_w, f.eirp_dbm,
+           f.transmitter_make, f.transmitter_model, group_concat(DISTINCT e.emission_code),
+           ${bandwidth},
+           f.frequency_mhz - COALESCE(${bandwidth}, 0) / 2.0 AS occ_low,
+           COALESCE(f.upper_mhz, f.frequency_mhz) + COALESCE(${bandwidth}, 0) / 2.0 AS occ_high
+         FROM temp.stage_fr f
+         LEFT JOIN temp.stage_em e ON e.usi = f.usi AND e.location_number = f.location_number
+           AND e.antenna_number = f.antenna_number AND e.freq_seq_id = f.freq_seq_id
+         GROUP BY f.rowid);
+     INSERT INTO market_blocks (usi, partition_area_id, lower, upper, band_class)
+       SELECT usi, partition_area_id, lower, upper,
+         ${bandClassSql('COALESCE(upper, lower) - lower')}
+       FROM temp.stage_mf;`,
   );
   const em = stats.EM;
   if (em) {
@@ -1231,9 +1238,10 @@ function insertTechnical(db: SqliteHandle, stats: RecordStats): void {
 
 /**
  * Widen the stored widest-band bounds to cover the rows of every USI in `temp.apply`, in the
- * daily file's transaction. The overlap range scans trust these bounds, so a committed row
- * wider than them must never be visible without them — not to a reader mid-run, and not
- * after a refresh that stops partway, before {@link recomputeSummaries} runs.
+ * daily file's transaction. The overlap range scan of the open band class trusts these
+ * bounds, so a committed row wider than them must never be visible without them — not to a
+ * reader mid-run, and not after a refresh that stops partway, before
+ * {@link recomputeSummaries} runs.
  */
 function widenBandBounds(db: SqliteHandle): void {
   db.exec(
@@ -1248,7 +1256,7 @@ function widenBandBounds(db: SqliteHandle): void {
 
 /**
  * Refresh derived bookkeeping after a run: per-code record counts, the widest site and
- * market bands (which bound the overlap range scans; a daily file only widens them, see
+ * market bands (which bound the open band class's scan; a daily file only widens them, see
  * {@link widenBandBounds}), and per-group coverage counts. A market block with a 0 lower
  * edge records a channel width, not a frequency, so it never bounds a scan.
  */

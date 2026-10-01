@@ -1444,6 +1444,77 @@ export const QUIRKS_WEEKLY: FixtureFile = {
   ]),
 };
 
+/**
+ * A paging-slot snapshot of occupied widths at and past the band-class ceilings, every record
+ * active: KZZ601 (USI 6001, CD) files 100 MHz on a 62.5 kHz emission (exactly 2^-4 MHz wide),
+ * 200 MHz on a 62.6 kHz one (just past it), 300 MHz with no emission (zero width), and 9000
+ * MHz on a 1.6 GHz radar emission (8200–9800 MHz); KZZ602 (USI 6002, RS) a 1000–20000 MHz
+ * range, wider than the largest power-of-two class; KZZ603 (USI 6003, CW) a 700–700.5 MHz
+ * market block (exactly 2^-1 MHz) and a 10000–20000 MHz one.
+ */
+export const BAND_CLASS_WEEKLY: FixtureFile = {
+  countsCreated: PAGING_WEEKLY.countsCreated,
+  lastModified: PAGING_WEEKLY.lastModified,
+  zip: buildZip([
+    { name: 'counts', data: countsFile('Sun Sep 27 09:38:53 EDT 2026', { HD: 3, EN: 3 }) },
+    {
+      name: 'HD.dat',
+      data: datFile([
+        hd({ usi: 6001, callsign: 'KZZ601', status: 'A', service: 'CD', grant: '01/01/2020' }),
+        hd({ usi: 6002, callsign: 'KZZ602', status: 'A', service: 'RS', grant: '01/01/2020' }),
+        hd({ usi: 6003, callsign: 'KZZ603', status: 'A', service: 'CW', grant: '01/01/2020' }),
+      ]),
+    },
+    {
+      name: 'EN.dat',
+      data: datFile([
+        en({ usi: 6001, name: 'Class Ceiling Paging', state: 'WA', applicantType: 'C' }),
+        en({ usi: 6002, name: 'Broad Range Survey', state: 'WA', applicantType: 'C' }),
+        en({ usi: 6003, name: 'Block Edge Wireless', state: 'WA', applicantType: 'C' }),
+      ]),
+    },
+    { name: 'MK.dat', data: datFile([mk({ usi: 6003, code: 'CMA001', name: 'Seattle, WA' })]) },
+    {
+      name: 'LO.dat',
+      data: datFile([
+        lo({ usi: 6001, number: 1, type: 'F', lat: [47, 32, 0, 'N'], lon: [122, 32, 0, 'W'] }),
+        lo({ usi: 6002, number: 1, type: 'F', lat: [47, 33, 0, 'N'], lon: [122, 33, 0, 'W'] }),
+      ]),
+    },
+    {
+      name: 'AN.dat',
+      data: datFile([
+        an({ usi: 6001, antenna: 1, location: 1, type: 'T' }),
+        an({ usi: 6002, antenna: 1, location: 1, type: 'T' }),
+      ]),
+    },
+    {
+      name: 'FR.dat',
+      data: datFile([
+        ...[100, 200, 300, 9000].map((frequency, i) =>
+          fr({ usi: 6001, location: 1, antenna: 1, seq: i + 1, frequency }),
+        ),
+        fr({ usi: 6002, location: 1, antenna: 1, seq: 1, frequency: 1000, upper: 20000 }),
+      ]),
+    },
+    {
+      name: 'EM.dat',
+      data: datFile([
+        em({ usi: 6001, location: 1, antenna: 1, seq: 1, code: '62K5F3E' }),
+        em({ usi: 6001, location: 1, antenna: 1, seq: 2, code: '62K6F3E' }),
+        em({ usi: 6001, location: 1, antenna: 1, seq: 4, code: '1G60N0N' }),
+      ]),
+    },
+    {
+      name: 'MF.dat',
+      data: datFile([
+        mf({ usi: 6003, partition: 1, lower: 700, upper: 700.5 }),
+        mf({ usi: 6003, partition: 1, lower: 10000, upper: 20000 }),
+      ]),
+    },
+  ]),
+};
+
 /** The fixture weekly snapshot of each group. */
 export const WEEKLY_FIXTURES = {
   paging: PAGING_WEEKLY,

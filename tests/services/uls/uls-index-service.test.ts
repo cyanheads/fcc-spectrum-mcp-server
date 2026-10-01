@@ -33,6 +33,7 @@ import type {
 } from '@/services/uls/types.js';
 import { UlsIndexService } from '@/services/uls/uls-index-service.js';
 import {
+  BAND_CLASS_WEEKLY,
   DAILY_PG_MON,
   FakeIngestClient,
   PAGING_WEEKLY,
@@ -1552,5 +1553,71 @@ describe('filing quirks', () => {
       ]);
       expect(single.rows[0]).not.toHaveProperty('sitesSharingNumber');
     });
+  });
+});
+
+describe('band classes', () => {
+  let classes: FixtureIndex;
+  let service: UlsIndexService;
+
+  beforeAll(async () => {
+    classes = await buildFixtureIndex({
+      groups: ['paging'],
+      weekly: { paging: BAND_CLASS_WEEKLY },
+    });
+    service = classes.service();
+  });
+
+  afterAll(async () => {
+    await classes?.dispose();
+  });
+
+  /** `usi@frequency` of every row of one kind overlapping `[lowMhz, highMhz]`. */
+  const matches = async (kind: 'market' | 'site', lowMhz: number, highMhz = lowMhz) =>
+    page(
+      await service.searchFrequencies(frequencies({ band: band(lowMhz, highMhz), kind })),
+    ).rows.map((row) => `${row.usi}@${row.frequencyMhz}`);
+
+  it('stores each frequency and market block in the class of its occupied width', async () => {
+    const store = createUlsStore(join(classes.mirrorDir, classes.generation));
+    try {
+      const db = await store.raw();
+      const rows = (sql: string) => db.prepare<{ c: number; f: number }>(sql).all();
+      expect(
+        rows('SELECT frequency_mhz AS f, band_class AS c FROM frequencies ORDER BY frequency_mhz'),
+      ).toEqual([
+        { f: 100, c: -4 },
+        { f: 200, c: -3 },
+        { f: 300, c: -14 },
+        { f: 1000, c: 14 },
+        { f: 9000, c: 11 },
+      ]);
+      expect(rows('SELECT lower AS f, band_class AS c FROM market_blocks ORDER BY lower')).toEqual([
+        { f: 700, c: -1 },
+        { f: 10000, c: 14 },
+      ]);
+    } finally {
+      await store.close();
+    }
+  });
+
+  it('matches a row as wide as its class ceiling, or just wider, at both edges and no further', async () => {
+    expect(await matches('site', 99.96875)).toEqual(['6001@100']);
+    expect(await matches('site', 100.03125)).toEqual(['6001@100']);
+    expect(await matches('site', 100.0313)).toEqual([]);
+    expect(await matches('site', 199.9687)).toEqual(['6001@200']);
+    expect(await matches('site', 200.0313)).toEqual(['6001@200']);
+    expect(await matches('site', 300)).toEqual(['6001@300']);
+    expect(await matches('site', 300.000001)).toEqual([]);
+    expect(await matches('market', 700.5)).toEqual(['6003@700']);
+  });
+
+  it('matches a wide filing anywhere inside it, the open class included', async () => {
+    expect(await matches('site', 8200.5)).toEqual(['6002@1000', '6001@9000']);
+    expect(await matches('site', 9799.5)).toEqual(['6002@1000', '6001@9000']);
+    expect(await matches('site', 19999)).toEqual(['6002@1000']);
+    expect(await matches('site', 20001)).toEqual([]);
+    expect(await matches('market', 19999)).toEqual(['6003@10000']);
+    expect(await matches('market', 9999, 10000)).toEqual(['6003@10000']);
   });
 });
