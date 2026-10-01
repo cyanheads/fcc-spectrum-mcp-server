@@ -37,6 +37,7 @@ describe('callsignSchema', () => {
 
   it('rejects a prefix form, a too-short value, wildcards, and non-strings', () => {
     expect(callsignSchema.safeParse('VE3/N0CALL').success).toBe(false);
+    expect(callsignSchema.safeParse('KH6/W1AW').success).toBe(false);
     expect(callsignSchema.safeParse('AB').success).toBe(false);
     expect(callsignSchema.safeParse('*').success).toBe(false);
     expect(callsignSchema.safeParse('N0CALL*').success).toBe(false);
@@ -122,6 +123,26 @@ describe('licenseStatusSchema and liveStatusSchema', () => {
     for (const status of ['C', 'E', 'P', 'T']) {
       expect(liveStatusSchema.safeParse(status).success).toBe(false);
     }
+  });
+
+  it.each([
+    ['active', 'A'],
+    [' Expired ', 'E'],
+    ['canceled', 'C'],
+    ['CANCELLED', 'C'],
+    ['terminated', 'T'],
+    ['term pending', 'X'],
+    ['Pending  Legal', 'L'],
+    ['pending legal status', 'L'],
+    ['parent station cancelled', 'P'],
+  ])('maps the status word %j to its one code %s', (word, code) => {
+    expect(accepted(licenseStatusSchema, word)).toBe(code);
+  });
+
+  it('applies the live set to a status word and rejects one naming two statuses', () => {
+    expect(accepted(liveStatusSchema, 'Active')).toBe('A');
+    expect(liveStatusSchema.safeParse('expired').success).toBe(false);
+    expect(licenseStatusSchema.safeParse('pending').success).toBe(false);
   });
 });
 

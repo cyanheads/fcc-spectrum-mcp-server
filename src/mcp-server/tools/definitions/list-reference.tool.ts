@@ -7,7 +7,7 @@
 
 import { tool, z } from '@cyanheads/mcp-ts-core';
 import { cell, yesNo } from '@/mcp-server/tools/format-helpers.js';
-import { blankAsUnset } from '@/mcp-server/tools/input-schemas.js';
+import { blankAsUnset, caseFolded } from '@/mcp-server/tools/input-schemas.js';
 import {
   ANTENNA_TYPES,
   APPLICANT_TYPES,
@@ -145,11 +145,9 @@ export const listReference = tool('fcc_spectrum_list_reference', {
     'Decode FCC ULS codes used by the other tools — radio service codes, license statuses, location types, antenna types, applicant types, amateur operator classes — or report coverage: which service groups this index holds, record counts, and when each was last updated. Works before the index is built.',
   annotations: { readOnlyHint: true, idempotentHint: true, openWorldHint: false },
   input: z.object({
-    topic: z
-      .enum(TOPICS)
-      .describe(
-        'What to list: a code vocabulary (radio_services, license_statuses, location_types, antenna_types, applicant_types, operator_classes) or coverage, the index build state and loaded service groups.',
-      ),
+    topic: caseFolded(z.enum(TOPICS)).describe(
+      'What to list: a code vocabulary (radio_services, license_statuses, location_types, antenna_types, applicant_types, operator_classes) or coverage, the index build state and loaded service groups.',
+    ),
     filter: blankAsUnset(z.string().max(200).optional()).describe(
       'Radio services only: keep entries whose code and label contain every word given, in any order (e.g. "700 public safety"). Case- and accent-insensitive.',
     ),
@@ -251,7 +249,7 @@ export const listReference = tool('fcc_spectrum_list_reference', {
       );
       lines.push(
         '',
-        `${result.entries.length} entries`,
+        `${result.entries.length} ${result.entries.length === 1 ? 'entry' : 'entries'}`,
         '',
         withIndex ? '| Code | Label | Group | Indexed records |' : '| Code | Label |',
         withIndex ? '|:-----|:------|:------|----------------:|' : '|:-----|:------|',

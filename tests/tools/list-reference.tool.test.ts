@@ -205,6 +205,13 @@ describe('warm index', () => {
   });
 
   it.each([
+    [' License_Statuses ', 'license_statuses'],
+    ['COVERAGE', 'coverage'],
+  ])('case-folds the topic %j', (topic, expected) => {
+    expect(listReference.input.parse({ topic }).topic).toBe(expected);
+  });
+
+  it.each([
     ['an unknown topic', { topic: 'callsigns' }],
     ['a 201-character filter', { topic: 'radio_services', filter: 'x'.repeat(201) }],
   ])('rejects %s with InvalidParams', async (_label, input) => {
@@ -265,6 +272,16 @@ describe('format()', () => {
     const row = rendered.split('\n').find((line) => line.startsWith('| Z'));
     expect(row).toBe('| Z\\|Q | Line one line two \\| piped | paging | — |');
     expect(rendered).not.toMatch(/two \| piped/);
+  });
+
+  it('counts one entry in the singular and several in the plural', () => {
+    const entry = { code: 'A', label: 'Active' };
+    expect(formatText({ topic: 'license_statuses', entries: [entry] }).split('\n')).toContain(
+      '1 entry',
+    );
+    expect(
+      formatText({ topic: 'license_statuses', entries: [entry, entry] }).split('\n'),
+    ).toContain('2 entries');
   });
 
   it('renders a multi-line index error as quoted lines', () => {

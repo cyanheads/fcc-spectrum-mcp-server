@@ -159,6 +159,13 @@ export const RADIO_SERVICES: Readonly<Record<string, string>> = {
   ZV: '218-219 MHz Service',
 };
 
+/**
+ * The band, in MHz, a Priority Access License (radio service `PL`) channel lies in (47 CFR
+ * 96.11(a)(2)). The Spectrum Access System assigns the 10 MHz channel, so ULS files a PAL
+ * block as 0–10 MHz rather than as frequencies.
+ */
+export const PAL_BAND_MHZ = { low: 3550, high: 3650 } as const;
+
 /** License status code → label (HD field 6). */
 export const LICENSE_STATUSES: Readonly<Record<string, string>> = {
   A: 'Active',

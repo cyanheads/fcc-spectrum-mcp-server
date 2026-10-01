@@ -151,6 +151,14 @@ export function emissionBandwidthMhz(designator: string): number | null {
 }
 
 /**
+ * A designator whose bandwidth is this fraction of the assigned frequency or more is a
+ * filing error (`5G75C3F` on 470 MHz) and is left out of the bandwidth and occupied band.
+ * It is the fractional-bandwidth leg of the ultra-wideband definition in 47 CFR 15.503(d);
+ * licensed ULS stations are not ultra-wideband.
+ */
+export const MAX_FRACTIONAL_BANDWIDTH = 0.2;
+
+/**
  * Occupied band of a site assignment in MHz: `[f − bw/2, (upper ?? f) + bw/2]`, where
  * `bw` is the widest necessary bandwidth among its emissions (0 when none parses).
  */
@@ -231,7 +239,10 @@ export interface HdRecord {
   usi: number;
 }
 
-/** Decode an HD line. */
+/**
+ * Decode an HD line. The license status is upper-cased: ULS files the odd one in lower case
+ * (`c`), which would miss its label and, for a live status, the live-status filter.
+ */
 export function decodeHd(line: string): HdRecord | null {
   const f = splitRecord(line, 'HD');
   const usi = f && numberField(f, 2);
@@ -239,7 +250,7 @@ export function decodeHd(line: string): HdRecord | null {
   return {
     usi,
     callsign: textField(f, 5),
-    licenseStatus: textField(f, 6),
+    licenseStatus: textField(f, 6)?.toUpperCase() ?? null,
     radioServiceCode: textField(f, 7),
     grantDate: dateField(f, 8),
     expiredDate: dateField(f, 9),

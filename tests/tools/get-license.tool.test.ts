@@ -10,10 +10,12 @@
 
 import { writeFile } from 'node:fs/promises';
 import { join } from 'node:path';
+import { z } from '@cyanheads/mcp-ts-core';
 import { JsonRpcErrorCode } from '@cyanheads/mcp-ts-core/errors';
 import { runToolContract } from '@cyanheads/mcp-ts-core/testing';
 import { afterAll, beforeAll, beforeEach, describe, expect, it } from 'vitest';
 import { getLicense } from '@/mcp-server/tools/definitions/get-license.tool.js';
+import { ANTENNA_TYPES } from '@/services/uls/codes.js';
 import { POINTER_FILE, writePointer } from '@/services/uls/schema.js';
 import {
   type ContractResult,
@@ -26,7 +28,11 @@ import {
   successOf,
   useIndex,
 } from '../fixtures/tool-harness.js';
-import { widePagingWeekly } from '../fixtures/uls-fixtures.js';
+import {
+  QUIRKS_WEEKLY,
+  sprawlingPagingWeekly,
+  widePagingWeekly,
+} from '../fixtures/uls-fixtures.js';
 import {
   buildFixtureIndex,
   type FixtureIndex,
@@ -169,6 +175,7 @@ describe('warm index', () => {
       ['a usi with a letter', { usi: '10a1' }],
       ['an 11-digit usi', { usi: '12345678901' }],
       ['a prefix-portable callsign', { callsign: 'VE3/N0CALL' }],
+      ['a prefix-portable callsign with a 4-character base', { callsign: 'KH6/W1AW' }],
       ['a wildcard callsign', { callsign: 'KZZ*' }],
       ['a two-character callsign', { callsign: 'KZ' }],
     ])('rejects %s with InvalidParams', async (_label, input) => {
@@ -187,7 +194,12 @@ describe('warm index', () => {
 
     it('reads a blank callsign as unset when usi is given, and the reverse', async () => {
       const parsed = getLicense.input.parse({ callsign: '  ', usi: '1005' });
-      expect(parsed).toEqual({ usi: '1005', max_frequencies: 100 });
+      expect(parsed).toEqual({
+        usi: '1005',
+        max_frequencies: 100,
+        location_offset: 0,
+        lease_offset: 0,
+      });
       expect(hit(await run({ callsign: '  ', usi: '1005' })).license?.usi).toBe('1005');
       expect(hit(await run({ callsign: 'KZZ903', usi: '' })).license?.usi).toBe('1003');
     });
@@ -266,21 +278,23 @@ describe('warm index', () => {
       expect(rendered).toContain('- KZZ906 · USI 1006 · status X');
     });
 
-    it('returns the USI guidance and no candidates on a USI miss', async () => {
+    it('returns the USI guidance and leaves callsign-prefix candidates out on a USI miss', async () => {
       const result = await run({ usi: '424242' });
-      expect(hit(result)).toMatchObject({
+      const structured = hit(result);
+      expect(structured).toMatchObject({
         found: false,
         guidance:
           'No record with USI 424242; USIs come from the usi field of fcc_spectrum_search_licenses, fcc_spectrum_find_transmitters, and fcc_spectrum_search_frequencies results.',
-        candidates: [],
       });
-      expect(lines(result)).toContain('No callsign-prefix candidates.');
+      expect(structured).not.toHaveProperty('candidates');
+      expect(contractText(result)).not.toContain('callsign-prefix');
     });
 
     it('returns no candidates for a callsign nothing starts with', async () => {
       const result = await run({ callsign: 'QQQ123' });
       expect(hit(result)).toMatchObject({ found: false, candidates: [] });
       expect(contractText(result)).toContain('No record with callsign QQQ123');
+      expect(lines(result)).toContain('No callsign-prefix candidates.');
     });
   });
 
@@ -358,14 +372,14 @@ describe('warm index', () => {
         trusteeName: null,
       });
       expect(lines(redacted)).toContain(
-        '**Amateur:** · **Trustee callsign:** KZ1AAA · **Trustee name:** redacted',
+        '**Trustee callsign:** KZ1AAA · **Trustee name:** redacted',
       );
 
       await useIndex(fixture.mirrorDir, { redactIndividuals: false });
       const open = await run({ callsign: 'KZ1CLB' });
       expect(hit(open).license?.amateur?.trusteeName).toBe('Trustee Person Example');
       expect(lines(open)).toContain(
-        '**Amateur:** · **Trustee callsign:** KZ1AAA · **Trustee name:** Trustee Person Example',
+        '**Trustee callsign:** KZ1AAA · **Trustee name:** Trustee Person Example',
       );
     });
 
@@ -381,7 +395,7 @@ describe('warm index', () => {
       });
       const rendered = contractText(result);
       expect(rendered.split('\n')).toContain(
-        '**Amateur:** · **Operator class:** E (Amateur Extra) · **Previous callsign:** KZ1ZZZ',
+        '**Operator class:** E (Amateur Extra) · **Previous callsign:** KZ1ZZZ',
       );
       expect(rendered).not.toContain('Alex Amateur Example');
       expect(rendered).not.toContain('DENVER');
@@ -421,7 +435,7 @@ describe('warm index', () => {
         marketName: 'Fargo-Moorhead, ND-MN',
         channelBlock: 'A1',
         blocks: [
-          { lowMhz: 2496, highMhz: 2502 },
+          { lowMhz: 2496, highMhz: 2502, partitionAreaIds: [1] },
           { lowMhz: 2502, highMhz: 2508 },
         ],
       });
@@ -433,7 +447,9 @@ describe('warm index', () => {
       expect(rendered).toContain(
         '**Market:** BTA144 — Fargo-Moorhead, ND-MN · **Channel block:** A1',
       );
-      expect(rendered).toContain('**Spectrum blocks:** 2496–2502 MHz, 2502–2508 MHz');
+      expect(rendered).toContain(
+        '**Spectrum blocks:** 2496–2502 MHz (partition area 1), 2502–2508 MHz',
+      );
       expect(rendered).toContain('**Leases:** 2');
       expect(rendered).toContain('- L000000001 · USI 2002 · status A');
       expect(rendered).toContain('- L000000002 · USI 2004 · status A');
@@ -575,6 +591,210 @@ describe('the 1000-row ceiling', () => {
   });
 });
 
+/** Sites a page lists: a number filed at several sites counts each of them. */
+const sitesListed = (locations: readonly Location[] | undefined) =>
+  (locations ?? []).reduce((sum, location) => sum + (location.sites?.length ?? 1), 0);
+
+describe('paging a large license', () => {
+  let sprawl: FixtureIndex;
+  beforeAll(async () => {
+    sprawl = await buildFixtureIndex({
+      weekly: {
+        paging: sprawlingPagingWeekly({
+          locations: 60,
+          sitesAtFirst: 3,
+          antennasPerLocation: 1,
+          leases: 130,
+        }),
+      },
+    });
+  });
+  beforeEach(async () => {
+    await useIndex(sprawl.mirrorDir);
+  });
+  afterAll(async () => {
+    await releaseIndex();
+    await sprawl.dispose();
+  });
+
+  const NEXT_LOCATIONS =
+    'Listing 48 of 60 locations (50 of 62 sites) from location_offset 0; one call lists at most 50 sites and 100 antennas. Call fcc_spectrum_get_license with usi "7001" and location_offset 48 for the next locations.';
+  const NEXT_LEASES =
+    'Listing leases 1–100 of 130; call fcc_spectrum_get_license with usi "7001" and lease_offset 100 for the next ones.';
+
+  it('stops the first page at 50 sites and 100 leases and names both next offsets', async () => {
+    const result = await run({ callsign: 'KZZ701' });
+    const structured = hit(result);
+    expect(structured).toMatchObject({
+      truncated: true,
+      shown: 48,
+      cap: 100,
+      locationTotal: 60,
+      siteTotal: 62,
+      nextLocationOffset: 48,
+      nextLeaseOffset: 100,
+      notice: `${NEXT_LOCATIONS} ${NEXT_LEASES}`,
+    });
+    expect(structured.locations).toHaveLength(48);
+    expect(sitesListed(structured.locations)).toBe(50);
+    expect(structured.locations?.[0]?.sites).toHaveLength(3);
+    expect(structured.license?.leases).toHaveLength(100);
+    expect(structured.license?.leaseCount).toBe(130);
+    const rendered = contractText(result);
+    expect(rendered).toContain('### Locations (48 of 60 listed; 62 sites in all)');
+    expect(rendered).toContain('**Next location_offset:** 48');
+    expect(rendered).toContain('**Leases:** 130 (100 listed)');
+    expect(rendered).toContain('**Next lease_offset:** 100');
+    expectCarries(rendered, {
+      license: structured.license,
+      locations: structured.locations,
+      otherCallsignRecords: structured.otherCallsignRecords,
+    });
+  });
+
+  it('reads the next locations from location_offset, ending without a next offset', async () => {
+    const structured = hit(await run({ usi: '7001', location_offset: 48 }));
+    expect(structured.locations?.map((location) => location.locationNumber)).toEqual(
+      Array.from({ length: 12 }, (_, i) => 49 + i),
+    );
+    expect(structured).toMatchObject({ locationTotal: 60, siteTotal: 62, shown: 12 });
+    expect(structured).not.toHaveProperty('nextLocationOffset');
+    expect(structured.notice).toBe(NEXT_LEASES);
+  });
+
+  it('pages leases with lease_offset', async () => {
+    const structured = hit(await run({ usi: '7001', lease_offset: 100 }));
+    expect(structured.license?.leases.map((lease) => lease.callsign)).toEqual(
+      Array.from({ length: 30 }, (_, i) => `L0000${70_101 + i}`),
+    );
+    expect(structured).not.toHaveProperty('nextLeaseOffset');
+    expect(structured.notice).toBe(NEXT_LOCATIONS);
+  });
+
+  it('names the location where max_frequencies starts dropping rows', async () => {
+    const structured = hit(await run({ usi: '7001', max_frequencies: 10 }));
+    expect(rowsPerLocation(structured.locations)).toEqual([
+      ...Array.from({ length: 10 }, () => 1),
+      ...Array.from({ length: 38 }, () => 0),
+    ]);
+    expect(structured).toMatchObject({ truncated: true, shown: 10, cap: 10 });
+    expect(structured.notice).toBe(
+      `${NEXT_LOCATIONS} ${CAP_NOTICE(10, 48)} Rows are missing from location 11 on; call again with location_offset 10 to start there, or raise max_frequencies (up to 1000). ${NEXT_LEASES}`,
+    );
+  });
+
+  it('says an offset past the end lists nothing', async () => {
+    const structured = hit(await run({ usi: '7001', location_offset: 60, lease_offset: 130 }));
+    expect(structured).toMatchObject({ truncated: false, shown: 0, locations: [] });
+    expect(structured.license?.leases).toEqual([]);
+    expect(structured.notice).toBe(
+      'location_offset 60 is past the last location; this record has 60. lease_offset 130 is past the last lease; this record has 130.',
+    );
+  });
+});
+
+describe('one location over the page caps', () => {
+  let dense: FixtureIndex;
+  beforeAll(async () => {
+    dense = await buildFixtureIndex({
+      weekly: {
+        paging: sprawlingPagingWeekly({
+          locations: 41,
+          sitesAtFirst: 70,
+          antennasPerLocation: 3,
+          leases: 0,
+        }),
+      },
+    });
+  });
+  beforeEach(async () => {
+    await useIndex(dense.mirrorDir);
+  });
+  afterAll(async () => {
+    await releaseIndex();
+    await dense.dispose();
+  });
+
+  it('lists a location whole even when its sites alone exceed the cap', async () => {
+    const structured = hit(await run({ usi: '7001' }));
+    expect(structured.locations).toHaveLength(1);
+    expect(structured.locations?.[0]?.sites).toHaveLength(70);
+    expect(structured.locations?.[0]?.antennas).toHaveLength(3);
+    expect(structured).toMatchObject({ locationTotal: 41, siteTotal: 110, nextLocationOffset: 1 });
+  });
+
+  it('stops a page before its antennas pass 100', async () => {
+    const structured = hit(await run({ usi: '7001', location_offset: 1 }));
+    expect(structured.locations).toHaveLength(33);
+    expect(structured.locations?.flatMap((location) => location.antennas)).toHaveLength(99);
+    expect(structured.nextLocationOffset).toBe(34);
+  });
+});
+
+describe('filing quirks', () => {
+  let quirks: FixtureIndex;
+  beforeAll(async () => {
+    quirks = await buildFixtureIndex({ groups: ['paging'], weekly: { paging: QUIRKS_WEEKLY } });
+  });
+  beforeEach(async () => {
+    await useIndex(quirks.mirrorDir, { services: ['paging'] });
+  });
+  afterAll(async () => {
+    await releaseIndex();
+    await quirks.dispose();
+  });
+
+  it('shows a PAL block filed as 0–10 MHz as a channel width the SAS assigns', async () => {
+    const result = await run({ callsign: 'KZZ503' });
+    const structured = hit(result);
+    expect(structured.license?.market?.blocks).toMatchObject([{ channelWidthMhz: 10 }]);
+    expect(structured.license?.market?.blocks[0]).not.toHaveProperty('lowMhz');
+    expect(lines(result)).toEqual(
+      expect.arrayContaining([
+        '**Spectrum blocks:** 10 MHz channel, no frequency filed (partition area 41001)',
+        'The Spectrum Access System assigns each PAL channel within 3550–3650 MHz, so ULS files its width rather than its frequencies.',
+      ]),
+    );
+    expectCarries(contractText(result), structured.license);
+  });
+
+  it('lists a band filed under several partition areas once, with the areas', async () => {
+    const result = await run({ callsign: 'KZZ504' });
+    const structured = hit(result);
+    const partitionAreaIds = [8183, 8184, 96978];
+    expect(structured.license?.market?.blocks).toEqual([
+      { lowMhz: 1755, highMhz: 1760, partitionAreaIds },
+      { lowMhz: 2155, highMhz: 2160, partitionAreaIds },
+    ]);
+    expect(lines(result)).toContain(
+      '**Spectrum blocks:** 1755–1760 MHz (partition areas 8183, 8184, 96978), 2155–2160 MHz (partition areas 8183, 8184, 96978)',
+    );
+    expectCarries(contractText(result), structured.license);
+  });
+
+  it('lists every site under a shared location number and ties the frequencies to the number', async () => {
+    const result = await run({ callsign: 'KZZ505' });
+    const structured = hit(result);
+    const [shared, single] = structured.locations ?? [];
+    expect(shared?.sites).toHaveLength(2);
+    expect(shared?.antennas[0]?.recordCount).toBe(2);
+    expect(single).not.toHaveProperty('sites');
+    expect(lines(result)).toEqual(
+      expect.arrayContaining([
+        '#### Location 1 — 2 sites share this number',
+        'The antennas and frequencies below are filed against location 1, and ULS does not say which of its 2 sites uses each.',
+        '##### Site 1 of 2 — 33 SR99 North Rd',
+        '##### Site 2 of 2 — 35 I5 Northgate',
+        '#### Location 2 — Single Site',
+      ]),
+    );
+    expect(contractText(result)).toContain(
+      '**Filed records:** 2 (fields that differ between them are omitted)',
+    );
+    expectCarries(contractText(result), structured.locations);
+  });
+});
+
 describe('format()', () => {
   const license: License = {
     usi: '77',
@@ -649,10 +869,10 @@ describe('format()', () => {
       '## KZZ 077 · USI 77',
       '**Status:** A (Active) · **Service:** HA (Amateur Service) · **Group:** amat · **Lease:** yes',
       '**Lessee:** Acme Radio Club · **Redacted:** no · **Role:** lessee · **City:** NEW YORK · **State:** NY',
-      '**Amateur:** · **Trustee callsign:** KZ1AAA · **Trustee name:** Trustee Person',
+      '**Trustee callsign:** KZ1AAA · **Trustee name:** Trustee Person',
       '**Market:** BTA001 — Fargo Moorhead, ND-MN · **Channel block:** A 1',
       '**Leased from:** KZZ 801 (USI 2001)',
-      '**Leases:** 30 (first 1 listed)',
+      '**Leases:** 30 (1 listed)',
       '- L000 000009 · USI 2009 · status A',
       '#### Location 1 — Seattle Hill',
       '**Type:** F · **Coordinates:** 47.5, -122.25 · **Filed DMS:** 47-30-0 N 122-15-0 W',
@@ -734,6 +954,14 @@ describe('format()', () => {
     expect(render(true)).toContain(
       '**Licensee:** Redacted (individual licensee) · **Redacted:** yes · **Role:** licensee',
     );
+  });
+
+  it('describes antennaTypeCode with the codes and labels list_reference serves', () => {
+    const schema = JSON.stringify(z.toJSONSchema(getLicense.output));
+    const described = /"antennaTypeCode":\{[^}]*"description":"([^"]*)"/.exec(schema)?.[1];
+    for (const [code, label] of Object.entries(ANTENNA_TYPES)) {
+      expect(described).toContain(`${code} ${label}`);
+    }
   });
 
   it('says "not filed" for a location that filed no coordinates (typical of mobile locations)', () => {

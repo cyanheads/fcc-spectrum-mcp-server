@@ -19,7 +19,7 @@ import {
 export const MIRROR_NAME = 'fcc-uls';
 
 /** Current store schema version; bump it and add a migration on any schema change. */
-export const SCHEMA_VERSION = 1;
+export const SCHEMA_VERSION = 2;
 
 /** License statuses whose records keep sites, antennas, frequencies, and market blocks. */
 export const LIVE_STATUSES = ['A', 'L', 'X'] as const;
@@ -69,7 +69,8 @@ export const LICENSE_COLUMNS = {
 /**
  * Auxiliary tables and their indexes. Keys of the upstream-data tables are indexed but
  * not enforced: a duplicate line in a snapshot must not abort a whole step. The
- * bookkeeping tables (`service_codes`, `ingest_files`, `meta`) do enforce theirs.
+ * bookkeeping tables (`service_codes`, `ingest_files`, `meta`) do enforce theirs. A license
+ * can file several sites under one location number; `site_seq` numbers them in filing order.
  */
 const AUX_DDL = `
 CREATE TABLE IF NOT EXISTS lease_links (
@@ -84,6 +85,7 @@ CREATE INDEX IF NOT EXISTS lease_links_parent ON lease_links (parent_usi);
 CREATE TABLE IF NOT EXISTS locations (
   usi INTEGER NOT NULL,
   location_number INTEGER NOT NULL,
+  site_seq INTEGER NOT NULL DEFAULT 1,
   location_type TEXT,
   location_class TEXT,
   address TEXT,
@@ -204,6 +206,28 @@ export type RecordStats = Record<
   { kept: number; read: number; rejected: number; orphaned?: number }
 >;
 
+/**
+ * Schema 2: add `locations.site_seq` to a schema 1 generation, numbering the sites under each
+ * `(usi, location_number)` in row order, which is filing order. A database {@link AUX_DDL}
+ * just created already has the column.
+ */
+function addSiteSeq(handle: SqliteHandle): void {
+  const present = handle
+    .prepare<{ n: number }>(
+      "SELECT count(*) AS n FROM pragma_table_info('locations') WHERE name = 'site_seq'",
+    )
+    .get()?.n;
+  if (present) return;
+  handle.exec(
+    `ALTER TABLE locations ADD COLUMN site_seq INTEGER NOT NULL DEFAULT 1;
+     UPDATE locations SET site_seq = numbered.seq
+     FROM (SELECT rowid AS id,
+             row_number() OVER (PARTITION BY usi, location_number ORDER BY rowid) AS seq
+           FROM locations) AS numbered
+     WHERE locations.rowid = numbered.id AND numbered.seq > 1;`,
+  );
+}
+
 /** Create the SQLite mirror store for one generation file. Nothing opens until first use. */
 export function createUlsStore(path: string): MirrorStore {
   return sqliteMirrorStore({
@@ -219,7 +243,10 @@ export function createUlsStore(path: string): MirrorStore {
       { columns: ['licensee_state'] },
     ],
     version: SCHEMA_VERSION,
-    migrations: [{ version: 1, up: (handle: SqliteHandle) => handle.exec(AUX_DDL) }],
+    migrations: [
+      { version: 1, up: (handle: SqliteHandle) => handle.exec(AUX_DDL) },
+      { version: 2, up: addSiteSeq },
+    ],
   });
 }
 

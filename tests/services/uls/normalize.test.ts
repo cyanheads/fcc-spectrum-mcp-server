@@ -92,8 +92,17 @@ describe('normalizeCallsign', () => {
     expect(normalizeCallsign('L000000123')).toBe('L000000123');
   });
 
+  it('strips a trailing location prefix used as a portable suffix', () => {
+    expect(normalizeCallsign('W1AW/KH6')).toBe('W1AW');
+    expect(normalizeCallsign('n0call/ve3')).toBe('N0CALL');
+  });
+
   it('keeps prefix-portable forms and long suffixes for the pattern to reject', () => {
     expect(normalizeCallsign('VE3/N0CALL')).toBe('VE3/N0CALL');
+    // A base callsign short enough to fit the suffix length is still a callsign, not a suffix.
+    expect(normalizeCallsign('KH6/W1AW')).toBe('KH6/W1AW');
+    expect(normalizeCallsign('kl7/aa0a')).toBe('KL7/AA0A');
+    expect(normalizeCallsign('W1/K1A')).toBe('W1/K1A');
     expect(normalizeCallsign('N0CALL/MOBILE')).toBe('N0CALL/MOBILE');
   });
 });

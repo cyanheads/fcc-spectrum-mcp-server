@@ -30,6 +30,22 @@ export const blankAsUnset = <T extends z.ZodType>(schema: T) =>
 const normalizedString = (normalize: (raw: string) => string) => (value: unknown) =>
   typeof value === 'string' ? normalize(value) : value;
 
+/** Trim and lowercase string input before `schema` checks it, so `" Market "` reads as `market`. */
+export const caseFolded = <T extends z.ZodType>(schema: T) =>
+  z.preprocess(
+    normalizedString((raw) => raw.trim().toLowerCase()),
+    schema,
+  );
+
+/** Licensee name words, up to 200 characters, with at least one letter or digit to search on. */
+export const licenseeSchema = z
+  .string()
+  .max(200)
+  .refine((text) => /[\p{L}\p{N}]/u.test(text), {
+    message:
+      'licensee needs at least one letter or digit; punctuation alone has nothing to search.',
+  });
+
 /** Callsign or lease ID: trimmed, uppercased, spaces dropped, one trailing `/X` portable suffix removed. */
 export const callsignSchema = z.preprocess(
   normalizedString(normalizeCallsign),

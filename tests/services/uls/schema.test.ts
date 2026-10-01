@@ -341,6 +341,38 @@ describe('createUlsStore', () => {
     }
   });
 
+  it('numbers the sites filed under each location number when upgrading a schema 1 generation', async () => {
+    const path = join(dir, 'gen.db');
+    const v1 = createUlsStore(path);
+    try {
+      // The schema 1 layout: no site_seq column, stamped version 1.
+      (await v1.raw()).exec(
+        `ALTER TABLE locations DROP COLUMN site_seq;
+         INSERT INTO locations (usi, location_number) VALUES (7, 1), (7, 2), (7, 1), (8, 1), (7, 1);
+         UPDATE schema_version SET version = 1;`,
+      );
+    } finally {
+      await v1.close();
+    }
+    const upgraded = createUlsStore(path);
+    try {
+      const rows = (await upgraded.raw())
+        .prepare<{ location_number: number; site_seq: number; usi: number }>(
+          'SELECT usi, location_number, site_seq FROM locations ORDER BY rowid',
+        )
+        .all();
+      expect(rows.map((row) => [row.usi, row.location_number, row.site_seq])).toEqual([
+        [7, 1, 1],
+        [7, 2, 1],
+        [7, 1, 2],
+        [8, 1, 1],
+        [7, 1, 3],
+      ]);
+    } finally {
+      await upgraded.close();
+    }
+  });
+
   it('opens nothing until first use', async () => {
     const store = createUlsStore(join(dir, 'lazy.db'));
     expect(await readdir(dir)).toEqual([]);

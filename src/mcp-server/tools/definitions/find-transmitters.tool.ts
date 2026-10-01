@@ -36,7 +36,9 @@ const SiteFrequencySchema = z
     bandwidthMhz: z
       .number()
       .optional()
-      .describe('Widest necessary bandwidth parsed from the emission designators, MHz.'),
+      .describe(
+        'Widest necessary bandwidth parsed from the emission designators, MHz; a designator 20% of the assigned frequency or wider is a filing error and is left out.',
+      ),
     stationClasses: z
       .array(z.string().describe('One ULS class-of-station code, e.g. "FB2".'))
       .describe(
@@ -92,6 +94,12 @@ const SiteSchema = z
       .boolean()
       .optional()
       .describe('True when state was derived from the coordinates rather than filed.'),
+    sitesSharingNumber: z
+      .number()
+      .optional()
+      .describe(
+        "Sites the license files under this location number, when more than one; each is returned as its own site, and frequencies then lists the number's frequencies, since ULS does not say which site uses each.",
+      ),
     frequencyCount: z
       .number()
       .describe('Frequencies at the site (only those overlapping the band when one is given).'),
@@ -297,14 +305,17 @@ export const findTransmitters = tool('fcc_spectrum_find_transmitters', {
     if (page.total === 0) {
       const widen = orList([
         input.radius_km < 100 && 'raise radius_km (max 100)',
-        band && 'widen the band with frequency_high',
+        band &&
+          (input.frequency_high === undefined
+            ? 'widen the band with frequency_high'
+            : 'widen the band (lower frequency_low or raise frequency_high)'),
         input.radio_service && 'drop radio_service',
         input.status !== 'any' && 'pass status "any"',
         band && 'call fcc_spectrum_search_frequencies to search by state',
       ]);
       fragments.push(
         `No transmitter site within ${input.radius_km} km ${band ? `is authorized on ${bandText(band.lowMhz, band.highMhz)} under` : 'matches'} these filters${widen ? `; ${widen}` : ''}.`,
-        'Market-area licenses (PCS, AWS, 700 MHz, 3.5 GHz) usually have no site records; call fcc_spectrum_search_frequencies with kind "market".',
+        'Market-area licenses (PCS, AWS, 700 MHz, 3.7 GHz) usually have no site records; call fcc_spectrum_search_frequencies with kind "market".',
       );
     }
     if (page.nextCursor) {
@@ -338,6 +349,11 @@ export const findTransmitters = tool('fcc_spectrum_find_transmitters', {
       if (place) {
         lines.push(
           `- **Place:** ${place}${site.stateFromCoordinates ? ' (state derived from coordinates)' : ''}${site.stateFromCoordinates === false ? ' (state as filed)' : ''}`,
+        );
+      }
+      if (site.sitesSharingNumber !== undefined) {
+        lines.push(
+          `- **Shared location number:** ${site.sitesSharingNumber} sites share location ${site.locationNumber}; the frequencies below are filed against the number, and ULS does not say which site uses each.`,
         );
       }
       lines.push(`- **Frequencies:** ${site.frequenciesShown} of ${site.frequencyCount} listed`);

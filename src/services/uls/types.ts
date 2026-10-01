@@ -106,13 +106,17 @@ export interface LicenseAntenna {
   make?: string;
   model?: string;
   polarization?: string;
+  /**
+   * AN records filed under this location and antenna number, when more than one; only the
+   * fields every record agrees on are kept.
+   */
+  recordCount?: number;
 }
 
-/** A license location with its antennas. */
-export interface LicenseLocation {
+/** One filed site: an LO record's place, coordinates, and structure. */
+export interface LicenseSite {
   /** Street address; omitted on an individual's record while redaction is on. */
   address?: string;
-  antennas: LicenseAntenna[];
   asrNumber?: string;
   city?: string;
   /** The filed coordinates as text, kept when validation drops the decimal pair. */
@@ -121,7 +125,6 @@ export interface LicenseLocation {
   groundElevationM?: number;
   latitude?: number;
   locationClassCode?: string;
-  locationNumber: number;
   /** Absent when the filing leaves the location type blank. */
   locationTypeCode?: string;
   locationTypeLabel?: string;
@@ -134,6 +137,17 @@ export interface LicenseLocation {
   stateFromCoordinates?: boolean;
   structureType?: string;
   supportHeightM?: number;
+}
+
+/**
+ * A license location number with its antennas. A number filed at one site carries that
+ * site's fields; one the license files at several sites lists them in `sites` instead, and
+ * its antennas and frequencies belong to the number, since ULS does not tie them to a site.
+ */
+export interface LicenseLocation extends LicenseSite {
+  antennas: LicenseAntenna[];
+  locationNumber: number;
+  sites?: LicenseSite[];
 }
 
 /** The full license record of `getLicense`. */
@@ -156,7 +170,7 @@ export interface LicenseDetail {
   leaseCount: number;
   /** Parent licenses this lease is carved from. */
   leasedFrom: { callsign?: string; usi: string }[];
-  /** Leases carved from this license, up to 25; `leaseCount` has the total. */
+  /** One page of the leases carved from this license; `leaseCount` has the total. */
   leases: { callsign?: string; licenseStatus: string; usi: string }[];
   licensee: {
     applicantType?: string;
@@ -169,7 +183,16 @@ export interface LicenseDetail {
   };
   licenseStatus: string;
   market?: {
-    blocks: { highMhz: number; lowMhz: number }[];
+    /**
+     * One entry per band, collapsed across the partition areas it is filed under. A block
+     * filed with a 0 lower edge carries `channelWidthMhz` instead of edges.
+     */
+    blocks: {
+      channelWidthMhz?: number;
+      highMhz?: number;
+      lowMhz?: number;
+      partitionAreaIds?: number[];
+    }[];
     channelBlock?: string;
     marketCode: string;
     marketName?: string;
@@ -184,6 +207,10 @@ export interface LicenseDetail {
 /** `getLicense` parameters: exactly one of `callsign` or `usi` (checked by the tool). */
 export interface GetLicenseParams {
   callsign?: string | undefined;
+  /** Index of the first lease listed, in lease-ID order (default 0). */
+  leaseOffset?: number;
+  /** Index of the first location number in the window, in number order (default 0). */
+  locationOffset?: number;
   maxFrequencies: number;
   usi?: string | undefined;
 }
@@ -196,15 +223,30 @@ export type GetLicenseResult =
     }
   | {
       found: true;
+      /** The window's first location missing frequency rows past the cap, and its offset. */
+      frequencyCutAt?: { locationNumber: number; offset: number };
       /** Frequency rows returned after the `maxFrequencies` cap. */
       frequenciesShown: number;
       /** Frequency rows the record holds. */
       frequencyTotal: number;
       license: LicenseDetail;
+      /** Location numbers the record files. */
+      locationTotal: number;
+      /** The window of location numbers, from `locationOffset`. */
       locations: LicenseLocation[];
+      /** Offset of the first lease past this page; absent on the last page. */
+      nextLeaseOffset?: number;
+      /** Offset of the first location number past this window; absent on the last window. */
+      nextLocationOffset?: number;
       otherCallsignRecords: { licenseStatus: string; usi: string }[];
+      /** Sites the record files, each site of a shared location number counted. */
+      siteTotal: number;
+      /** Sites in this window. */
+      sitesShown: number;
       /** False for a non-live record, whose sites and frequencies are not kept. */
       technicalRetained: boolean;
+      /** Frequency rows filed at this window's locations. */
+      windowFrequencyTotal: number;
     };
 
 /** One frequency at a site after collapsing antennas and modulation steps. */
@@ -238,6 +280,11 @@ export interface TransmitterSite extends LicenseeFields {
   overallHeightM?: number;
   radioServiceCode: string;
   radioServiceLabel: string;
+  /**
+   * Sites the license files under this location number, when more than one; the
+   * frequencies are then the number's, not this site's alone.
+   */
+  sitesSharingNumber?: number;
   state?: string;
   stateFromCoordinates?: boolean;
   usi: string;
@@ -273,8 +320,16 @@ export interface FrequencyAssignment extends LicenseeFields {
   marketCode?: string;
   marketName?: string;
   maxErpW?: number;
+  /** Partition areas a market block is filed under (market rows; blank areas dropped). */
+  partitionAreaIds?: number[];
   radioServiceCode: string;
   radioServiceLabel: string;
+  /**
+   * Sites the license files under this location number, when more than one (site rows);
+   * the row then carries no site coordinates or place, since ULS does not say which site
+   * uses the frequency.
+   */
+  sitesSharingNumber?: number;
   state?: string;
   stateFromCoordinates?: boolean;
   stationClasses?: string[];

@@ -28,12 +28,17 @@ import { openZipArchive } from '@/services/uls/zip-reader.js';
 import {
   AMAT_WEEKLY,
   at,
+  buildZip,
+  countsFile,
   DAILY_MK_MON,
   DAILY_PG_MON,
   DAILY_PG_SUN,
   DAILY_PG_TUE,
   DAILY_WIDE_MON,
+  datFile,
   FakeIngestClient,
+  hd,
+  lo,
   MDSITFS_WEEKLY,
   PAGING_WEEKLY,
 } from '../../fixtures/uls-fixtures.js';
@@ -462,6 +467,39 @@ describe('rebuild content (all three groups)', () => {
   it('empties the temp directory and releases the lock', async () => {
     expect(await readdir(mirror.tempDir)).toEqual([]);
     expect(existsSync(join(mirror.mirrorDir, LOCK_FILE))).toBe(false);
+  });
+});
+
+describe('a status code filed in lower case', () => {
+  it('is stored upper case, so its label resolves and a live one keeps its technical rows', async () => {
+    const mirror = await tempMirror();
+    const client = new FakeIngestClient().set('complete/l_paging.zip', {
+      ...PAGING_WEEKLY,
+      zip: buildZip([
+        { name: 'counts', data: countsFile('Sun Sep 27 09:38:53 EDT 2026', { HD: 2, LO: 1 }) },
+        {
+          name: 'HD.dat',
+          data: datFile([
+            hd({ usi: 6001, callsign: 'KZZ601', status: 'c', service: 'CD' }),
+            hd({ usi: 6002, callsign: 'KZZ602', status: 'a', service: 'CD' }),
+          ]),
+        },
+        {
+          name: 'LO.dat',
+          data: datFile([
+            lo({ usi: 6002, number: 1, type: 'F', lat: [47, 10, 0, 'N'], lon: [122, 10, 0, 'W'] }),
+          ]),
+        },
+      ]),
+    });
+    const { generation } = await fixtureIngester(mirror, { client, groups: ['paging'] }).rebuild();
+    await readDb(join(mirror.mirrorDir, generation), (db) => {
+      expect(all(db, 'SELECT usi, license_status FROM licenses ORDER BY usi')).toEqual([
+        { usi: 6001, license_status: 'C' },
+        { usi: 6002, license_status: 'A' },
+      ]);
+      expect(count(db, 'SELECT count(*) AS n FROM locations WHERE usi = 6002')).toBe(1);
+    });
   });
 });
 

@@ -11,6 +11,7 @@ import { JsonRpcErrorCode } from '@cyanheads/mcp-ts-core/errors';
 import { runToolContract } from '@cyanheads/mcp-ts-core/testing';
 import { afterAll, beforeAll, beforeEach, describe, expect, it } from 'vitest';
 import { searchLicenses } from '@/mcp-server/tools/definitions/search-licenses.tool.js';
+import { LICENSE_STATUSES } from '@/services/uls/codes.js';
 import { writePointer } from '@/services/uls/schema.js';
 import {
   type ContractResult,
@@ -26,6 +27,7 @@ import {
   successOf,
   useIndex,
 } from '../fixtures/tool-harness.js';
+import { carrierNamesWeekly } from '../fixtures/uls-fixtures.js';
 import {
   buildFixtureIndex,
   type FixtureIndex,
@@ -139,7 +141,7 @@ describe('warm index', () => {
     it.each([
       ['a cursor that does not decode', 'garbage'],
       ['a cursor from another generation', forgeCursor('20990101T000000Z', 'c', 'KZZ901', 1001)],
-      ['a find_transmitters cursor', forgeCursor(FIXTURE_GENERATION_ID, 't', 0, 1001, 1)],
+      ['a find_transmitters cursor', forgeCursor(FIXTURE_GENERATION_ID, 't', 0, 1001, 1, 1)],
       [
         'a name-search cursor on a callsign search',
         forgeCursor(FIXTURE_GENERATION_ID, 'r', -1, 1001),
@@ -156,16 +158,27 @@ describe('warm index', () => {
       ['limit 0', { callsign: 'KZZ901', limit: 0 }],
       ['limit 101', { callsign: 'KZZ901', limit: 101 }],
       ['a prefix-portable callsign', { callsign: 'VE3/N0CALL' }],
+      ['a prefix-portable callsign with a 4-character base', { callsign: 'KL7/AA0A' }],
       ['an 11-digit FRN', { frn: '12345678901' }],
       ['an unknown state name', { state: 'Atlantis' }],
       ['an unknown status', { callsign: 'KZZ901', status: 'Q' }],
       ['a three-character service code', { radio_service: 'ABC' }],
       ['a 201-character licensee', { licensee: 'x'.repeat(201) }],
+      ['a licensee with no letter or digit', { licensee: ' !!! ' }],
+      ['a punctuation-only licensee with a bad cursor', { licensee: '&-.', cursor: 'bad' }],
       ['a cursor with spaces', { callsign: 'KZZ901', cursor: 'has space' }],
+      ['a status word that names two statuses', { callsign: 'KZZ901', status: 'pending' }],
     ])('rejects %s with InvalidParams', async (_label, input) => {
       const error = errorOf(await run(input));
       expect(error.code).toBe(JsonRpcErrorCode.InvalidParams);
       expect(error.data?.reason).toBe('invalid_arguments');
+    });
+
+    it('names the rule when licensee has nothing searchable', () => {
+      const parsed = searchLicenses.input.safeParse({ licensee: '!!!' });
+      expect(parsed.error?.issues.map((issue) => issue.message)).toEqual([
+        'licensee needs at least one letter or digit; punctuation alone has nothing to search.',
+      ]);
     });
   });
 
@@ -174,6 +187,22 @@ describe('warm index', () => {
       const result = page(await run({ callsign: ' kzz901/4 ', status: 'ANY' }));
       expect(result.appliedFilters).toEqual({ callsign: 'KZZ901', status: 'any' });
       expect(usis(result.licenses)).toEqual(['1001', '1005']);
+    });
+
+    it('reads a spelled-out status as its code', async () => {
+      const result = page(await run({ callsign: 'KZZ901', status: ' Expired ' }));
+      expect(result.appliedFilters).toEqual({ callsign: 'KZZ901', status: 'E' });
+      expect(usis(result.licenses)).toEqual(['1005']);
+    });
+
+    it('describes each status code with the label it renders', () => {
+      const described = searchLicenses.input.shape.status.description;
+      for (const [code, label] of Object.entries(LICENSE_STATUSES)) {
+        expect(described).toContain(`${code} ${label.toLowerCase().replace(/ status$/, '')}`);
+      }
+      expect(
+        searchLicenses.output.shape.licenses.element.shape.licenseStatus.description,
+      ).toContain('C canceled');
     });
 
     it('echoes a padded FRN, a state name as its code, and the default status', async () => {
@@ -321,7 +350,10 @@ describe('warm index', () => {
       });
       expect(license).not.toHaveProperty('licenseeCity');
       const rendered = contractText(result);
-      expect(rendered).toContain('- **Licensee:** Redacted (individual licensee) (redacted)');
+      expect(rendered.split('\n')).toContain(
+        '- **Licensee:** Redacted (individual licensee) · **Redacted:** yes · **FRN:** 0005550001 · **Applicant type:** I',
+      );
+      expect(rendered).not.toContain('(redacted)');
       expect(rendered).not.toContain('Pat Q Example');
       expect(rendered).not.toContain('SPOKANE');
     });
@@ -400,7 +432,9 @@ describe('warm index', () => {
       const result = await run({ callsign: 'KZZ907', status: 'any' });
       expect(page(result).licenses[0]?.licenseeName).toBe('Carriage\rReturn Paging');
       const rendered = contractText(result);
-      expect(rendered).toContain('- **Licensee:** Carriage Return Paging · **FRN:** 0002223333');
+      expect(rendered).toContain(
+        '- **Licensee:** Carriage Return Paging · **Redacted:** no · **FRN:** 0002223333',
+      );
       expect(rendered).not.toContain('\r');
     });
 
@@ -426,7 +460,7 @@ describe('warm index', () => {
       const rendered = formattedText(searchLicenses.format?.({ licenses: [license] }));
       expect(rendered).not.toMatch(/\r/);
       const lines = rendered.split('\n');
-      expect(lines).toContain('- **Licensee:** Acme Radio | Relay Co');
+      expect(lines).toContain('- **Licensee:** Acme Radio | Relay Co · **Redacted:** no');
       expect(lines).toContain(
         '- **Status:** A (Active) · **Service:** CD (Paging and Radiotelephone) · **Group:** paging · **Lease:** no',
       );
@@ -457,12 +491,45 @@ describe('warm index', () => {
           nextCursor: 'abc_DEF-1',
         }),
       );
-      expect(rendered).toContain('### (no callsign) · USI 78\n- **Licensee:** Not on file\n');
       expect(rendered).toContain(
-        '### (no callsign) · USI 79\n- **Licensee:** Redacted (individual licensee) (redacted)\n',
+        '### (no callsign) · USI 78\n- **Licensee:** Not on file · **Redacted:** no\n',
+      );
+      expect(rendered).toContain(
+        '### (no callsign) · USI 79\n- **Licensee:** Redacted (individual licensee) · **Redacted:** yes\n',
       );
       expect(rendered).toContain('**Lease:** yes');
       expect(rendered.endsWith('**nextCursor:** abc_DEF-1')).toBe(true);
     });
+  });
+});
+
+describe('licensee names joined by - or &', () => {
+  let carriers: FixtureIndex;
+  beforeAll(async () => {
+    carriers = await buildFixtureIndex({ weekly: { paging: carrierNamesWeekly() } });
+  });
+  beforeEach(async () => {
+    await useIndex(carriers.mirrorDir);
+  });
+  afterAll(async () => {
+    await releaseIndex();
+    await carriers.dispose();
+  });
+
+  it.each([
+    ['T-Mobile', ['6001']],
+    ['t-mobile license', ['6001']],
+    ['AT&T', ['6004']],
+    ['AT & T', ['6004']],
+    ['T Mobile', ['6001']],
+  ])('matches %s as joined words, not one-letter prefixes', async (licensee, expected) => {
+    const result = page(await run({ licensee }));
+    expect(usis(result.licenses)).toEqual(expected);
+    expect(result.totalCount).toBe(expected.length);
+  });
+
+  it('still matches a plain multi-word name as word prefixes in any order', async () => {
+    const result = page(await run({ licensee: 'acme wire' }));
+    expect(new Set(usis(result.licenses))).toEqual(new Set(['6006', '6007']));
   });
 });

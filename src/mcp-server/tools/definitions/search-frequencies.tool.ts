@@ -19,13 +19,16 @@ import {
 } from '@/mcp-server/tools/format-helpers.js';
 import {
   blankAsUnset,
+  caseFolded,
   cursorSchema,
   frequencySchema,
+  licenseeSchema,
   liveStatusSchema,
   radioServiceSchema,
   stateSchema,
   unitSchema,
 } from '@/mcp-server/tools/input-schemas.js';
+import { PAL_BAND_MHZ } from '@/services/uls/codes.js';
 import { resolveBand } from '@/services/uls/normalize.js';
 import { getUlsIndexService, radioServiceLabel } from '@/services/uls/uls-index-service.js';
 
@@ -64,7 +67,7 @@ const AssignmentSchema = z
       .number()
       .optional()
       .describe(
-        'Widest necessary bandwidth parsed from the emission designators, MHz (site rows).',
+        'Widest necessary bandwidth parsed from the emission designators, MHz (site rows); a designator 20% of the assigned frequency or wider is a filing error and is left out.',
       ),
     stationClasses: z
       .array(z.string().describe('One ULS class-of-station code.'))
@@ -99,19 +102,31 @@ const AssignmentSchema = z
       .boolean()
       .optional()
       .describe('True when state was derived from the coordinates rather than filed (site rows).'),
+    sitesSharingNumber: z
+      .number()
+      .optional()
+      .describe(
+        'Sites the license files under this location number, when more than one (site rows); ULS does not say which of them uses the frequency, so the row has no coordinates, county, or state. fcc_spectrum_get_license lists the sites.',
+      ),
     marketCode: z.string().optional().describe('Market code (market rows).'),
     marketName: z
       .string()
       .optional()
       .describe('Market name as filed, cut at 30 characters by ULS (market rows).'),
     channelBlock: z.string().optional().describe('Channel block, as filed (market rows).'),
+    partitionAreaIds: z
+      .array(z.number().describe('One ULS partition area ID.'))
+      .optional()
+      .describe(
+        'ULS partition areas this block is filed under (market rows); a partitioned license files one block per area, returned here as one row.',
+      ),
   })
   .describe('One site assignment or market spectrum block.');
 
 export const searchFrequencies = tool('fcc_spectrum_search_frequencies', {
   title: 'Search FCC ULS authorizations by frequency',
   description:
-    "Find FCC ULS authorizations whose occupied band overlaps a frequency or band. Site assignments (land mobile, microwave, paging, cellular sites) return one row per site and frequency with the site's state and coordinates; market-area licenses and leases (PCS, AWS, 700 MHz, 3.5 GHz, and other auctioned blocks) return one row per spectrum block with its market code and name. Filter by state, radio service, licensee, and live status (active by default). For transmitter sites near a coordinate, use fcc_spectrum_find_transmitters.",
+    "Find FCC ULS authorizations whose occupied band overlaps a frequency or band. Site assignments (land mobile, microwave, paging, cellular sites) return one row per site and frequency with the site's state and coordinates; market-area licenses and leases (PCS, AWS, 700 MHz, 3.45 and 3.7 GHz, and other auctioned blocks) return one row per spectrum block with its market code and name; 3.5 GHz Priority Access Licenses file no frequency, so list them with fcc_spectrum_search_licenses and radio_service PL. Filter by state, radio service, licensee, and live status (active by default). For transmitter sites near a coordinate, use fcc_spectrum_find_transmitters.",
   annotations: { readOnlyHint: true, idempotentHint: true, openWorldHint: false },
   input: z.object({
     frequency_low: frequencySchema.describe(
@@ -121,7 +136,7 @@ export const searchFrequencies = tool('fcc_spectrum_search_frequencies', {
       'Band upper edge in unit; omit to search a single frequency.',
     ),
     unit: blankAsUnset(unitSchema).describe('Unit of the frequencies: kHz, MHz (default), or GHz.'),
-    kind: blankAsUnset(z.enum(KINDS).default('both')).describe(
+    kind: blankAsUnset(caseFolded(z.enum(KINDS).default('both'))).describe(
       'site: transmitter-site assignments only; market: market-area spectrum blocks only; both (default).',
     ),
     state: blankAsUnset(stateSchema.optional()).describe(
@@ -130,8 +145,8 @@ export const searchFrequencies = tool('fcc_spectrum_search_frequencies', {
     radio_service: blankAsUnset(radioServiceSchema.optional()).describe(
       'Two-character radio service code, e.g. "WU" (700 MHz upper band); see fcc_spectrum_list_reference topic "radio_services".',
     ),
-    licensee: blankAsUnset(z.string().max(200).optional()).describe(
-      'Licensee name words; every word must match the start of a word in the name, in any order.',
+    licensee: blankAsUnset(licenseeSchema.optional()).describe(
+      'Licensee name words, with at least one letter or digit; every word must match the start of a word in the name, in any order. A word joined by - or & ("T-Mobile", "AT&T") matches its pieces side by side.',
     ),
     status: blankAsUnset(liveStatusSchema).describe(
       'A active (default), L pending legal, X term pending, or "any" for all three. Other statuses keep no frequency records.',
@@ -305,6 +320,16 @@ export const searchFrequencies = tool('fcc_spectrum_search_frequencies', {
         'Individual licensees are excluded from name search while redaction is on; search without licensee to see them.',
       );
     }
+    if (
+      band.lowMhz <= PAL_BAND_MHZ.high &&
+      band.highMhz >= PAL_BAND_MHZ.low &&
+      input.kind !== 'site' &&
+      (!input.radio_service || input.radio_service === 'PL')
+    ) {
+      fragments.push(
+        `ULS files Priority Access Licenses (radio service PL, ${PAL_BAND_MHZ.low}–${PAL_BAND_MHZ.high} MHz) as a 10 MHz channel width with no frequency, so frequency search does not match them; list them with fcc_spectrum_search_licenses and radio_service "PL".`,
+      );
+    }
     if (page.nextCursor) {
       fragments.push(
         `Showing ${page.rows.length} of ${page.total} rows; pass nextCursor as cursor with the same inputs for the next page.`,
@@ -341,7 +366,7 @@ export const searchFrequencies = tool('fcc_spectrum_search_frequencies', {
       ) {
         const place = [row.county && inline(row.county), row.state].filter(Boolean).join(', ');
         lines.push(
-          `- **Site:** location ${row.locationNumber ?? '—'}${row.latitude !== undefined && row.longitude !== undefined ? ` · ${row.latitude}, ${row.longitude}` : ''}${place ? ` · ${place}` : ''}${row.stateFromCoordinates ? ' (state derived from coordinates)' : ''}${row.stateFromCoordinates === false ? ' (state as filed)' : ''}`,
+          `- **Site:** location ${row.locationNumber ?? '—'}${row.latitude !== undefined && row.longitude !== undefined ? ` · ${row.latitude}, ${row.longitude}` : ''}${place ? ` · ${place}` : ''}${row.stateFromCoordinates ? ' (state derived from coordinates)' : ''}${row.stateFromCoordinates === false ? ' (state as filed)' : ''}${row.sitesSharingNumber !== undefined ? ` · ${row.sitesSharingNumber} sites share this location number; ULS does not say which uses this frequency` : ''}`,
         );
       }
       const technical = [
@@ -353,7 +378,7 @@ export const searchFrequencies = tool('fcc_spectrum_search_frequencies', {
       if (technical.length) lines.push(`- ${technical.join(' · ')}`);
       if (row.marketCode || row.marketName || row.channelBlock) {
         lines.push(
-          `- **Market:** ${[row.marketCode, row.marketName && inline(row.marketName)].filter(Boolean).join(' — ')}${row.channelBlock ? ` · **Block:** ${inline(row.channelBlock)}` : ''}`,
+          `- **Market:** ${[row.marketCode, row.marketName && inline(row.marketName)].filter(Boolean).join(' — ')}${row.channelBlock ? ` · **Block:** ${inline(row.channelBlock)}` : ''}${row.partitionAreaIds?.length ? ` · **Partition areas:** ${row.partitionAreaIds.join(', ')}` : ''}`,
         );
       }
     }

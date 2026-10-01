@@ -7,21 +7,36 @@
 import { resource, z } from '@cyanheads/mcp-ts-core';
 import { JsonRpcErrorCode } from '@cyanheads/mcp-ts-core/errors';
 import { callsignSchema } from '@/mcp-server/tools/input-schemas.js';
-import { getUlsIndexService } from '@/services/uls/uls-index-service.js';
+import { getUlsIndexService, LICENSE_PAGE } from '@/services/uls/uls-index-service.js';
 
 /** Frequency rows returned, matching `fcc_spectrum_get_license`'s default `max_frequencies`. */
 const MAX_FREQUENCIES = 100;
 
+/**
+ * Percent-decode a URI template variable, which reaches the handler as the URI carried it:
+ * `{callsign}` matches no `/`, so a portable suffix arrives as `W1AW%2F4`. A malformed escape
+ * is left as is for the callsign pattern to reject.
+ */
+function percentDecoded(value: unknown): unknown {
+  if (typeof value !== 'string') return value;
+  try {
+    return decodeURIComponent(value);
+  } catch {
+    return value;
+  }
+}
+
 export const licenseResource = resource('fcc-spectrum://license/{callsign}', {
   name: 'fcc_spectrum_license',
   title: 'FCC ULS license by callsign',
-  description:
-    'One FCC ULS license or spectrum lease by callsign, as JSON: the record fcc_spectrum_get_license returns (licensee, status and dates, locations with antennas and up to 100 frequency rows, market blocks, lease links), plus dataAsOf and the frequency-row counts. A callsign shared by several records resolves to the active one, else the most recent.',
+  description: `One FCC ULS license or spectrum lease by callsign, as JSON: the first page fcc_spectrum_get_license returns (licensee, status and dates, whole locations up to ${LICENSE_PAGE.sites} sites and ${LICENSE_PAGE.antennas} antennas with up to ${MAX_FREQUENCIES} frequency rows, market blocks, lease links with up to ${LICENSE_PAGE.leases} leases), plus dataAsOf, the location, site, and frequency-row counts, and a notice naming the fcc_spectrum_get_license call that reads whatever the page leaves out. A callsign shared by several records resolves to the active one, else the most recent.`,
   mimeType: 'application/json',
   params: z.object({
-    callsign: callsignSchema.describe(
-      'Callsign or lease ID, e.g. KNKA123 or L000012345; case and one trailing portable suffix are normalized.',
-    ),
+    callsign: z
+      .preprocess(percentDecoded, callsignSchema)
+      .describe(
+        'Callsign or lease ID, e.g. KNKA123 or L000012345, percent-encoded; case and one trailing portable suffix, sent with its slash as %2F (W1AW%2F4), are normalized.',
+      ),
   }),
   cacheHint: { ttlMs: 3_600_000, cacheScope: 'public' },
   errors: [
@@ -62,14 +77,34 @@ export const licenseResource = resource('fcc-spectrum://license/{callsign}', {
         },
       );
     }
+    const { license, locations } = result;
+    const call = `call fcc_spectrum_get_license with usi "${license.usi}"`;
+    const cut = result.frequencyCutAt;
+    const notice = [
+      result.nextLocationOffset !== undefined &&
+        `Lists ${locations.length} of ${result.locationTotal} locations; ${call} and location_offset ${result.nextLocationOffset} for the rest.`,
+      result.windowFrequencyTotal > result.frequenciesShown &&
+        `Lists ${result.frequenciesShown} of ${result.windowFrequencyTotal} frequency rows at these locations; ${call} and a higher max_frequencies (up to 1000)${cut && cut.offset > 0 ? ` or location_offset ${cut.offset}` : ''} for the rest.`,
+      result.nextLeaseOffset !== undefined &&
+        `Lists ${license.leases.length} of ${license.leaseCount} leases; ${call} and lease_offset ${result.nextLeaseOffset} for the rest.`,
+    ]
+      .filter((fragment): fragment is string => Boolean(fragment))
+      .join(' ');
     return {
       dataAsOf,
-      license: result.license,
+      license,
       technicalRetained: result.technicalRetained,
-      locations: result.locations,
+      locations,
+      locationTotal: result.locationTotal,
+      siteTotal: result.siteTotal,
+      ...(result.nextLocationOffset !== undefined && {
+        nextLocationOffset: result.nextLocationOffset,
+      }),
+      ...(result.nextLeaseOffset !== undefined && { nextLeaseOffset: result.nextLeaseOffset }),
       otherCallsignRecords: result.otherCallsignRecords,
       frequenciesShown: result.frequenciesShown,
       frequencyTotal: result.frequencyTotal,
+      ...(notice && { notice }),
     };
   },
 });

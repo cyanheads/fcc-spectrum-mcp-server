@@ -19,6 +19,7 @@ import {
   callsignSchema,
   cursorSchema,
   frnSchema,
+  licenseeSchema,
   licenseStatusSchema,
   radioServiceSchema,
   stateSchema,
@@ -41,7 +42,7 @@ const LicenseSchema = z
       .describe('True for a spectrum leasing arrangement, whose licensee is the lessee.'),
     licenseStatus: z
       .string()
-      .describe('ULS license status code (A active, E expired, C cancelled, T terminated, …).'),
+      .describe('ULS license status code (A active, E expired, C canceled, T terminated, …).'),
     statusLabel: z.string().describe('Label of the license status code.'),
     radioServiceCode: z.string().describe('Two-character ULS radio service code.'),
     radioServiceLabel: z.string().describe('Label of the radio service code.'),
@@ -96,8 +97,8 @@ export const searchLicenses = tool('fcc_spectrum_search_licenses', {
     callsign: blankAsUnset(callsignSchema.optional()).describe(
       'Exact callsign or lease ID, e.g. "KNKA123" or "L000012345". Case, spaces, and one trailing portable suffix ("/4") are normalized. ULS reuses callsigns, so several records can match.',
     ),
-    licensee: blankAsUnset(z.string().max(200).optional()).describe(
-      'Licensee name words; every word must match the start of a word in the name, in any order (e.g. "verizon wireless").',
+    licensee: blankAsUnset(licenseeSchema.optional()).describe(
+      'Licensee name words, with at least one letter or digit; every word must match the start of a word in the name, in any order (e.g. "verizon wireless"). A word joined by - or & ("T-Mobile", "AT&T") matches its pieces side by side.',
     ),
     frn: blankAsUnset(frnSchema.optional()).describe(
       'FCC Registration Number, up to 10 digits; spaces and hyphens are removed and it is left-padded with zeros.',
@@ -106,7 +107,7 @@ export const searchLicenses = tool('fcc_spectrum_search_licenses', {
       'Two-character radio service code, e.g. "CD" (paging) or "BR" (BRS); see fcc_spectrum_list_reference topic "radio_services".',
     ),
     status: blankAsUnset(licenseStatusSchema).describe(
-      'License status: A active, L pending legal, X term pending, E expired, C cancelled, T terminated, P parent station cancelled, or "any" for every status. Defaults to A.',
+      'License status: A active, L pending legal, X term pending, E expired, C canceled, T terminated, P parent station canceled, or "any" for every status. Defaults to A.',
     ),
     state: blankAsUnset(stateSchema.optional()).describe(
       "Licensee mailing state: a two-letter USPS code (incl. DC, PR, VI, GU, AS, MP) or a full state name. This is the licensee's address, not the site location.",
@@ -182,7 +183,7 @@ export const searchLicenses = tool('fcc_spectrum_search_licenses', {
     {
       reason: 'invalid_cursor',
       code: JsonRpcErrorCode.ValidationError,
-      when: 'The cursor does not decode or belongs to an earlier index generation.',
+      when: 'The cursor does not decode, belongs to an earlier index generation, or is from a licensee search the daily refresh has since changed.',
       recovery:
         'Call fcc_spectrum_search_licenses again with the same filters and no cursor to start from the first page.',
     },
@@ -300,7 +301,7 @@ export const searchLicenses = tool('fcc_spectrum_search_licenses', {
       lines.push(
         '',
         `### ${license.callsign ? inline(license.callsign) : '(no callsign)'} · USI ${license.usi}`,
-        `- **Licensee:** ${licenseeText(license.licenseeName, license.licenseeRedacted)}${license.licenseeRedacted ? ' (redacted)' : ''}${license.frn ? ` · **FRN:** ${license.frn}` : ''}${license.applicantType ? ` · **Applicant type:** ${license.applicantType}` : ''}`,
+        `- **Licensee:** ${licenseeText(license.licenseeName, license.licenseeRedacted)} · **Redacted:** ${yesNo(license.licenseeRedacted)}${license.frn ? ` · **FRN:** ${license.frn}` : ''}${license.applicantType ? ` · **Applicant type:** ${license.applicantType}` : ''}`,
         `- **Status:** ${license.licenseStatus} (${license.statusLabel}) · **Service:** ${license.radioServiceCode} (${inline(license.radioServiceLabel)}) · **Group:** ${license.serviceGroup} · **Lease:** ${yesNo(license.isLease)}`,
       );
       if (license.licenseeCity || license.licenseeState) {

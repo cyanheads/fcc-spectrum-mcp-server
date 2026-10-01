@@ -46,6 +46,7 @@ import {
   decodeMf,
   decodeMk,
   emissionBandwidthMhz,
+  MAX_FRACTIONAL_BANDWIDTH,
   parseCountsFile,
   type RecordType,
   toIsoSeconds,
@@ -1181,23 +1182,33 @@ function insertRecords(db: SqliteHandle): number {
 /**
  * Insert staged technical rows. Frequencies take their emissions (distinct, comma-joined)
  * and widest necessary bandwidth from EM rows joined on `(usi, location, antenna,
- * freq_seq_id)`, and the occupied band `[f − bw/2, (upper ?? f) + bw/2]`. EM rows with no
- * FR partner are dropped and counted in `stats.EM.orphaned`.
+ * freq_seq_id)`, and the occupied band `[f − bw/2, (upper ?? f) + bw/2]`. A bandwidth of
+ * {@link MAX_FRACTIONAL_BANDWIDTH} × f or more is a filing error and counts as none. EM
+ * rows with no FR partner are dropped and counted in `stats.EM.orphaned`. Sites a license
+ * files under one location number take `site_seq` 1, 2, … in filing order.
  */
 function insertTechnical(db: SqliteHandle, stats: RecordStats): void {
+  const bandwidth = `max(CASE WHEN e.bandwidth_mhz < ${MAX_FRACTIONAL_BANDWIDTH} * f.frequency_mhz
+    THEN e.bandwidth_mhz END)`;
+  const locationColumns = `location_type, location_class, address, city, county, state, radius_km,
+    ground_elevation_m, lat, lon, coord_dms, asr_number, support_height_m, overall_height_m,
+    structure_type, location_name, site_state, state_derived`;
   db.exec(
     `CREATE INDEX temp.stage_em_key ON stage_em (usi, location_number, antenna_number, freq_seq_id);
      CREATE INDEX temp.stage_fr_key ON stage_fr (usi, location_number, antenna_number, freq_seq_id);
-     INSERT INTO locations SELECT * FROM temp.stage_lo;
+     INSERT INTO locations (usi, location_number, site_seq, ${locationColumns})
+       SELECT usi, location_number,
+         row_number() OVER (PARTITION BY usi, location_number ORDER BY rowid), ${locationColumns}
+       FROM temp.stage_lo;
      INSERT INTO antennas SELECT * FROM temp.stage_an;
      INSERT INTO frequencies (usi, location_number, antenna_number, freq_seq_id, class_station,
        frequency_mhz, upper_mhz, power_output_w, erp_w, eirp_dbm, transmitter_make,
        transmitter_model, emissions, bandwidth_mhz, occ_low, occ_high)
        SELECT f.usi, f.location_number, f.antenna_number, f.freq_seq_id, f.class_station,
          f.frequency_mhz, f.upper_mhz, f.power_output_w, f.erp_w, f.eirp_dbm, f.transmitter_make,
-         f.transmitter_model, group_concat(DISTINCT e.emission_code), max(e.bandwidth_mhz),
-         f.frequency_mhz - COALESCE(max(e.bandwidth_mhz), 0) / 2.0,
-         COALESCE(f.upper_mhz, f.frequency_mhz) + COALESCE(max(e.bandwidth_mhz), 0) / 2.0
+         f.transmitter_model, group_concat(DISTINCT e.emission_code), ${bandwidth},
+         f.frequency_mhz - COALESCE(${bandwidth}, 0) / 2.0,
+         COALESCE(f.upper_mhz, f.frequency_mhz) + COALESCE(${bandwidth}, 0) / 2.0
        FROM temp.stage_fr f
        LEFT JOIN temp.stage_em e ON e.usi = f.usi AND e.location_number = f.location_number
          AND e.antenna_number = f.antenna_number AND e.freq_seq_id = f.freq_seq_id
@@ -1230,7 +1241,7 @@ function widenBandBounds(db: SqliteHandle): void {
        FROM frequencies WHERE usi IN (SELECT usi FROM temp.apply)), 0))
      WHERE key = '${META_KEYS.maxSiteBand}';
      UPDATE meta SET value = max(CAST(value AS REAL), COALESCE((SELECT max(COALESCE(upper, lower) - lower)
-       FROM market_blocks WHERE usi IN (SELECT usi FROM temp.apply)), 0))
+       FROM market_blocks WHERE lower > 0 AND usi IN (SELECT usi FROM temp.apply)), 0))
      WHERE key = '${META_KEYS.maxMarketBand}';`,
   );
 }
@@ -1238,7 +1249,8 @@ function widenBandBounds(db: SqliteHandle): void {
 /**
  * Refresh derived bookkeeping after a run: per-code record counts, the widest site and
  * market bands (which bound the overlap range scans; a daily file only widens them, see
- * {@link widenBandBounds}), and per-group coverage counts.
+ * {@link widenBandBounds}), and per-group coverage counts. A market block with a 0 lower
+ * edge records a channel width, not a frequency, so it never bounds a scan.
  */
 function recomputeSummaries(db: SqliteHandle): void {
   const count = (sql: string) => db.prepare<{ group: string | null; n: number }>(sql).all();
@@ -1270,7 +1282,8 @@ function recomputeSummaries(db: SqliteHandle): void {
        INSERT OR REPLACE INTO meta (key, value) VALUES ('${META_KEYS.maxSiteBand}',
          (SELECT COALESCE(max(occ_high - occ_low), 0) FROM frequencies));
        INSERT OR REPLACE INTO meta (key, value) VALUES ('${META_KEYS.maxMarketBand}',
-         (SELECT COALESCE(max(COALESCE(upper, lower) - lower), 0) FROM market_blocks));`,
+         (SELECT COALESCE(max(COALESCE(upper, lower) - lower), 0) FROM market_blocks
+          WHERE lower > 0));`,
     );
     db.prepare('INSERT OR REPLACE INTO meta (key, value) VALUES (?, ?)').run(
       META_KEYS.groupStats,

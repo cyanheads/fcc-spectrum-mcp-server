@@ -30,6 +30,7 @@ import {
   successOf,
   useIndex,
 } from '../fixtures/tool-harness.js';
+import { QUIRKS_WEEKLY } from '../fixtures/uls-fixtures.js';
 import {
   buildFixtureIndex,
   type FixtureIndex,
@@ -57,7 +58,7 @@ const PORTLAND = { latitude: dms(45, 30, 54.7), longitude: dms(122, 40, 42.2, tr
 const SPOKANE = { latitude: dms(47, 39, 32), longitude: dms(117, 25, 33, true) };
 
 const MARKET_HINT =
-  'Market-area licenses (PCS, AWS, 700 MHz, 3.5 GHz) usually have no site records; call fcc_spectrum_search_frequencies with kind "market".';
+  'Market-area licenses (PCS, AWS, 700 MHz, 3.7 GHz) usually have no site records; call fcc_spectrum_search_frequencies with kind "market".';
 
 const run = (input: Record<string, unknown>) => runToolContract(findTransmitters, input as never);
 const page = (result: ContractResult) => successOf<Page>(result);
@@ -200,12 +201,12 @@ describe('warm index', () => {
 
     it.each([
       ['a cursor that does not decode', 'garbage'],
-      ['a cursor from another generation', forgeCursor('20990101T000000Z', 't', 0, 1001, 1)],
+      ['a cursor from another generation', forgeCursor('20990101T000000Z', 't', 0, 1001, 1, 1)],
       ['a search_licenses cursor', forgeCursor(FIXTURE_GENERATION_ID, 'c', 'KZZ901', 1001)],
-      ['a transmitter cursor missing a key', forgeCursor(FIXTURE_GENERATION_ID, 't', 0, 1001)],
+      ['a transmitter cursor missing a key', forgeCursor(FIXTURE_GENERATION_ID, 't', 0, 1001, 1)],
       [
         'a transmitter cursor with a string key',
-        forgeCursor(FIXTURE_GENERATION_ID, 't', 0, '1001', 1),
+        forgeCursor(FIXTURE_GENERATION_ID, 't', 0, '1001', 1, 1),
       ],
     ])('fails invalid_cursor for %s', async (_label, cursor) => {
       const result = await run({ ...SEATTLE, cursor });
@@ -434,7 +435,14 @@ describe('warm index', () => {
         await run({ ...SEATTLE, frequency_low: 500, frequency_high: 510, radio_service: 'CD' }),
       );
       expect(result.notice).toBe(
-        `No transmitter site within 5 km is authorized on 500–510 MHz under these filters; raise radius_km (max 100), widen the band with frequency_high, drop radio_service, pass status "any", or call fcc_spectrum_search_frequencies to search by state. ${MARKET_HINT}`,
+        `No transmitter site within 5 km is authorized on 500–510 MHz under these filters; raise radius_km (max 100), widen the band (lower frequency_low or raise frequency_high), drop radio_service, pass status "any", or call fcc_spectrum_search_frequencies to search by state. ${MARKET_HINT}`,
+      );
+    });
+
+    it('suggests frequency_high for a single-frequency search with nothing on it', async () => {
+      const result = page(await run({ ...SEATTLE, frequency_low: 500, status: 'any' }));
+      expect(result.notice).toBe(
+        `No transmitter site within 5 km is authorized on 500 MHz under these filters; raise radius_km (max 100), widen the band with frequency_high, or call fcc_spectrum_search_frequencies to search by state. ${MARKET_HINT}`,
       );
     });
   });
@@ -555,6 +563,40 @@ describe('warm index', () => {
       expect(tacoma).toMatchObject({ usi: '1001', locationNumber: 2 });
       expect(contractText(result).split('\n')).toContain('- **Place:** KING, WA (state as filed)');
     });
+  });
+});
+
+describe('filing quirks', () => {
+  let quirks: FixtureIndex;
+  beforeAll(async () => {
+    quirks = await buildFixtureIndex({ groups: ['paging'], weekly: { paging: QUIRKS_WEEKLY } });
+  });
+  beforeEach(async () => {
+    await useIndex(quirks.mirrorDir, { services: ['paging'] });
+  });
+  afterAll(async () => {
+    await releaseIndex();
+    await quirks.dispose();
+  });
+
+  it('returns each site under a shared location number and ties the frequencies to the number', async () => {
+    const result = await run({ latitude: '47-40-00 N', longitude: '122-21-00 W', radius_km: 2 });
+    const structured = page(result);
+    expect(
+      structured.sites.map((site) => [
+        site.locationNumber,
+        site.groundElevationM,
+        site.sitesSharingNumber,
+      ]),
+    ).toEqual([
+      [1, 120, 2],
+      [1, 60, 2],
+    ]);
+    const rendered = contractText(result);
+    expect(rendered.split('\n')).toContain(
+      '- **Shared location number:** 2 sites share location 1; the frequencies below are filed against the number, and ULS does not say which site uses each.',
+    );
+    expectCarries(rendered, structured.sites);
   });
 });
 

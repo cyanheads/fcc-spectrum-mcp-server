@@ -5,7 +5,7 @@
  * @module services/uls/normalize
  */
 
-import { STATE_NAME_TO_CODE, stateNameKey } from './codes.js';
+import { LICENSE_STATUSES, STATE_NAME_TO_CODE, stateNameKey } from './codes.js';
 
 /** Which coordinate a DMS value describes; decides the valid hemispheres and bound. */
 export type CoordinateAxis = 'latitude' | 'longitude';
@@ -64,13 +64,18 @@ export function parseCoordinateText(text: string, axis: CoordinateAxis): number 
   return dmsToDecimal(Number(deg), Number(min), Number(sec), dir ?? null, axis) ?? undefined;
 }
 
-/** Trim, uppercase, drop internal spaces, and strip one trailing portable suffix (`n0call/4` → `N0CALL`). */
+/**
+ * Trim, uppercase, drop internal spaces, and strip one trailing portable suffix (`n0call/4` →
+ * `N0CALL`, `W1AW/KH6` → `W1AW`). A trailing segment shaped like a callsign (letters, a digit,
+ * letters: `KH6/W1AW`) is the base of a prefix-portable form, not a suffix, so it stays for
+ * the pattern check to reject.
+ */
 export function normalizeCallsign(raw: string): string {
   return raw
     .trim()
     .toUpperCase()
     .replace(/\s+/g, '')
-    .replace(/\/[A-Z0-9]{1,4}$/, '');
+    .replace(/\/(?![A-Z]{1,2}\d[A-Z]+$)[A-Z0-9]{1,4}$/, '');
 }
 
 /** Strip spaces and hyphens and left-pad up to 10 digits (`1234567` → `0001234567`). */
@@ -86,10 +91,25 @@ export function normalizeStateInput(raw: string): string {
   return STATE_NAME_TO_CODE.get(stateNameKey(trimmed)) ?? trimmed;
 }
 
-/** Uppercase a status code, keeping the `any` keyword lowercase. */
+/** Lowercase, single-spaced, US spelling (`Cancelled` → `canceled`). */
+const statusWordKey = (text: string) =>
+  text.trim().toLowerCase().replace(/\s+/g, ' ').replaceAll('cancelled', 'canceled');
+
+/**
+ * Status words that name exactly one ULS code: each status label (`expired`, `term pending`)
+ * plus `pending legal`, the shorter form the tool descriptions use. `pending` alone names
+ * both `L` and `X`, so it is not here.
+ */
+const STATUS_WORDS = new Map([
+  ...Object.entries(LICENSE_STATUSES).map(([code, label]) => [statusWordKey(label), code] as const),
+  ['pending legal', 'L'],
+]);
+
+/** Uppercase a status code or map a one-to-one status word to it, keeping `any` lowercase. */
 export function normalizeStatusInput(raw: string): string {
-  const trimmed = raw.trim();
-  return trimmed.toLowerCase() === 'any' ? 'any' : trimmed.toUpperCase();
+  const key = statusWordKey(raw);
+  if (key === 'any') return 'any';
+  return STATUS_WORDS.get(key) ?? raw.trim().toUpperCase();
 }
 
 /** Map any casing of a unit to its canonical spelling (`mhz` → `MHz`); unknown text passes through. */

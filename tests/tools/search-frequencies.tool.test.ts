@@ -29,6 +29,7 @@ import {
   successOf,
   useIndex,
 } from '../fixtures/tool-harness.js';
+import { QUIRKS_WEEKLY } from '../fixtures/uls-fixtures.js';
 import {
   buildFixtureIndex,
   type FixtureIndex,
@@ -208,7 +209,7 @@ describe('warm index', () => {
         'a cursor from another generation',
         forgeCursor('20990101T000000Z', 'f', 2496, 1, 2001, 0, 1),
       ],
-      ['a find_transmitters cursor', forgeCursor(FIXTURE_GENERATION_ID, 't', 0, 1001, 1)],
+      ['a find_transmitters cursor', forgeCursor(FIXTURE_GENERATION_ID, 't', 0, 1001, 1, 1)],
       [
         'a frequency cursor missing a key',
         forgeCursor(FIXTURE_GENERATION_ID, 'f', 2496, 1, 2001, 0),
@@ -234,6 +235,7 @@ describe('warm index', () => {
       ['an unknown state name', { ...BRS, state: 'Atlantis' }],
       ['a three-character service code', { ...BRS, radio_service: 'ABC' }],
       ['a 201-character licensee', { ...BRS, licensee: 'x'.repeat(201) }],
+      ['a licensee with no letter or digit', { ...BRS, licensee: '!!!' }],
       ['limit 0', { ...BRS, limit: 0 }],
       ['limit 201', { ...BRS, limit: 201 }],
       ['a fractional limit', { ...BRS, limit: 1.5 }],
@@ -261,6 +263,8 @@ describe('warm index', () => {
       };
       const parsed = searchFrequencies.input.parse(input);
       expect(parsed).toMatchObject({ unit: 'MHz', kind: 'both', status: 'A', limit: 50 });
+      expect(searchFrequencies.input.parse({ ...BRS, kind: ' Market ' }).kind).toBe('market');
+      expect(searchFrequencies.input.parse({ ...BRS, kind: 'SITE' }).kind).toBe('site');
       for (const key of ['state', 'radio_service', 'licensee', 'cursor'] as const) {
         expect(parsed[key]).toBeUndefined();
       }
@@ -586,6 +590,86 @@ describe('warm index', () => {
       ]);
       expectCarries(contractText(result), structured.assignments);
     });
+  });
+});
+
+describe('filing quirks', () => {
+  const PAL_NOT_MATCHED =
+    'ULS files Priority Access Licenses (radio service PL, 3550–3650 MHz) as a 10 MHz channel width with no frequency, so frequency search does not match them; list them with fcc_spectrum_search_licenses and radio_service "PL".';
+
+  let quirks: FixtureIndex;
+  beforeAll(async () => {
+    quirks = await buildFixtureIndex({ groups: ['paging'], weekly: { paging: QUIRKS_WEEKLY } });
+  });
+  beforeEach(async () => {
+    await useIndex(quirks.mirrorDir, { services: ['paging'] });
+  });
+  afterAll(async () => {
+    await releaseIndex();
+    await quirks.dispose();
+  });
+
+  it('never matches a PAL block filed as 0–10 MHz, and says why on a search of the PAL band', async () => {
+    expect(page(await run({ frequency_low: 5, kind: 'market' })).totalCount).toBe(0);
+    const result = await run({ frequency_low: 3550, frequency_high: 3700, radio_service: 'PL' });
+    const structured = page(result);
+    expect(structured.totalCount).toBe(0);
+    expect(structured.notice).toContain(PAL_NOT_MATCHED);
+    expect(contractText(result)).toContain(PAL_NOT_MATCHED);
+  });
+
+  it('leaves the PAL notice off searches that could not match a PAL', async () => {
+    for (const input of [
+      { frequency_low: 3600, kind: 'site' },
+      { frequency_low: 3600, radio_service: 'CW' },
+      { frequency_low: 3500, frequency_high: 3549 },
+      { frequency_low: 3651, frequency_high: 3700 },
+    ]) {
+      expect(page(await run(input)).notice ?? '', JSON.stringify(input)).not.toContain(
+        'Priority Access',
+      );
+    }
+    expect(page(await run({ frequency_low: 3.6, unit: 'GHz' })).notice).toContain(PAL_NOT_MATCHED);
+  });
+
+  it('returns a block filed under several partition areas once, listing the areas', async () => {
+    const result = await run({
+      frequency_low: 1757,
+      kind: 'market',
+      state: 'California',
+      licensee: 'partitioned',
+    });
+    const structured = page(result);
+    expect(structured.totalCount).toBe(1);
+    expect(structured.assignments).toEqual([
+      expect.objectContaining({
+        usi: '5004',
+        frequencyMhz: 1755,
+        upperMhz: 1760,
+        marketCode: 'CMA097',
+        channelBlock: 'G',
+        partitionAreaIds: [8183, 8184, 96978],
+      }),
+    ]);
+    expect(contractText(result).split('\n')).toContain(
+      '- **Market:** CMA097 — Bakersfield, CA · **Block:** G · **Partition areas:** 8183, 8184, 96978',
+    );
+    expectCarries(contractText(result), structured.assignments);
+  });
+
+  it("returns a frequency filed against a shared location number once, without one site's place", async () => {
+    const result = await run({ frequency_low: 5900, kind: 'site', state: 'WA' });
+    const structured = page(result);
+    expect(structured.totalCount).toBe(1);
+    const [row] = structured.assignments;
+    expect(row).toMatchObject({ usi: '5005', locationNumber: 1, sitesSharingNumber: 2 });
+    expect(row).not.toHaveProperty('latitude');
+    expect(row).not.toHaveProperty('state');
+    const rendered = contractText(result);
+    expect(rendered.split('\n')).toContain(
+      '- **Site:** location 1 · 2 sites share this location number; ULS does not say which uses this frequency',
+    );
+    expectCarries(rendered, structured.assignments);
   });
 });
 

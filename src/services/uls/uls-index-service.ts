@@ -49,6 +49,7 @@ import type {
   LicenseDetail,
   LicenseeFields,
   LicenseLocation,
+  LicenseSite,
   LicenseSummary,
   LiveStatusFilter,
   PageResult,
@@ -79,8 +80,13 @@ const OVERLAP_EPSILON_MHZ = 0.0000005;
 const EARTH_RADIUS_KM = 6371.0088;
 const KM_PER_DEGREE = (Math.PI * EARTH_RADIUS_KM) / 180;
 
-/** Leases listed on a parent license before `leaseCount` carries the rest. */
-const MAX_LEASES_LISTED = 25;
+/**
+ * What one `getLicense` call lists of each repeating section: the location window holds
+ * whole locations up to this many sites and antennas (one location larger than either is
+ * listed alone), and leases are listed this many at a time. Frequency rows are capped by the
+ * caller's `maxFrequencies`.
+ */
+export const LICENSE_PAGE = { sites: 50, antennas: 100, leases: 100 } as const;
 
 /** Callsign-prefix candidates offered on a miss. */
 const MAX_CANDIDATES = 5;
@@ -141,6 +147,8 @@ interface LocationRow {
   lon: number | null;
   overall_height_m: number | null;
   radius_km: number | null;
+  /** Numbers the sites a license files under one location number, 1, 2, … in filing order. */
+  site_seq: number;
   site_state: string | null;
   state_derived: number;
   structure_type: string | null;
@@ -216,16 +224,36 @@ function liveStatuses(status: LiveStatusFilter): readonly string[] {
 }
 
 /**
- * Translate a licensee name into an FTS5 query: each word double-quoted as a prefix term,
- * AND-ed (`"acme"* "wireless"*`). Splitting on non-letters matches the index tokenizer and
- * leaves no FTS operator in the query. `undefined` when the text has no word to search.
+ * The distinct partition areas a market band is filed under, comma-joined, over rows of
+ * `market_blocks mb` grouped by `(usi, lower, upper)`. A blank area (stored as `0`) is dropped.
+ */
+const PARTITION_AREAS_SQL = 'group_concat(DISTINCT NULLIF(mb.partition_area_id, 0))';
+
+/** {@link PARTITION_AREAS_SQL} as numbers, ascending; `undefined` when every area was blank. */
+function partitionAreaIds(concat: string | null): number[] | undefined {
+  return concat
+    ?.split(',')
+    .map(Number)
+    .toSorted((a, b) => a - b);
+}
+
+/**
+ * Translate a licensee name into an FTS5 query: each whitespace-separated word becomes one
+ * double-quoted term, AND-ed (`"acme"* "wireless"*`). A word the index tokenizer splits on
+ * punctuation (`T-Mobile`, `AT&T`) stays one phrase of its pieces (`"t mobile"*`, `"at t"`),
+ * so its one-letter pieces cannot match as separate words. A term's last piece is a prefix
+ * unless it is a single character, which would match nearly every name. Splitting on
+ * non-letters matches the tokenizer and leaves no FTS operator in the query. `undefined` when
+ * the text has no word to search.
  */
 function ftsQuery(text: string): string | undefined {
-  const words = text
+  const terms = text
     .normalize('NFKC')
-    .split(/[^\p{L}\p{N}]+/u)
-    .filter(Boolean);
-  return words.length ? words.map((word) => `"${word}"*`).join(' ') : undefined;
+    .split(/\s+/u)
+    .map((word) => word.split(/[^\p{L}\p{N}]+/u).filter(Boolean))
+    .filter((pieces) => pieces.length > 0)
+    .map((pieces) => `"${pieces.join(' ')}"${(pieces.at(-1)?.length ?? 0) > 1 ? '*' : ''}`);
+  return terms.length ? terms.join(' ') : undefined;
 }
 
 function encodeCursor(generation: string, tag: string, key: CursorKey): string {
@@ -381,6 +409,30 @@ function collapseFrequencies(
   }));
 }
 
+/** One LO row's site fields; the street address only when redaction leaves it visible. */
+function siteFields(lo: LocationRow, addressVisible: boolean): LicenseSite {
+  return {
+    ...opt('locationTypeCode', lo.location_type),
+    ...opt('locationTypeLabel', lo.location_type && LOCATION_TYPES[lo.location_type]),
+    ...opt('locationClassCode', lo.location_class),
+    ...opt('latitude', lo.lat),
+    ...opt('longitude', lo.lon),
+    ...opt('coordinatesDms', lo.coord_dms),
+    ...opt('groundElevationM', lo.ground_elevation_m),
+    ...opt('supportHeightM', lo.support_height_m),
+    ...opt('overallHeightM', lo.overall_height_m),
+    ...opt('structureType', lo.structure_type),
+    ...opt('asrNumber', lo.asr_number),
+    ...opt('radiusKm', lo.radius_km),
+    ...(addressVisible && opt('address', lo.address)),
+    ...opt('city', lo.city),
+    ...opt('county', lo.county),
+    ...opt('state', lo.site_state),
+    ...(lo.site_state !== null && { stateFromCoordinates: lo.state_derived === 1 }),
+    ...opt('name', lo.location_name),
+  };
+}
+
 /** Read path over the published ULS index generation. */
 export class UlsIndexService {
   private current: OpenGeneration | undefined;
@@ -516,7 +568,9 @@ export class UlsIndexService {
   /**
    * Search licenses and leases. With `licensee`, rows rank by FTS bm25 then USI, and
    * individual records are excluded while redaction is on; otherwise they sort by callsign
-   * then USI. Keyset-paginated with a generation-bound cursor.
+   * then USI. Keyset-paginated with a generation-bound cursor; a rank-order cursor is also
+   * bound to the daily files applied, since each one shifts the corpus statistics bm25 scores
+   * from.
    */
   async searchLicenses(params: SearchLicensesParams): Promise<PageResult<LicenseSummary>> {
     const { db, id } = await this.requireGeneration();
@@ -541,11 +595,13 @@ export class UlsIndexService {
     const base = `FROM licenses_fts JOIN licenses l ON l.usi = licenses_fts.rowid
       WHERE licenses_fts MATCH ?${where.map((clause) => ` AND ${clause}`).join('')}`;
     const baseArgs = [match, ...args];
+    // Read before the rows: a refresh committing in between then fails the next page.
+    const scoreState = `${id}+${readRefreshState(db)}`;
 
     let keyset = '';
     const keysetArgs: SqlValue[] = [];
     if (params.cursor) {
-      const key = decodeCursor(params.cursor, id, 'r', ['number', 'number']);
+      const key = decodeCursor(params.cursor, scoreState, 'r', ['number', 'number']);
       if (!key) return { ok: false, reason: 'invalid_cursor' };
       keyset = 'WHERE (score, usi) > (?, ?)';
       keysetArgs.push(...(key as number[]));
@@ -564,7 +620,7 @@ export class UlsIndexService {
       total,
       rows: this.licenseSummaries(db, rows.slice(0, params.limit)),
       ...(rows.length > params.limit &&
-        last && { nextCursor: encodeCursor(id, 'r', [last.score, last.usi]) }),
+        last && { nextCursor: encodeCursor(scoreState, 'r', [last.score, last.usi]) }),
     };
   }
 
@@ -713,31 +769,123 @@ export class UlsIndexService {
     }
 
     const technicalRetained = (LIVE_STATUSES as readonly string[]).includes(row.license_status);
-    const frequencyTotal =
-      db
-        .prepare<{ n: number }>(
-          // Only rows that can be shown: a row with no assigned frequency is never listed.
-          'SELECT count(*) AS n FROM frequencies WHERE usi = ? AND frequency_mhz IS NOT NULL',
-        )
-        .get(row.usi)?.n ?? 0;
-    const { locations, shown } = technicalRetained
-      ? this.licenseLocations(db, row, params.maxFrequencies)
+    const window = technicalRetained
+      ? this.locationWindow(db, row.usi, params.locationOffset ?? 0, params.maxFrequencies)
+      : undefined;
+    const { locations, shown } = window?.range
+      ? this.licenseLocations(db, row, window.range, params.maxFrequencies)
       : { locations: [], shown: 0 };
+    const { license, nextLeaseOffset } = this.licenseDetail(db, row, params.leaseOffset ?? 0);
     return {
       found: true,
-      license: this.licenseDetail(db, row),
+      license,
       technicalRetained,
       locations,
       otherCallsignRecords: others.map((other) => ({
         usi: String(other.usi),
         licenseStatus: other.license_status,
       })),
-      frequencyTotal,
+      frequencyTotal: window?.frequencyTotal ?? 0,
       frequenciesShown: shown,
+      locationTotal: window?.locationTotal ?? 0,
+      siteTotal: window?.siteTotal ?? 0,
+      sitesShown: window?.sitesShown ?? 0,
+      windowFrequencyTotal: window?.windowFrequencyTotal ?? 0,
+      ...(window?.nextOffset !== undefined && { nextLocationOffset: window.nextOffset }),
+      ...(window?.cutAt && { frequencyCutAt: window.cutAt }),
+      ...(nextLeaseOffset !== undefined && { nextLeaseOffset }),
     };
   }
 
-  private licenseDetail(db: SqliteHandle, row: LicenseRow): LicenseDetail {
+  /**
+   * The window of location numbers one `getLicense` call lists: whole locations from
+   * `offset`, in number order, until the next would pass {@link LICENSE_PAGE}'s site or
+   * antenna budget. The first location is always listed, so one larger than a budget is
+   * listed alone rather than split. Sites count every site of a shared number; antennas and
+   * frequency rows count those {@link licenseLocations} lists. `cutAt` is the first location
+   * whose frequency rows `maxFrequencies` drops, since rows are read in location order.
+   */
+  private locationWindow(db: SqliteHandle, usi: number, offset: number, maxFrequencies: number) {
+    const summary = new Map<
+      number,
+      { antennas: Set<number>; frequencies: number; sites: number }
+    >();
+    const entry = (number: number) => {
+      let counts = summary.get(number);
+      if (!counts) {
+        counts = { antennas: new Set(), frequencies: 0, sites: 0 };
+        summary.set(number, counts);
+      }
+      return counts;
+    };
+    for (const { n, count } of db
+      .prepare<{ count: number; n: number }>(
+        'SELECT location_number AS n, count(*) AS count FROM locations WHERE usi = ? GROUP BY n',
+      )
+      .all(usi)) {
+      entry(n).sites = count;
+    }
+    for (const { n, a } of db
+      .prepare<{ a: number; n: number }>(
+        'SELECT location_number AS n, antenna_number AS a FROM antennas WHERE usi = ?',
+      )
+      .all(usi)) {
+      entry(n).antennas.add(a);
+    }
+    for (const { n, a, count } of db
+      .prepare<{ a: number; count: number; n: number }>(
+        `SELECT location_number AS n, antenna_number AS a, count(*) AS count FROM frequencies
+         WHERE usi = ? AND frequency_mhz IS NOT NULL GROUP BY n, a`,
+      )
+      .all(usi)) {
+      const counts = entry(n);
+      counts.antennas.add(a);
+      counts.frequencies += count;
+    }
+    const ordered = [...summary].sort(([a], [b]) => a - b);
+
+    const listed: number[] = [];
+    let sites = 0;
+    let antennas = 0;
+    let frequencies = 0;
+    let cutAt: { locationNumber: number; offset: number } | undefined;
+    for (const [number, counts] of ordered.slice(offset)) {
+      const over =
+        sites + counts.sites > LICENSE_PAGE.sites ||
+        antennas + counts.antennas.size > LICENSE_PAGE.antennas;
+      if (listed.length > 0 && over) break;
+      if (!cutAt && frequencies + counts.frequencies > maxFrequencies) {
+        cutAt = { locationNumber: number, offset: offset + listed.length };
+      }
+      listed.push(number);
+      sites += counts.sites;
+      antennas += counts.antennas.size;
+      frequencies += counts.frequencies;
+    }
+    const [first] = listed;
+    const last = listed.at(-1);
+    const end = offset + listed.length;
+    return {
+      range: first !== undefined && last !== undefined ? { first, last } : undefined,
+      cutAt,
+      locationTotal: ordered.length,
+      siteTotal: ordered.reduce((sum, [, counts]) => sum + counts.sites, 0),
+      sitesShown: sites,
+      frequencyTotal: ordered.reduce((sum, [, counts]) => sum + counts.frequencies, 0),
+      windowFrequencyTotal: frequencies,
+      ...(end < ordered.length && { nextOffset: end }),
+    };
+  }
+
+  /**
+   * The license record with one page of its leases from `leaseOffset`, in lease-ID order,
+   * and the offset of the next page when more follow.
+   */
+  private licenseDetail(
+    db: SqliteHandle,
+    row: LicenseRow,
+    leaseOffset: number,
+  ): { license: LicenseDetail; nextLeaseOffset?: number } {
     const shown = this.redact(row);
     const leasedFrom = db
       .prepare<{ callsign: string | null; usi: number }>(
@@ -750,13 +898,15 @@ export class UlsIndexService {
       db
         .prepare<{ n: number }>('SELECT count(*) AS n FROM lease_links WHERE parent_usi = ?')
         .get(row.usi)?.n ?? 0;
-    const leases = db
+    // One row past the page says whether another page follows.
+    const leaseRows = db
       .prepare<{ callsign: string | null; license_status: string; usi: number }>(
         `SELECT l.callsign, l.usi, l.license_status FROM lease_links ll
          JOIN licenses l ON l.usi = ll.lease_usi
-         WHERE ll.parent_usi = ? ORDER BY l.callsign, l.usi LIMIT ${MAX_LEASES_LISTED}`,
+         WHERE ll.parent_usi = ? ORDER BY l.callsign, l.usi LIMIT ? OFFSET ?`,
       )
-      .all(row.usi);
+      .all(row.usi, LICENSE_PAGE.leases + 1, leaseOffset);
+    const leases = leaseRows.slice(0, LICENSE_PAGE.leases);
     const hasAmateur =
       row.operator_class !== null ||
       row.trustee_callsign !== null ||
@@ -764,13 +914,15 @@ export class UlsIndexService {
       row.trustee_name !== null;
     const blocks = row.market_code
       ? db
-          .prepare<{ lower: number; upper: number | null }>(
-            'SELECT lower, upper FROM market_blocks WHERE usi = ? ORDER BY lower, partition_area_id',
+          .prepare<{ lower: number; partitions: string | null; upper: number | null }>(
+            `SELECT mb.lower, mb.upper, ${PARTITION_AREAS_SQL} AS partitions
+             FROM market_blocks mb WHERE mb.usi = ?
+             GROUP BY mb.lower, mb.upper ORDER BY mb.lower, mb.upper`,
           )
           .all(row.usi)
       : [];
 
-    return {
+    const license: LicenseDetail = {
       usi: String(row.usi),
       ...opt('callsign', row.callsign),
       isLease: row.is_lease === 1,
@@ -808,8 +960,10 @@ export class UlsIndexService {
           ...opt('marketName', row.market_name),
           ...opt('channelBlock', row.channel_block),
           blocks: blocks.map((block) => ({
-            lowMhz: block.lower,
-            highMhz: block.upper ?? block.lower,
+            ...(block.lower > 0
+              ? { lowMhz: block.lower, highMhz: block.upper ?? block.lower }
+              : opt('channelWidthMhz', block.upper)),
+            ...opt('partitionAreaIds', partitionAreaIds(block.partitions)),
           })),
         },
       }),
@@ -824,20 +978,28 @@ export class UlsIndexService {
       })),
       leaseCount,
     };
+    return leaseRows.length > LICENSE_PAGE.leases
+      ? { license, nextLeaseOffset: leaseOffset + LICENSE_PAGE.leases }
+      : { license };
   }
 
   /**
-   * Locations → antennas → frequencies for a live record. Frequency rows are read in
-   * `(location, antenna, freq_seq_id)` order and capped at `maxFrequencies`, so the cap drops
-   * the last locations' rows first. A row whose antenna or location has no record of its
-   * own is kept under a bare antenna or location entry rather than dropped.
+   * Locations → antennas → frequencies for a live record's location numbers `range.first`
+   * through `range.last`. Frequency rows are read in `(location, antenna, freq_seq_id)` order
+   * and capped at `maxFrequencies`, so the cap drops the last locations' rows first. A row
+   * whose antenna or location has no record of its own is kept under a bare antenna or
+   * location entry rather than dropped. A location number filed at several sites lists them
+   * in `sites`; AN and FR rows carry only the number, so its antennas stay on the entry, each
+   * merged across the AN records filed for it (a field is kept only when every record agrees
+   * on it).
    */
   private licenseLocations(
     db: SqliteHandle,
     row: LicenseRow,
+    range: { first: number; last: number },
     maxFrequencies: number,
   ): { locations: LicenseLocation[]; shown: number } {
-    const shown = this.redact(row);
+    const { siteAddressVisible } = this.redact(row);
     const locations = new Map<number, LicenseLocation>();
     const antennas = new Map<string, LicenseAntenna>();
     const location = (number: number) => {
@@ -859,56 +1021,60 @@ export class UlsIndexService {
       return entry;
     };
 
-    for (const lo of db
-      .prepare<LocationRow>('SELECT * FROM locations WHERE usi = ? ORDER BY location_number')
-      .all(row.usi)) {
-      locations.set(lo.location_number, {
-        locationNumber: lo.location_number,
-        ...opt('locationTypeCode', lo.location_type),
-        ...opt('locationTypeLabel', lo.location_type && LOCATION_TYPES[lo.location_type]),
-        ...opt('locationClassCode', lo.location_class),
-        ...opt('latitude', lo.lat),
-        ...opt('longitude', lo.lon),
-        ...opt('coordinatesDms', lo.coord_dms),
-        ...opt('groundElevationM', lo.ground_elevation_m),
-        ...opt('supportHeightM', lo.support_height_m),
-        ...opt('overallHeightM', lo.overall_height_m),
-        ...opt('structureType', lo.structure_type),
-        ...opt('asrNumber', lo.asr_number),
-        ...opt('radiusKm', lo.radius_km),
-        ...(shown.siteAddressVisible && opt('address', lo.address)),
-        ...opt('city', lo.city),
-        ...opt('county', lo.county),
-        ...opt('state', lo.site_state),
-        ...(lo.site_state !== null && { stateFromCoordinates: lo.state_derived === 1 }),
-        ...opt('name', lo.location_name),
+    const inRange = 'usi = ? AND location_number BETWEEN ? AND ?';
+    const rangeArgs = [row.usi, range.first, range.last];
+    const sites = Map.groupBy(
+      db
+        .prepare<LocationRow>(
+          `SELECT * FROM locations WHERE ${inRange} ORDER BY location_number, site_seq`,
+        )
+        .all(...rangeArgs),
+      (lo) => lo.location_number,
+    );
+    for (const [locationNumber, filedSites] of sites) {
+      const [only] = filedSites;
+      locations.set(locationNumber, {
+        locationNumber,
+        ...(filedSites.length > 1
+          ? { sites: filedSites.map((lo) => siteFields(lo, siteAddressVisible)) }
+          : only && siteFields(only, siteAddressVisible)),
         antennas: [],
       });
     }
-    for (const an of db
-      .prepare<AntennaRow>(
-        'SELECT * FROM antennas WHERE usi = ? ORDER BY location_number, antenna_number',
-      )
-      .all(row.usi)) {
-      Object.assign(antenna(an.location_number, an.antenna_number), {
-        ...opt('antennaTypeCode', an.antenna_type),
-        ...opt('heightToTipM', an.height_to_tip_m),
-        ...opt('heightToCenterM', an.height_to_center_m),
-        ...opt('haatM', an.haat_m),
-        ...opt('azimuthDeg', an.azimuth_deg),
-        ...opt('gainDbi', an.gain_dbi),
-        ...opt('beamwidthDeg', an.beamwidth_deg),
-        ...opt('polarization', an.polarization),
-        ...opt('make', an.make),
-        ...opt('model', an.model),
+    // Grouped by the antenna entry itself: one group per (location, antenna) number pair.
+    const filed = Map.groupBy(
+      db
+        .prepare<AntennaRow>(
+          `SELECT * FROM antennas WHERE ${inRange} ORDER BY location_number, antenna_number`,
+        )
+        .all(...rangeArgs),
+      (an) => antenna(an.location_number, an.antenna_number),
+    );
+    for (const [entry, records] of filed) {
+      const agreed = <K extends keyof AntennaRow>(column: K) => {
+        const values = new Set(records.map((an) => an[column]));
+        return values.size === 1 ? [...values][0] : undefined;
+      };
+      Object.assign(entry, {
+        ...opt('antennaTypeCode', agreed('antenna_type')),
+        ...opt('heightToTipM', agreed('height_to_tip_m')),
+        ...opt('heightToCenterM', agreed('height_to_center_m')),
+        ...opt('haatM', agreed('haat_m')),
+        ...opt('azimuthDeg', agreed('azimuth_deg')),
+        ...opt('gainDbi', agreed('gain_dbi')),
+        ...opt('beamwidthDeg', agreed('beamwidth_deg')),
+        ...opt('polarization', agreed('polarization')),
+        ...opt('make', agreed('make')),
+        ...opt('model', agreed('model')),
+        ...(records.length > 1 && { recordCount: records.length }),
       });
     }
     const frequencies = db
       .prepare<FrequencyRow>(
-        `SELECT * FROM frequencies WHERE usi = ? AND frequency_mhz IS NOT NULL
+        `SELECT * FROM frequencies WHERE ${inRange} AND frequency_mhz IS NOT NULL
          ORDER BY location_number, antenna_number, freq_seq_id LIMIT ?`,
       )
-      .all(row.usi, maxFrequencies);
+      .all(...rangeArgs, maxFrequencies);
     for (const fr of frequencies) {
       antenna(fr.location_number, fr.antenna_number).frequencies.push({
         frequencyMhz: fr.frequency_mhz,
@@ -933,14 +1099,16 @@ export class UlsIndexService {
   /**
    * Transmitter sites within `radiusKm` of a point, nearest first: a bounding-box query on
    * `locations(lat, lon)`, then haversine distance in JS, keyset-paginated on
-   * `(distance, usi, location_number)`. With a band, only sites authorized on an
+   * `(distance, usi, location_number, site_seq)`. With a band, only sites authorized on an
    * overlapping frequency match, and each site lists only its overlapping frequencies.
+   * Frequencies are filed against a location number, so every site sharing one lists the
+   * number's frequencies and carries `sitesSharingNumber`.
    */
   async findTransmitters(params: FindTransmittersParams): Promise<PageResult<TransmitterSite>> {
     const { db, id } = await this.requireGeneration();
     let after: CursorKey | undefined;
     if (params.cursor) {
-      const key = decodeCursor(params.cursor, id, 't', ['number', 'number', 'number']);
+      const key = decodeCursor(params.cursor, id, 't', ['number', 'number', 'number', 'number']);
       if (!key) return { ok: false, reason: 'invalid_cursor' };
       after = key as CursorKey;
     }
@@ -965,29 +1133,37 @@ export class UlsIndexService {
       args.push(overlap.high, overlap.low);
     }
     const candidates = db
-      .prepare<{ lat: number; loc: number; lon: number; usi: number }>(
-        `SELECT lo.usi, lo.location_number AS loc, lo.lat, lo.lon
+      .prepare<{ lat: number; loc: number; lon: number; seq: number; usi: number }>(
+        `SELECT lo.usi, lo.location_number AS loc, lo.site_seq AS seq, lo.lat, lo.lon
          FROM locations lo JOIN licenses l ON l.usi = lo.usi WHERE ${where.join(' AND ')}`,
       )
       .all(...args);
 
+    const siteKey = (site: { distance: number; loc: number; seq: number; usi: number }) => [
+      site.distance,
+      site.usi,
+      site.loc,
+      site.seq,
+    ];
     const inRange = candidates
       .map((site) => ({
         ...site,
         distance: haversineKm(params.latitude, params.longitude, site.lat, site.lon),
       }))
       .filter((site) => site.distance <= params.radiusKm)
-      .sort((a, b) => compareKeys([a.distance, a.usi, a.loc], [b.distance, b.usi, b.loc]));
+      .sort((a, b) => compareKeys(siteKey(a), siteKey(b)));
     const remaining = after
-      ? inRange.filter((site) => compareKeys([site.distance, site.usi, site.loc], after) > 0)
+      ? inRange.filter((site) => compareKeys(siteKey(site), after) > 0)
       : inRange;
     const page = remaining.slice(0, params.limit);
     const last = page.at(-1);
 
-    const siteQuery = db.prepare<LocationRow & LicenseHeadRow>(
-      `SELECT lo.*, ${LICENSE_HEAD_COLUMNS}
+    const siteQuery = db.prepare<LocationRow & LicenseHeadRow & { sites: number }>(
+      `SELECT lo.*, ${LICENSE_HEAD_COLUMNS},
+         (SELECT count(*) FROM locations s
+          WHERE s.usi = lo.usi AND s.location_number = lo.location_number) AS sites
        FROM locations lo JOIN licenses l ON l.usi = lo.usi
-       WHERE lo.usi = ? AND lo.location_number = ?`,
+       WHERE lo.usi = ? AND lo.location_number = ? AND lo.site_seq = ?`,
     );
     const frequencyQuery = db.prepare<FrequencyRow>(
       `SELECT * FROM frequencies WHERE usi = ? AND location_number = ? AND frequency_mhz IS NOT NULL
@@ -995,7 +1171,7 @@ export class UlsIndexService {
        ORDER BY frequency_mhz, upper_mhz`,
     );
     const rows = page.flatMap((candidate): TransmitterSite[] => {
-      const site = siteQuery.get(candidate.usi, candidate.loc);
+      const site = siteQuery.get(candidate.usi, candidate.loc, candidate.seq);
       if (!site) return [];
       const frequencies = collapseFrequencies(
         frequencyQuery.all(
@@ -1019,6 +1195,7 @@ export class UlsIndexService {
           ...opt('county', site.county),
           ...opt('state', site.site_state),
           ...(site.site_state !== null && { stateFromCoordinates: site.state_derived === 1 }),
+          ...(site.sites > 1 && { sitesSharingNumber: site.sites }),
           frequencyCount: frequencies.length,
           frequenciesShown: shownFrequencies.length,
           frequencies: shownFrequencies,
@@ -1030,7 +1207,7 @@ export class UlsIndexService {
       rows,
       total: inRange.length,
       ...(remaining.length > params.limit &&
-        last && { nextCursor: encodeCursor(id, 't', [last.distance, last.usi, last.loc]) }),
+        last && { nextCursor: encodeCursor(id, 't', siteKey(last)) }),
     };
   }
 
@@ -1038,9 +1215,11 @@ export class UlsIndexService {
 
   /**
    * Authorizations whose occupied band overlaps `band`: collapsed site assignments and
-   * market blocks, merged in frequency order and keyset-paginated on
-   * `(frequency, kind, usi, location_number or 0, upper_mhz ?? 0 | partition_area_id)`.
-   * Each range scan is bounded by the widest stored band, so no query scans the index.
+   * market blocks (collapsed across partition areas), merged in frequency order and
+   * keyset-paginated on `(frequency, kind, usi, location_number or 0, upper edge ?? 0)`.
+   * Each range scan is bounded by the widest stored band, so no query scans the index. A
+   * frequency filed against a location number several sites share is one row carrying
+   * `sitesSharingNumber` in place of a site's coordinates and place.
    */
   async searchFrequencies(
     params: SearchFrequenciesParams,
@@ -1151,6 +1330,7 @@ export class UlsIndexService {
           lon: number | null;
           max_erp: number | null;
           site_state: string | null;
+          sites: number;
           state_derived: number | null;
           upper: number | null;
         }
@@ -1159,7 +1339,9 @@ export class UlsIndexService {
            f.upper_mhz AS upper, max(f.bandwidth_mhz) AS bandwidth,
            group_concat(f.class_station, '|') AS classes, max(f.erp_w) AS max_erp,
            group_concat(f.emissions, ',') AS emissions,
-           lo.lat, lo.lon, lo.county, lo.site_state, lo.state_derived
+           lo.lat, lo.lon, lo.county, lo.site_state, lo.state_derived,
+           (SELECT count(*) FROM locations s
+            WHERE s.usi = f.usi AND s.location_number = f.location_number) AS sites
          ${from} WHERE ${pageWhere.join(' AND ')} ${group}
          ORDER BY f.frequency_mhz, f.usi, f.location_number, COALESCE(f.upper_mhz, 0)
          LIMIT ?`,
@@ -1179,11 +1361,15 @@ export class UlsIndexService {
           ...opt('maxErpW', row.max_erp),
           emissions: [...new Set(row.emissions?.split(',').filter(Boolean) ?? [])],
           locationNumber: row.location_number,
-          ...opt('latitude', row.lat),
-          ...opt('longitude', row.lon),
-          ...opt('county', row.county),
-          ...opt('state', row.site_state),
-          ...(row.site_state !== null && { stateFromCoordinates: row.state_derived === 1 }),
+          ...(row.sites > 1
+            ? { sitesSharingNumber: row.sites }
+            : {
+                ...opt('latitude', row.lat),
+                ...opt('longitude', row.lon),
+                ...opt('county', row.county),
+                ...opt('state', row.site_state),
+                ...(row.site_state !== null && { stateFromCoordinates: row.state_derived === 1 }),
+              }),
         },
       })),
     };
@@ -1201,6 +1387,7 @@ export class UlsIndexService {
     const maxBand = readMetaNumber(db, META_KEYS.maxMarketBand);
     const where = [
       'mb.lower BETWEEN ? AND ?',
+      'mb.lower > 0',
       'COALESCE(mb.upper, mb.lower) >= ?',
       ...licenseWhere,
     ];
@@ -1210,9 +1397,12 @@ export class UlsIndexService {
       args.push(`%,${params.state},%`);
     }
     const from = 'FROM market_blocks mb JOIN licenses l ON l.usi = mb.usi';
+    const group = 'GROUP BY mb.usi, mb.lower, mb.upper';
     const total =
       db
-        .prepare<{ n: number }>(`SELECT count(*) AS n ${from} WHERE ${where.join(' AND ')}`)
+        .prepare<{ n: number }>(
+          `SELECT count(*) AS n FROM (SELECT 1 ${from} WHERE ${where.join(' AND ')} ${group})`,
+        )
         .get(...args)?.n ?? 0;
 
     const pageWhere = [...where];
@@ -1220,7 +1410,7 @@ export class UlsIndexService {
     if (after) {
       pageWhere.push(
         'mb.lower >= ?',
-        '(mb.lower, 0, mb.usi, 0, mb.partition_area_id) > (?, ?, ?, ?, ?)',
+        '(mb.lower, 0, mb.usi, 0, COALESCE(mb.upper, 0)) > (?, ?, ?, ?, ?)',
       );
       pageArgs.push(after[0] ?? 0, ...after);
     }
@@ -1231,20 +1421,20 @@ export class UlsIndexService {
           lower: number;
           market_code: string | null;
           market_name: string | null;
-          partition_area_id: number;
+          partitions: string | null;
           upper: number | null;
         }
       >(
         `SELECT ${LICENSE_HEAD_COLUMNS}, l.market_code, l.market_name, l.channel_block,
-           mb.lower, mb.upper, mb.partition_area_id
-         ${from} WHERE ${pageWhere.join(' AND ')}
-         ORDER BY mb.lower, mb.usi, mb.partition_area_id LIMIT ?`,
+           mb.lower, mb.upper, ${PARTITION_AREAS_SQL} AS partitions
+         ${from} WHERE ${pageWhere.join(' AND ')} ${group}
+         ORDER BY mb.lower, mb.usi, COALESCE(mb.upper, 0) LIMIT ?`,
       )
       .all(...pageArgs, fetch);
     return {
       total,
       rows: rows.map((row) => ({
-        key: [row.lower, 0, row.usi, 0, row.partition_area_id],
+        key: [row.lower, 0, row.usi, 0, row.upper ?? 0],
         row: {
           kind: 'market',
           ...this.siteHead(row),
@@ -1253,6 +1443,7 @@ export class UlsIndexService {
           ...opt('marketCode', row.market_code),
           ...opt('marketName', row.market_name),
           ...opt('channelBlock', row.channel_block),
+          ...opt('partitionAreaIds', partitionAreaIds(row.partitions)),
         },
       })),
     };
@@ -1484,6 +1675,20 @@ function readDataAsOf(db: SqliteHandle): string | undefined {
       .prepare<{ latest: string | null }>('SELECT max(counts_created) AS latest FROM ingest_files')
       .get()?.latest ?? undefined
   );
+}
+
+/**
+ * The daily files applied to a generation, as `<count>.<latest applied_at>`. Each file is
+ * applied in one transaction with its `ingest_files` row, so this changes with every refresh
+ * that changes rows, a re-applied file included.
+ */
+function readRefreshState(db: SqliteHandle): string {
+  const state = db
+    .prepare<{ applied: number; latest: string | null }>(
+      "SELECT count(*) AS applied, max(applied_at) AS latest FROM ingest_files WHERE kind = 'daily'",
+    )
+    .get();
+  return `${state?.applied ?? 0}.${state?.latest ?? ''}`;
 }
 
 /**

@@ -3,7 +3,8 @@
  * index: its definition metadata (no `list`), callsign normalization and rejection in
  * `params`, the declared `index_not_ready` and `license_not_found` contracts, parity with the
  * record `fcc_spectrum_get_license` returns, the frequency-row counts under its fixed cap of
- * 100, redaction on and off, and registry text kept verbatim in the JSON body.
+ * 100, the first page of a large license with the notice naming the call that reads the rest,
+ * redaction on and off, and registry text kept verbatim in the JSON body.
  * @module tests/resources/license.resource.test
  */
 
@@ -17,7 +18,7 @@ import { getLicense } from '@/mcp-server/tools/definitions/get-license.tool.js';
 import { POINTER_FILE, writePointer } from '@/services/uls/schema.js';
 import type { GetLicenseResult } from '@/services/uls/types.js';
 import { releaseIndex, successOf, useIndex } from '../fixtures/tool-harness.js';
-import { widePagingWeekly } from '../fixtures/uls-fixtures.js';
+import { sprawlingPagingWeekly, widePagingWeekly } from '../fixtures/uls-fixtures.js';
 import {
   buildFixtureIndex,
   type FixtureIndex,
@@ -25,10 +26,20 @@ import {
   type TempMirror,
 } from '../fixtures/uls-index.js';
 
-/** The JSON body the handler builds: a found service result plus `dataAsOf`. */
-type ResourceResult = Omit<Extract<GetLicenseResult, { found: true }>, 'found'> & {
-  dataAsOf: string;
-};
+/** The JSON body the handler builds: the found record's first page, `dataAsOf`, and a notice. */
+type ResourceResult = Pick<
+  Extract<GetLicenseResult, { found: true }>,
+  | 'frequenciesShown'
+  | 'frequencyTotal'
+  | 'license'
+  | 'locations'
+  | 'locationTotal'
+  | 'nextLeaseOffset'
+  | 'nextLocationOffset'
+  | 'otherCallsignRecords'
+  | 'siteTotal'
+  | 'technicalRetained'
+> & { dataAsOf: string; notice?: string };
 type ToolOutput = Parameters<NonNullable<typeof getLicense.format>>[0];
 
 const DATA_AS_OF = '2026-09-27T13:44:10Z';
@@ -85,6 +96,8 @@ describe('params', () => {
     ['kzz901', 'KZZ901'],
     ['l000000001', 'L000000001'],
     ['KZ1AAA/M', 'KZ1AAA'],
+    ['kzz901%2F4', 'KZZ901'],
+    ['kzz%20901%2fm', 'KZZ901'],
   ])('normalizes %j to %s', (raw, normalized) => {
     expect(paramsSchema.parse({ callsign: raw })).toEqual({ callsign: normalized });
   });
@@ -96,6 +109,8 @@ describe('params', () => {
     ['an eleven-character callsign', 'KZZ12345678'],
     ['a wildcard', 'KZZ*'],
     ['a prefix-portable callsign', 'VE3/N0CALL'],
+    ['a percent-encoded prefix-portable callsign', 'VE3%2FN0CALL'],
+    ['a malformed percent-escape', 'KZZ%E0%A4%A'],
     ['a number', 901],
   ])('rejects %s', (_label, callsign) => {
     expect(paramsSchema.safeParse({ callsign }).success).toBe(false);
@@ -188,14 +203,18 @@ describe('warm index', () => {
         otherCallsignRecords: [{ usi: '1005', licenseStatus: 'E' }],
         frequenciesShown: 4,
         frequencyTotal: 4,
+        locationTotal: 2,
+        siteTotal: 2,
       });
       expect(Object.keys(result).sort()).toEqual([
         'dataAsOf',
         'frequenciesShown',
         'frequencyTotal',
         'license',
+        'locationTotal',
         'locations',
         'otherCallsignRecords',
+        'siteTotal',
         'technicalRetained',
       ]);
     });
@@ -218,6 +237,8 @@ describe('warm index', () => {
         license: tool.license,
         technicalRetained: tool.technicalRetained,
         locations: tool.locations,
+        locationTotal: tool.locationTotal,
+        siteTotal: tool.siteTotal,
         otherCallsignRecords: tool.otherCallsignRecords,
         frequenciesShown: expect.any(Number),
         frequencyTotal: expect.any(Number),
@@ -285,7 +306,12 @@ describe('the 100-row cap', () => {
 
   it('returns 100 of 1001 frequency rows, matching the tool at its default cap', async () => {
     const result = await read('KZZ401');
-    expect(result).toMatchObject({ frequenciesShown: 100, frequencyTotal: 1001 });
+    expect(result).toMatchObject({
+      frequenciesShown: 100,
+      frequencyTotal: 1001,
+      notice:
+        'Lists 100 of 1001 frequency rows at these locations; call fcc_spectrum_get_license with usi "4001" and a higher max_frequencies (up to 1000) for the rest.',
+    });
     const rows = result.locations.flatMap((location) =>
       location.antennas.flatMap((antenna) => antenna.frequencies),
     );
@@ -294,6 +320,45 @@ describe('the 100-row cap', () => {
       await runToolContract(getLicense, { callsign: 'KZZ401' } as never),
     );
     expect(tool).toMatchObject({ shown: 100, truncated: true });
+    expect(result.locations).toEqual(tool.locations);
+  });
+});
+
+describe('a large license', () => {
+  let sprawl: FixtureIndex;
+  beforeAll(async () => {
+    sprawl = await buildFixtureIndex({
+      weekly: {
+        paging: sprawlingPagingWeekly({
+          locations: 60,
+          sitesAtFirst: 3,
+          antennasPerLocation: 1,
+          leases: 130,
+        }),
+      },
+    });
+    await useIndex(sprawl.mirrorDir);
+  });
+  afterAll(async () => {
+    await releaseIndex();
+    await sprawl.dispose();
+  });
+
+  it('holds the first page and names the fcc_spectrum_get_license calls for the rest', async () => {
+    const result = await read('KZZ701');
+    expect(result).toMatchObject({
+      locationTotal: 60,
+      siteTotal: 62,
+      nextLocationOffset: 48,
+      nextLeaseOffset: 100,
+      notice:
+        'Lists 48 of 60 locations; call fcc_spectrum_get_license with usi "7001" and location_offset 48 for the rest. Lists 100 of 130 leases; call fcc_spectrum_get_license with usi "7001" and lease_offset 100 for the rest.',
+    });
+    expect(result.locations).toHaveLength(48);
+    expect(result.license.leases).toHaveLength(100);
+    const tool = successOf<ToolOutput>(
+      await runToolContract(getLicense, { callsign: 'KZZ701' } as never),
+    );
     expect(result.locations).toEqual(tool.locations);
   });
 });

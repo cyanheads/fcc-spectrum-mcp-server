@@ -14,7 +14,13 @@ import { JsonRpcErrorCode, McpError } from '@cyanheads/mcp-ts-core/errors';
 import { logger } from '@cyanheads/mcp-ts-core/utils';
 import { afterAll, beforeAll, describe, expect, it, vi } from 'vitest';
 import { SERVICE_GROUPS } from '@/services/uls/codes.js';
-import { LOCK_FILE, POINTER_FILE, writePointer } from '@/services/uls/schema.js';
+import {
+  createUlsStore,
+  LOCK_FILE,
+  META_KEYS,
+  POINTER_FILE,
+  writePointer,
+} from '@/services/uls/schema.js';
 import type {
   Band,
   FindTransmittersParams,
@@ -26,7 +32,12 @@ import type {
   TransmitterSite,
 } from '@/services/uls/types.js';
 import { UlsIndexService } from '@/services/uls/uls-index-service.js';
-import { DAILY_PG_MON, FakeIngestClient, PAGING_WEEKLY } from '../../fixtures/uls-fixtures.js';
+import {
+  DAILY_PG_MON,
+  FakeIngestClient,
+  PAGING_WEEKLY,
+  QUIRKS_WEEKLY,
+} from '../../fixtures/uls-fixtures.js';
 import {
   buildFixtureIndex,
   FIXTURE_GENERATION,
@@ -598,6 +609,51 @@ describe('searchLicenses', () => {
   });
 });
 
+describe('searchLicenses cursors across a daily refresh', () => {
+  let fixture: FixtureIndex;
+  beforeAll(async () => {
+    fixture = await buildFixtureIndex({ groups: ['paging'] });
+  });
+  afterAll(async () => {
+    await fixture.dispose();
+  });
+
+  it('fails a rank-order cursor minted before the refresh and keeps a callsign-order one', async () => {
+    const service = fixture.service({ redactIndividuals: false });
+    const ranked = page(await service.searchLicenses(licenses({ licensee: 'example', limit: 1 })));
+    const ordered = page(await service.searchLicenses(licenses({ limit: 1 })));
+    expect(ranked.nextCursor).toBeDefined();
+    expect(ordered.nextCursor).toBeDefined();
+    expect(
+      (
+        await service.searchLicenses(
+          licenses({ licensee: 'example', limit: 1, cursor: ranked.nextCursor }),
+        )
+      ).ok,
+    ).toBe(true);
+
+    fixture.client.withDaily({ 'l_pg_mon.zip': DAILY_PG_MON });
+    await fixture.ingester.refresh();
+
+    expect(
+      await service.searchLicenses(
+        licenses({ licensee: 'example', limit: 1, cursor: ranked.nextCursor }),
+      ),
+    ).toEqual({ ok: false, reason: 'invalid_cursor' });
+    expect(
+      (await service.searchLicenses(licenses({ limit: 1, cursor: ordered.nextCursor }))).ok,
+    ).toBe(true);
+    const fresh = page(await service.searchLicenses(licenses({ licensee: 'example', limit: 1 })));
+    expect(
+      (
+        await service.searchLicenses(
+          licenses({ licensee: 'example', limit: 1, cursor: fresh.nextCursor }),
+        )
+      ).ok,
+    ).toBe(true);
+  });
+});
+
 describe('getLicense', () => {
   it('returns the full record by USI, with the other record sharing its callsign', async () => {
     const result = await on.getLicense({ usi: '1001', maxFrequencies: 100 });
@@ -765,7 +821,7 @@ describe('getLicense', () => {
       marketName: 'Fargo-Moorhead, ND-MN',
       channelBlock: 'A1',
       blocks: [
-        { lowMhz: 2496, highMhz: 2502 },
+        { lowMhz: 2496, highMhz: 2502, partitionAreaIds: [1] },
         { lowMhz: 2502, highMhz: 2508 },
       ],
     });
@@ -1046,6 +1102,7 @@ describe('searchFrequencies', () => {
       marketCode: 'BTA144',
       marketName: 'Fargo-Moorhead, ND-MN',
       channelBlock: 'A1',
+      partitionAreaIds: [1],
     } satisfies FrequencyAssignment);
     expect(result.rows[1]).toMatchObject({ usi: '2002', isLease: true });
   });
@@ -1184,7 +1241,7 @@ describe('searchFrequencies', () => {
     ).toEqual({ ok: false, reason: 'invalid_cursor' });
     expect(
       await on.searchFrequencies(
-        frequencies({ cursor: forgeCursor('20260927T133855Z', 't', 0, 1001, 1) }),
+        frequencies({ cursor: forgeCursor('20260927T133855Z', 't', 0, 1001, 1, 1) }),
       ),
     ).toEqual({ ok: false, reason: 'invalid_cursor' });
   });
@@ -1241,5 +1298,259 @@ describe('generation switch', () => {
       await service.close();
       await index.dispose();
     }
+  });
+});
+
+describe('filing quirks', () => {
+  let quirks: FixtureIndex;
+  let service: UlsIndexService;
+
+  /** A `meta` value of the quirks generation, as a number. */
+  async function metaNumber(key: string): Promise<number> {
+    const store = createUlsStore(join(quirks.mirrorDir, quirks.generation));
+    try {
+      const db = await store.raw();
+      return Number(
+        db.prepare<{ value: string }>('SELECT value FROM meta WHERE key = ?').get(key)?.value,
+      );
+    } finally {
+      await store.close();
+    }
+  }
+
+  beforeAll(async () => {
+    quirks = await buildFixtureIndex({ groups: ['paging'], weekly: { paging: QUIRKS_WEEKLY } });
+    service = quirks.service();
+  });
+
+  afterAll(async () => {
+    await quirks?.dispose();
+  });
+
+  describe('an emission bandwidth 20% of the assigned frequency or wider', () => {
+    it('is left out of the bandwidth and occupied band, keeping the designator as filed', async () => {
+      const pickup = await service.getLicense({ usi: '5001', maxFrequencies: 100 });
+      expect(pickup.found && pickup.locations[0]?.antennas[0]?.frequencies).toEqual([
+        expect.objectContaining({ frequencyMhz: 470, bandwidthMhz: 6 }),
+        { frequencyMhz: 638, emissions: ['5G75C3F'] },
+      ]);
+      const first = pickup.found ? pickup.locations[0]?.antennas[0]?.frequencies[0] : undefined;
+      expect(first?.emissions.toSorted()).toEqual(['5G75C3F', '6M00C3F']);
+
+      const radar = await service.getLicense({ usi: '5002', maxFrequencies: 100 });
+      expect(radar.found && radar.locations[0]?.antennas[0]?.frequencies).toEqual([
+        { frequencyMhz: 24150, emissions: ['24G1N0N'] },
+        { frequencyMhz: 8500, bandwidthMhz: 1300, emissions: ['1G30NXN'] },
+      ]);
+    });
+
+    it('matches no unrelated frequency and does not widen the stored site band', async () => {
+      expect(await metaNumber(META_KEYS.maxSiteBand)).toBe(1300);
+      const at = async (mhz: number) =>
+        usis(page(await service.searchFrequencies(frequencies({ band: band(mhz) }))).rows);
+      expect(await at(150)).toEqual([]);
+      expect(await at(467)).toEqual(['5001']);
+      expect(await at(638)).toEqual(['5001']);
+      expect(await at(24150)).toEqual(['5002']);
+      expect(await at(24100)).toEqual([]);
+      const near = page(
+        await service.findTransmitters(
+          transmitters({
+            latitude: dms(47, 30, 0),
+            longitude: dms(122, 30, 0, true),
+            radiusKm: 1,
+            band: band(150),
+          }),
+        ),
+      );
+      expect(near.rows).toEqual([]);
+    });
+  });
+
+  describe('a market block filed with a 0 lower edge (a PAL channel width)', () => {
+    it('stays out of frequency matching and the stored market band', async () => {
+      expect(await metaNumber(META_KEYS.maxMarketBand)).toBe(5);
+      const markets = async (lowMhz: number, highMhz = lowMhz, radioService?: string) =>
+        page(
+          await service.searchFrequencies(
+            frequencies({ band: band(lowMhz, highMhz), kind: 'market', radioService }),
+          ),
+        );
+      expect((await markets(5)).total).toBe(0);
+      expect((await markets(0, 10)).total).toBe(0);
+      expect((await markets(3550, 3700, 'PL')).total).toBe(0);
+    });
+
+    it('lists in get_license as a channel width with no frequency', async () => {
+      const pal = await service.getLicense({ usi: '5003', maxFrequencies: 100 });
+      expect(pal.found && pal.license.market).toMatchObject({
+        marketCode: 'CN53033',
+        marketName: 'King, WA',
+        blocks: [{ channelWidthMhz: 10 }],
+      });
+      const block = pal.found ? pal.license.market?.blocks[0] : undefined;
+      expect(block).not.toHaveProperty('lowMhz');
+      expect(block).not.toHaveProperty('highMhz');
+    });
+  });
+
+  describe('a market block filed under several partition areas', () => {
+    const PARTITIONS = [8183, 8184, 96978];
+
+    it('returns one search row per license and band, listing the partition areas', async () => {
+      const result = page(
+        await service.searchFrequencies(frequencies({ band: band(1757), kind: 'market' })),
+      );
+      expect(result.total).toBe(1);
+      expect(result.rows).toEqual([
+        expect.objectContaining({
+          usi: '5004',
+          frequencyMhz: 1755,
+          upperMhz: 1760,
+          partitionAreaIds: PARTITIONS,
+        }),
+      ]);
+
+      const { pages, rows, total } = await allPages((cursor) =>
+        service.searchFrequencies(
+          frequencies({ band: band(1755, 2160), kind: 'market', limit: 1, cursor }),
+        ),
+      );
+      expect([pages, total]).toEqual([2, 2]);
+      expect(assignmentKeys(rows)).toEqual(['market:5004:1755', 'market:5004:2155']);
+    });
+
+    it('lists each band once in get_license, with its partition areas', async () => {
+      const result = await service.getLicense({ usi: '5004', maxFrequencies: 100 });
+      expect(result.found && result.license.market?.blocks).toEqual([
+        { lowMhz: 1755, highMhz: 1760, partitionAreaIds: PARTITIONS },
+        { lowMhz: 2155, highMhz: 2160, partitionAreaIds: PARTITIONS },
+      ]);
+    });
+  });
+
+  describe('a location number the license files at several sites', () => {
+    const WEST = { latitude: dms(47, 40, 0), longitude: dms(122, 22, 0, true) };
+    const EAST = { latitude: dms(47, 40, 0), longitude: dms(122, 20, 0, true) };
+    /** Equidistant from both sites under location 1. */
+    const BETWEEN = { latitude: dms(47, 40, 0), longitude: dms(122, 21, 0, true) };
+    const SITE_FIELDS = ['latitude', 'longitude', 'county', 'state', 'stateFromCoordinates'];
+    const at = (point: { latitude: number; longitude: number }) => ({
+      latitude: expect.closeTo(point.latitude, 9),
+      longitude: expect.closeTo(point.longitude, 9),
+    });
+
+    it("lists every site in get_license, with the number's antennas and frequencies once", async () => {
+      const result = await service.getLicense({ usi: '5005', maxFrequencies: 100 });
+      if (!result.found) throw new Error('Expected KZZ505.');
+      expect(result.locations.map((location) => location.locationNumber)).toEqual([1, 2]);
+      const [shared, single] = result.locations;
+      for (const field of SITE_FIELDS) expect(shared).not.toHaveProperty(field);
+      expect(shared?.sites).toEqual([
+        expect.objectContaining({
+          ...at(WEST),
+          city: 'Shoreline',
+          groundElevationM: 120,
+          overallHeightM: 10.4,
+          name: '33 SR99 North Rd',
+        }),
+        expect.objectContaining({
+          ...at(EAST),
+          city: 'Seattle',
+          groundElevationM: 60,
+          overallHeightM: 6.7,
+          name: '35 I5 Northgate',
+        }),
+      ]);
+      // The two AN records differ only in height to tip, so that alone is withheld.
+      expect(shared?.antennas).toEqual([
+        {
+          antennaNumber: 1,
+          antennaTypeCode: 'T',
+          azimuthDeg: 360,
+          gainDbi: 7.6,
+          make: 'GTTEU',
+          model: 'OA-59',
+          recordCount: 2,
+          frequencies: [
+            { frequencyMhz: 5895, upperMhz: 5905, stationClass: 'FB', eirpDbm: 23, emissions: [] },
+            { frequencyMhz: 5915, upperMhz: 5925, stationClass: 'FB', eirpDbm: 23, emissions: [] },
+          ],
+        },
+      ]);
+      expect(single).toMatchObject({
+        locationNumber: 2,
+        city: 'Bellevue',
+        name: 'Single Site',
+        antennas: [{ antennaNumber: 1, heightToTipM: 15, make: 'ACME', model: 'X1' }],
+      });
+      expect(single).not.toHaveProperty('sites');
+      expect(single?.antennas[0]).not.toHaveProperty('recordCount');
+      expect(result.frequenciesShown).toBe(3);
+    });
+
+    it('returns each site in find_transmitters with its own details, paging past a distance tie', async () => {
+      const { pages, rows, total } = await allPages((cursor) =>
+        service.findTransmitters(transmitters({ ...BETWEEN, radiusKm: 2, limit: 1, cursor })),
+      );
+      expect([pages, total]).toEqual([2, 2]);
+      expect(rows).toEqual([
+        expect.objectContaining({
+          usi: '5005',
+          locationNumber: 1,
+          ...at(WEST),
+          groundElevationM: 120,
+          overallHeightM: 10.4,
+          sitesSharingNumber: 2,
+        }),
+        expect.objectContaining({
+          usi: '5005',
+          locationNumber: 1,
+          ...at(EAST),
+          groundElevationM: 60,
+          overallHeightM: 6.7,
+          sitesSharingNumber: 2,
+        }),
+      ]);
+      expect(rows[0]?.distanceKm).toBe(rows[1]?.distanceKm);
+      for (const site of rows) {
+        expect(site.frequencies.map((frequency) => frequency.frequencyMhz)).toEqual([5895, 5915]);
+        expect(site.frequencyCount).toBe(2);
+      }
+
+      const single = page(
+        await service.findTransmitters(
+          transmitters({ latitude: dms(47, 36, 0), longitude: dms(122, 12, 0, true), radiusKm: 1 }),
+        ),
+      );
+      expect(single.rows).toEqual([expect.objectContaining({ usi: '5005', locationNumber: 2 })]);
+      expect(single.rows[0]).not.toHaveProperty('sitesSharingNumber');
+    });
+
+    it("returns a frequency filed against the number once in search_frequencies, without one site's place", async () => {
+      for (const state of [undefined, 'WA']) {
+        const result = page(
+          await service.searchFrequencies(frequencies({ band: band(5900), kind: 'site', state })),
+        );
+        expect(result.total, state).toBe(1);
+        const [row] = result.rows;
+        expect(row, state).toMatchObject({
+          usi: '5005',
+          locationNumber: 1,
+          frequencyMhz: 5895,
+          upperMhz: 5905,
+          sitesSharingNumber: 2,
+        });
+        for (const field of SITE_FIELDS) expect(row, `${state} ${field}`).not.toHaveProperty(field);
+      }
+
+      const single = page(
+        await service.searchFrequencies(frequencies({ band: band(5940), kind: 'site' })),
+      );
+      expect(single.rows).toEqual([
+        expect.objectContaining({ locationNumber: 2, county: 'King', state: 'WA' }),
+      ]);
+      expect(single.rows[0]).not.toHaveProperty('sitesSharingNumber');
+    });
   });
 });
