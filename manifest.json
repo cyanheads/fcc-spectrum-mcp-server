@@ -2,7 +2,7 @@
   "manifest_version": "0.3",
   "name": "fcc-spectrum-mcp-server",
   "display_name": "fcc-spectrum-mcp-server",
-  "version": "0.1.0",
+  "version": "0.1.1",
   "description": "Search FCC radio licenses, find nearby transmitter sites, and see who is licensed on a frequency.",
   "license": "Apache-2.0",
   "repository": { "type": "git", "url": "https://github.com/cyanheads/fcc-spectrum-mcp-server" },
