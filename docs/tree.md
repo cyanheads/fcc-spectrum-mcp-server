@@ -1,6 +1,6 @@
 # fcc-spectrum-mcp-server - Directory Structure
 
-Generated on: 2026-10-01 02:45:28
+Generated on: 2026-10-01 08:07:50
 
 ```text
 fcc-spectrum-mcp-server/
@@ -24,6 +24,7 @@ fcc-spectrum-mcp-server/
 │   ├── extensions.json
 │   └── settings.json
 ├── changelog/
+│   ├── 0.1.x/
 │   └── template.md
 ├── docs/
 │   └── design.md
@@ -164,6 +165,7 @@ fcc-spectrum-mcp-server/
 │   │       ├── ingest-schedule.ts
 │   │       ├── ingest.ts
 │   │       ├── normalize.ts
+│   │       ├── organization-names.ts
 │   │       ├── schema.ts
 │   │       ├── state-lookup.ts
 │   │       ├── types.ts
@@ -187,6 +189,7 @@ fcc-spectrum-mcp-server/
 │   │       ├── ingest-schedule.test.ts
 │   │       ├── ingest.test.ts
 │   │       ├── normalize.test.ts
+│   │       ├── organization-names.test.ts
 │   │       ├── schema.test.ts
 │   │       ├── state-lookup.test.ts
 │   │       ├── uls-index-service.test.ts
@@ -201,6 +204,7 @@ fcc-spectrum-mcp-server/
 │   │   ├── list-reference.tool.test.ts
 │   │   ├── search-frequencies.tool.test.ts
 │   │   └── search-licenses.tool.test.ts
+│   ├── fuzz.test.ts
 │   └── index.test.ts
 ├── .dockerignore
 ├── .env.example
@@ -211,12 +215,14 @@ fcc-spectrum-mcp-server/
 ├── biome.json
 ├── bun.lock
 ├── bunfig.toml
+├── CHANGELOG.md
 ├── CLAUDE.md
 ├── devcheck.config.json
 ├── Dockerfile
 ├── LICENSE
 ├── manifest.json
 ├── package.json
+├── README.md
 ├── server.json
 ├── tsconfig.build.json
 ├── tsconfig.json

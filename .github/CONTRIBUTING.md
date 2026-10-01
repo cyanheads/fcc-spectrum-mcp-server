@@ -41,4 +41,4 @@ Read the relevant one before filing on a user's behalf.
 
 ## Security
 
-Don't open a public issue for a vulnerability. Report it privately — GitHub's **Security** tab → **Report a vulnerability**, or email the maintainer.
+Don't open a public issue for a vulnerability. Report it privately — GitHub's **Security** tab → **Report a vulnerability**, or email **security@caseyjhand.com**.

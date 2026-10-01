@@ -1,3 +1,9 @@
+# Local ULS index generations (GBs, built by mirror:init). Never bundled — users build
+# their own index.
+/.mirror/
+*.db
+*.db-wal
+*.db-shm
 .env*
 .mcpregistry_*
 /.claude/
@@ -5,6 +11,14 @@
 /framework-skills/
 /docs/idea.md
 /logs/
+/coverage/
+/tests/
+# Dev scripts stay out; the mirror CLI ships, as in package.json files[].
+/scripts/*
+!/scripts/_mirror-context.ts
+!/scripts/fcc-mirror-init.ts
+!/scripts/fcc-mirror-refresh.ts
+!/scripts/fcc-mirror-verify.ts
 /Dockerfile
 /bun.lock
 /bunfig.toml

@@ -1,23 +1,23 @@
 {
   "name": "fcc-spectrum-mcp-server",
   "version": "0.1.0",
-  "description": "FCC radio spectrum licensing from the Universal Licensing System: search callsigns and licenses, licensed frequencies, and transmitter locations.",
+  "description": "Search FCC radio licenses, find nearby transmitter sites, and see who is licensed on a frequency.",
   "author": {
-    "name": "Casey Hand",
+    "name": "cyanheads",
     "email": "casey@caseyjhand.com",
     "url": "https://caseyjhand.com"
   },
-  "homepage": "https://github.com/cyanheads/fcc-spectrum-mcp-server",
+  "homepage": "https://github.com/cyanheads/fcc-spectrum-mcp-server#readme",
   "repository": "https://github.com/cyanheads/fcc-spectrum-mcp-server",
   "license": "Apache-2.0",
-  "keywords": ["mcp", "mcp-server", "model-context-protocol", "fcc", "spectrum", "radio", "rf", "uls", "callsign", "wireless", "amateur-radio"],
+  "keywords": ["mcp", "mcp-server", "model-context-protocol", "typescript", "fcc", "uls", "universal-licensing-system", "spectrum", "radio", "rf", "frequency", "callsign", "transmitter", "wireless", "land-mobile", "microwave", "amateur-radio"],
   "mcpServers": "./.codex-plugin/mcp.json",
   "interface": {
     "displayName": "fcc-spectrum-mcp-server",
-    "shortDescription": "Search FCC radio licenses, frequencies, and transmitter locations.",
-    "longDescription": "Queries US radio spectrum licensing from the FCC Universal Licensing System (ULS): callsign and licensee search, licensed frequencies, and transmitter locations with antenna parameters. Covers cellular and market-area wireless, land mobile, microwave, paging, coast stations, broadband radio service, auxiliary broadcast, and amateur radio, plus spectrum leases; GMRS, ship, and aircraft licensee records can be added. Built on the public ULS bulk data, which is keyless. Full-power AM/FM/TV broadcast stations and satellite earth stations are separate FCC systems and are not included.",
+    "shortDescription": "Search FCC radio licenses, find nearby transmitter sites, and see who is licensed on a frequency.",
+    "longDescription": "US radio spectrum licensing from the FCC Universal Licensing System (ULS), answered from a local SQLite index the operator builds once from the FCC's public weekly bulk files and keeps current with the daily ones. Look up a callsign, licensee, or FCC Registration Number; read a license's sites, antennas, frequencies, power, and emission designators; find licensed transmitter sites within a radius of a point; and see who is authorized on a frequency or band, market-area spectrum blocks included. The default index covers land mobile, microwave, cellular and market-area wireless, paging, coast stations, BRS/EBS, and amateur licenses, plus spectrum leases; GMRS, ship, and aircraft licenses are opt-in. Broadcast stations and satellite earth stations are not included. Keyless, with no call to the FCC at request time. Individual licensees are redacted by default, and contact details are never ingested.",
     "developerName": "cyanheads",
-    "category": "Research",
+    "category": "data",
     "capabilities": ["Read"],
     "websiteURL": "https://github.com/cyanheads/fcc-spectrum-mcp-server",
     "defaultPrompt": []

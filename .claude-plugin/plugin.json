@@ -2,16 +2,16 @@
   "$schema": "https://json.schemastore.org/claude-code-plugin-manifest.json",
   "name": "fcc-spectrum-mcp-server",
   "version": "0.1.0",
-  "description": "FCC radio spectrum licensing from the Universal Licensing System: search callsigns and licenses, licensed frequencies, and transmitter locations.",
+  "description": "Search FCC radio licenses, find nearby transmitter sites, and see who is licensed on a frequency.",
   "author": {
-    "name": "Casey Hand",
+    "name": "cyanheads",
     "email": "casey@caseyjhand.com",
     "url": "https://caseyjhand.com"
   },
-  "homepage": "https://github.com/cyanheads/fcc-spectrum-mcp-server",
+  "homepage": "https://github.com/cyanheads/fcc-spectrum-mcp-server#readme",
   "repository": "https://github.com/cyanheads/fcc-spectrum-mcp-server",
   "license": "Apache-2.0",
-  "keywords": ["mcp", "mcp-server", "model-context-protocol", "fcc", "spectrum", "radio", "rf", "uls", "callsign", "wireless", "amateur-radio"],
+  "keywords": ["mcp", "mcp-server", "model-context-protocol", "typescript", "fcc", "uls", "universal-licensing-system", "spectrum", "radio", "rf", "frequency", "callsign", "transmitter", "wireless", "land-mobile", "microwave", "amateur-radio"],
   "mcpServers": {
     "fcc-spectrum-mcp-server": {
       "command": "npx",

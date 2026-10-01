@@ -1,7 +1,8 @@
 {
   "$schema": "https://static.modelcontextprotocol.io/schemas/2025-12-11/server.schema.json",
   "name": "io.github.cyanheads/fcc-spectrum-mcp-server",
-  "description": "FCC radio spectrum licensing: search callsigns, licensed frequencies, and transmitter locations.",
+  "title": "fcc-spectrum-mcp-server",
+  "description": "Search FCC radio licenses, find nearby transmitter sites, and see who is licensed on a frequency.",
   "repository": {
     "url": "https://github.com/cyanheads/fcc-spectrum-mcp-server",
     "source": "github"

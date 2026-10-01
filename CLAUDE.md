@@ -11,16 +11,13 @@
 
 ---
 
-## First Session
+## What This Server Is
 
-This project was just scaffolded with `bunx @cyanheads/mcp-ts-core init`. You're holding a production-grade MCP framework with the hard parts already solved — error handling, telemetry, auth, transport, validation, lifecycle. What's missing is the **domain**. Your job: design the tool, resource, and service surface with the user, then implement it as small pure handlers that throw — the framework catches, classifies, and instruments the rest. Design before code; the user's first messages set direction, so wait for them before scaffolding definitions.
+A keyless FCC radio spectrum licensing server. It indexes the FCC Universal Licensing System (ULS) weekly and daily bulk files into an embedded SQLite index and answers every query from it, with no runtime calls to the FCC. The data is a US government work in the public domain.
 
-> **Remove this section** from CLAUDE.md / AGENTS.md after completing these steps. The skills and conventions below remain — this block is one-time onboarding only.
+**Server-as-source.** The index is built as generation files under `FCC_SPECTRUM_MIRROR_DIR`; `current.json` names the published one and the read path follows it. The first build is an operator step (`mirror:init`, never on startup). Under HTTP the process schedules the weekly rebuild and daily refresh itself (`src/services/uls/ingest-schedule.ts`); under stdio, run `mirror:refresh` / `mirror:init` from cron. A cold index (no published generation) fails every tool and resource with the typed `index_not_ready` error, never an empty result. Cursors bind to the generation, so a rebuild invalidates them (`invalid_cursor`).
 
-1. **Get your bearings.** Take stock of the project tree, the skills in `framework-skills/`, and the tools/MCP servers available. Light tool use is fine for context-building — you're mapping the territory, not committing yet.
-2. **Read the framework docs** — `node_modules/@cyanheads/mcp-ts-core/CLAUDE.md` (builders, Context, errors, exports, conventions)
-3. **Run the `setup` skill** — read `framework-skills/setup/SKILL.md` and follow its checklist (project orientation, agent protocol file selection, echo definition cleanup, skill sync)
-4. **Design the server** — read `framework-skills/design-mcp-server/SKILL.md` and work through it with the user to map the domain into tools, resources, and services before scaffolding
+**Individual-licensee redaction is a first-class, fail-safe feature.** `FCC_SPECTRUM_REDACT_INDIVIDUALS` defaults to on, and only `false`/`0`/`no`/`off` disables it. Redaction happens at read time in one function, `UlsIndexService.redact()`, and individuals are excluded from name search. Contact details (phone, fax, email, ZIP, PO box) are never ingested for anyone. Do not add a read path that bypasses `redact()` or loosens the config parse.
 
 ---
 
@@ -47,8 +44,7 @@ Tailor suggestions to what's actually missing or stale — don't recite the full
 
 - **Logic throws, framework catches.** Tool/resource handlers are pure — throw on failure, no `try/catch`. Plain `Error` is fine; the framework catches, classifies, and formats. Use error factories (`notFound()`, `validationError()`, etc.) when the error code matters.
 - **Use `ctx.log`** for request-scoped logging. No `console` calls.
-- **Use `ctx.state`** for tenant-scoped storage. Never access persistence directly.
-- **Need input the caller didn't supply?** `return ctx.requestInput(...)` and read `ctx.inputs` when the handler is re-entered. Never `await` for user input mid-handler.
+- **Read the index only through `getUlsIndexService()`** (`src/services/uls/uls-index-service.ts`); no handler opens the SQLite files itself. This server uses no `ctx.state` and never calls `ctx.requestInput`.
 - **Secrets in env vars only** — never hardcoded.
 - **Cut noise.** Add only what earns its place: no speculative generality, no guards for states the framework already prevents (Zod-validated params, classified errors), no abstraction until a third caller proves it, no option nothing sets.
 - **Close the loop on issues.** When implementing work tracked by a GitHub issue, comment on the issue with what landed and close it. Do both — a comment without a close leaves stale issues open; a close without a comment leaves no record of what shipped. The comment is for future readers — state the concrete changes, not the conversation that produced them.
@@ -57,138 +53,196 @@ Tailor suggestions to what's actually missing or stale — don't recite the full
 
 ## Patterns
 
+All five tools are read-only and declare `openWorldHint: false` (no live network) and typed `errors[]` contracts. Definitions live in `src/mcp-server/tools/definitions/`; shared input schemas (`z.preprocess` normalization, `blankAsUnset`) are in `src/mcp-server/tools/input-schemas.ts` and shared `format()` helpers in `src/mcp-server/tools/format-helpers.ts`.
+
 ### Tool
+
+Excerpt of `fcc_spectrum_search_licenses` (`search-licenses.tool.ts`), trimmed:
 
 ```ts
 import { tool, z } from '@cyanheads/mcp-ts-core';
+import { JsonRpcErrorCode } from '@cyanheads/mcp-ts-core/errors';
+import { blankAsUnset, callsignSchema, cursorSchema } from '@/mcp-server/tools/input-schemas.js';
+import { getUlsIndexService } from '@/services/uls/uls-index-service.js';
 
-export const searchItems = tool('search_items', {
-  description: 'Search inventory items by query.',
-  annotations: { readOnlyHint: true },
+export const searchLicenses = tool('fcc_spectrum_search_licenses', {
+  title: 'Search FCC ULS licenses',
+  description: 'Search FCC ULS licenses and spectrum leases by callsign, licensee name, …',
+  annotations: { readOnlyHint: true, idempotentHint: true, openWorldHint: false },
   input: z.object({
-    query: z.string().describe('Search terms'),
-    limit: z.number().int().min(1).max(100).default(10).describe('Max results (1–100)'),
+    callsign: blankAsUnset(callsignSchema.optional()).describe(
+      'Exact callsign or lease ID, e.g. "KNKA123" or "L000012345". Case, spaces, and one trailing portable suffix ("/4") are normalized. …',
+    ),
+    limit: z.number().int().min(1).max(100).default(25).describe('Records per page (1–100).'),
+    cursor: cursorSchema.describe('nextCursor from the previous page of the same search; omit for the first page.'),
+    // … licensee, frn, radio_service, status, state
   }),
   output: z.object({
-    items: z.array(z.object({
-      id: z.string().describe('Item ID'),
-      name: z.string().describe('Item name'),
-    })).describe('Matching items'),
+    licenses: z.array(LicenseSchema).describe('Matching records, …'),
+    nextCursor: z.string().optional().describe('Pass as cursor with the same filters for the next page; …'),
   }),
-  auth: ['inventory:read'],
+  enrichment: {
+    dataAsOf: z.string().describe('Creation time of the newest applied ULS file (ISO 8601).'),
+    totalCount: z.number().describe('Records matching the filters, across every page.'),
+    truncated: z.boolean().describe('True when more records follow this page.'),
+    // … shown, cap, appliedFilters, notice
+  },
+  errors: [
+    {
+      reason: 'index_not_ready',
+      code: JsonRpcErrorCode.ServiceUnavailable,
+      when: 'No completed index generation is published yet.',
+      retryable: false,
+      recovery: 'The local ULS index has not been built yet; call fcc_spectrum_list_reference with topic "coverage" to see its build status. …',
+    },
+    // … no_criteria, unknown_radio_service, service_not_indexed, invalid_cursor
+  ],
 
   async handler(input, ctx) {
-    const items = await findItems(input.query, input.limit);
-    ctx.log.info('Search completed', { query: input.query, count: items.length });
-    return { items };
+    const index = getUlsIndexService();
+    const dataAsOf = await index.dataAsOf();
+    if (dataAsOf === undefined) throw ctx.fail('index_not_ready');
+
+    // Enrichment defaults go in first, so a failure or an empty page still carries them.
+    ctx.enrich({ dataAsOf, truncated: false, shown: 0, cap: input.limit, appliedFilters });
+    ctx.enrich.total(0);
+    // … criteria and radio-service checks (`throw ctx.fail('no_criteria')`)
+
+    const page = await index.searchLicenses({ callsign: input.callsign, /* … */ limit: input.limit, cursor: input.cursor });
+    if (!page.ok) throw ctx.fail('invalid_cursor');
+
+    ctx.enrich.total(page.total);
+    ctx.enrich({ shown: page.rows.length });
+    if (page.nextCursor) {
+      ctx.enrich.truncated({ shown: page.rows.length, cap: input.limit, guidance: fragments.join(' ') });
+    } else if (fragments.length) {
+      ctx.enrich.notice(fragments.join(' '));
+    }
+    return { licenses: page.rows, ...(page.nextCursor && { nextCursor: page.nextCursor }) };
   },
 
-  // format() populates content[] — the markdown twin of structuredContent.
-  // Different clients read different surfaces (Claude Code → structuredContent,
-  // Claude Desktop → content[]); both must carry the same data.
-  // Enforced at lint time: every field in `output` must appear in the rendered text.
-  format: (result) => [{
-    type: 'text',
-    text: result.items.map(i => `**${i.id}**: ${i.name}`).join('\n'),
-  }],
+  // format() populates content[] — the markdown twin of structuredContent. Both must carry
+  // the same data; the linter enforces that every `output` field appears in the rendered text.
+  format: (result) => {
+    const lines: string[] = [`## FCC ULS licenses (${result.licenses.length} on this page)`];
+    // … one block per license: licensee, status, service, dates, counts
+    if (result.nextCursor) lines.push('', `**nextCursor:** ${result.nextCursor}`);
+    return [{ type: 'text', text: lines.join('\n') }];
+  },
 });
 ```
 
+Every tool opens the same way: `dataAsOf()` for readiness, then enrichment defaults written unconditionally before any validation that can throw. Text-valued inputs are normalized inside a `z.preprocess` (callsign case and portable suffix, FRN padding, state names, frequency units), so the advertised pattern holds for the normalized value and handlers only see canonical input.
+
 ### Resource
 
-```ts
-import { resource, z } from '@cyanheads/mcp-ts-core';
-import { notFound } from '@cyanheads/mcp-ts-core/errors';
+`fcc-spectrum://license/{callsign}` (`license.resource.ts`), trimmed. It returns the first page `fcc_spectrum_get_license` returns, as JSON:
 
-export const itemData = resource('inventory://{itemId}', {
-  description: 'Fetch an inventory item by ID.',
-  params: z.object({ itemId: z.string().describe('Item identifier') }),
-  auth: ['inventory:read'],
+```ts
+export const licenseResource = resource('fcc-spectrum://license/{callsign}', {
+  name: 'fcc_spectrum_license',
+  title: 'FCC ULS license by callsign',
+  description: `One FCC ULS license or spectrum lease by callsign, as JSON: …`,
+  mimeType: 'application/json',
+  params: z.object({
+    callsign: z.preprocess(percentDecoded, callsignSchema).describe('Callsign or lease ID, e.g. KNKA123 or L000012345, percent-encoded; …'),
+  }),
+  cacheHint: { ttlMs: 3_600_000, cacheScope: 'public' },
+  errors: [
+    { reason: 'index_not_ready', code: JsonRpcErrorCode.ServiceUnavailable, retryable: false, /* … */ },
+    { reason: 'license_not_found', code: JsonRpcErrorCode.NotFound, when: 'No indexed record carries the callsign.', /* … */ },
+  ],
+
   async handler(params, ctx) {
-    const item = await ctx.state.get(`item/${params.itemId}`);
-    if (!item) throw notFound(`Item ${params.itemId} not found`, { itemId: params.itemId });
-    return item;
+    const index = getUlsIndexService();
+    const dataAsOf = await index.dataAsOf();
+    if (dataAsOf === undefined) throw ctx.fail('index_not_ready');
+
+    const result = await index.getLicense({ callsign: params.callsign, maxFrequencies: MAX_FREQUENCIES });
+    if (!result.found) throw ctx.fail('license_not_found', `No record with callsign ${params.callsign} in the indexed service groups.`, { callsign: params.callsign, /* candidates */ });
+    // … build the page and a `notice` naming the fcc_spectrum_get_license call for the rest
+    return { dataAsOf, license: result.license, locations: result.locations, /* … */ };
   },
 });
 ```
 
 ### Prompt
 
-```ts
-import { prompt, z } from '@cyanheads/mcp-ts-core';
-
-export const reviewCode = prompt('review_code', {
-  description: 'Review code for issues and best practices.',
-  args: z.object({
-    code: z.string().describe('Code to review'),
-    language: z.string().optional().describe('Programming language'),
-  }),
-  generate: (args) => [
-    { role: 'user', content: { type: 'text', text: `Review this ${args.language ?? ''} code:\n${args.code}` } },
-  ],
-});
-```
+This server has no prompts (`prompts: []` in `createApp()`). It is a lookup/search/decode surface with no recurring multi-step interaction worth templating.
 
 ### Server config
 
+`src/config/server-config.ts`, trimmed. Lazy-parsed, separate from framework config:
+
 ```ts
-// src/config/server-config.ts — lazy-parsed, separate from framework config
 import { z } from '@cyanheads/mcp-ts-core';
 import { parseEnvConfig } from '@cyanheads/mcp-ts-core/config';
 
+/** Only an explicit off-word disables redaction; anything else — typos included — keeps it on. */
+const REDACTION_OFF = new Set(['false', '0', 'no', 'off']);
+
 const ServerConfigSchema = z.object({
-  apiKey: z.string().describe('External API key'),
-  maxResults: z.coerce.number().default(100),
-  verboseLogging: z.stringbool().default(false).describe('Enable verbose logging'),
+  mirrorDir: z.string().default('.mirror/fcc-uls').transform((dir) => resolve(dir)).describe('Directory for index generations, current.json, the ingest lock, and temp zips'),
+  services: z.string().default(DEFAULT_SERVICE_GROUPS.join(',')).transform(/* validate and order the groups */).describe('Weekly service groups to index'),
+  redactIndividuals: z
+    .string()
+    .optional()
+    .transform((value) => !REDACTION_OFF.has(value?.trim().toLowerCase() ?? ''))
+    .describe('Redact individual licensees; fail-safe (only false/0/no/off disables)'),
+  baseUrl: z.url().default('https://data.fcc.gov/download/pub/uls').transform((url) => url.replace(/\/+$/, '')).describe('ULS bulk host root'),
 });
 
-let _config: z.infer<typeof ServerConfigSchema> | undefined;
-export function getServerConfig() {
+let _config: ServerConfig | undefined;
+export function getServerConfig(): ServerConfig {
   _config ??= parseEnvConfig(ServerConfigSchema, {
-    apiKey: 'MY_API_KEY',
-    maxResults: 'MY_MAX_RESULTS',
-    verboseLogging: 'MY_VERBOSE_LOGGING',
+    mirrorDir: 'FCC_SPECTRUM_MIRROR_DIR',
+    services: 'FCC_SPECTRUM_SERVICES',
+    redactIndividuals: 'FCC_SPECTRUM_REDACT_INDIVIDUALS',
+    baseUrl: 'FCC_SPECTRUM_BASE_URL',
   });
   return _config;
 }
 ```
 
-`parseEnvConfig` maps Zod schema paths → env var names so errors name the variable (`MY_API_KEY`) not the path (`apiKey`). Throws `ConfigurationError`, which the framework prints as a clean startup banner.
+`parseEnvConfig` maps Zod schema paths → env var names so errors name the variable (`FCC_SPECTRUM_SERVICES`) not the path (`services`). Throws `ConfigurationError`, which the framework prints as a clean startup banner. `redactIndividuals` is a privacy control and parses as a string with an explicit off-list rather than `z.stringbool()`, so a typo or an unset variable keeps redaction on instead of throwing or disabling it.
 
-For env booleans use `z.stringbool()`, never `z.coerce.boolean()` — `Boolean("false")` is `true`, so a coerced flag can't be disabled through the environment. `z.stringbool()` parses `true/false/1/0/yes/no/on/off` and rejects anything else, so `=false` actually disables.
+For other env booleans use `z.stringbool()`, never `z.coerce.boolean()` — `Boolean("false")` is `true`, so a coerced flag can't be disabled through the environment.
 
-### Server identity and instructions
+### Server identity, session posture, and lifecycle
 
-`createApp()` accepts optional identity fields forwarded to the SDK's `initialize` response and the server manifest (`/.well-known/mcp.json`):
-
-```ts
-await createApp({
-  name: 'my-mcp-server',
-  title: 'My Server',                         // human-readable display name
-  websiteUrl: 'https://github.com/owner/repo', // canonical homepage URL
-  description: 'One-line description.',        // wins over MCP_SERVER_DESCRIPTION
-  icons: [{ src: 'https://example.com/icon.png', sizes: ['48x48'], mimeType: 'image/png' }],
-  instructions: 'Use shortcut alpha for the most common case.', // session-level context
-});
-```
-
-`instructions` is optional server-level orientation, sent on every `initialize` as session-level context. Use it for deployment guidance (connection aliases, regional notes, scope hints) instead of repeating the same context across tool descriptions. Client adoption is uneven, but there's no downside when set.
-
-### Session posture and shutdown
-
-Two more `createApp()` options shape how the server runs rather than how it presents itself:
+`src/index.ts`, trimmed:
 
 ```ts
 await createApp({
-  sessionMode: 'stateless',          // or { default: 'stateful', require: 'stateful' }
-  setup(core) { startMyWatcher(core.config); },
-  async teardown() { await stopMyWatcher(); },
+  name: 'fcc-spectrum-mcp-server',   // machine name on every surface — never Title Case
+  title: 'fcc-spectrum-mcp-server',  // display identity = the hyphenated repo name
+  tools: allToolDefinitions,
+  resources: allResourceDefinitions,
+  prompts: [],
+  instructions: `FCC radio spectrum licensing from the Universal Licensing System (ULS), served from a local index … ${getServerConfig().redactIndividuals ? REDACTION_SENTENCE : ''} … Data: FCC Universal Licensing System, a US government work in the public domain.`,
+  // No tool asks the caller for input mid-call; MCP_SESSION_MODE still overrides this.
+  sessionMode: 'stateless',
+  async setup(core) {
+    const { baseUrl, mirrorDir, redactIndividuals, services } = getServerConfig();
+    initUlsIndexService({ mirrorDir, redactIndividuals, services });
+    // A long-lived HTTP process owns the ingest cron; stdio operators run mirror:* from cron.
+    if (core.config.mcpTransportType === 'http') {
+      await startIngestSchedule({ baseUrl, mirrorDir, services });
+    }
+  },
+  async teardown() {
+    // Jobs go first: a tick in flight writes to the index the service is about to close.
+    stopIngestSchedule();
+    await getUlsIndexService().close();
+  },
 });
 ```
 
-`sessionMode` declares the HTTP session posture in `src/` instead of leaving it to a deployment's `MCP_SESSION_MODE`, which still wins whenever it carries a meaningful value (an empty string and an unsubstituted `${…}` placeholder read as unset and fall through to the option). Add `require: 'stateful'` when a tool asks the caller for input mid-handler via `ctx.requestInput`: startup then fails with a `ConfigurationError` rather than serving a mode in which a 2025-era client can never answer the prompt. Stdio is never refused.
+`name` and `title` are both the hyphenated machine name; `description` is not passed (it derives from `package.json`). `instructions` is session-level orientation sent on every `initialize`: here it names the source, the tool workflow, the status semantics, and (when redaction is on) the redaction rule. `src/index.ts` loads `./.env` itself because `instructions` reads the redaction setting before `createApp()` runs.
 
-`teardown(core)` is the `setup()` counterpart — release a watcher, socket, or non-`unref()`'d timer there. It runs after the transport stops and before the logger closes, on every shutdown path, and a signal-triggered shutdown then exits the process explicitly (0, or 1 if a step never settles within the framework's 10 s ceiling).
+`sessionMode: 'stateless'` declares the HTTP session posture in `src/`; `MCP_SESSION_MODE` still wins whenever it carries a meaningful value. Stateless is correct here: every tool is a single-shot read over the local index. Do not add `require: 'stateful'`. `.env.example`, the `Dockerfile`, and the README env table carry `stateless` and must stay in step.
+
+`teardown` runs after the transport stops and before the logger closes, on every shutdown path. It stops the ingest jobs before closing the index, because a tick in flight writes to the index the service is about to close.
 
 ---
 
@@ -199,15 +253,11 @@ Handlers receive a unified `ctx` object. Key properties:
 | Property | Description |
 |:---------|:------------|
 | `ctx.log` | Request-scoped logger — `.debug()`, `.info()`, `.notice()`, `.warning()`, `.error()`. Auto-correlates requestId, traceId, tenantId. Dual-sink: Pino **and** `notifications/message` to the client, so treat it as client-visible. |
-| `ctx.state` | Tenant-scoped KV — `.get(key)`, `.set(key, value, { ttl? })`, `.delete(key)`, `.getMany(keys)`, `.list(prefix, { cursor, limit })`. Accepts any JSON-serializable value; reads return its JSON form (a `Date` comes back as an ISO string). |
-| `ctx.requestInput` | Suspend and ask the caller for more input — `return ctx.requestInput({ inputRequests: { key: inputRequired.elicit({ message, requestedSchema }) } })`. Never returns; the handler is re-entered with the answers. Always present. |
-| `ctx.inputs` | The request's responses — `.accepted(key, schema)`, `.view(key)`, `.state()`, `.dropped` — limited to what the client declared (`elicitation` and its form/url modes, `sampling`, `roots`). Client-supplied: a consent gate trusts only a `ctx.state` record it stored when it asked, bound to the operation, caller, and target (see the `api-context` skill). |
-| `ctx.clientCapabilities` | What the client declared for this request, `undefined` when no view exists. Decides whether to ask for optional context (e.g. roots); never a reason to skip a consent prompt. |
-| `ctx.enrich` | Success-path agent context (empty-result notices, query echo, pagination totals) — `ctx.enrich(...)` or `.notice()` / `.total()` / `.echo()` / `.truncated()`. Reaches `structuredContent` and `content[]`; lands only when the definition declares an `enrichment` block (no-op otherwise). |
-| `ctx.content` | Non-text content blocks — `.image(data, mimeType)`, `.audio(data, mimeType)`, or `ctx.content(block)` for a raw block. Prepended to `content[]` after `format()`; never enters `structuredContent`. |
-| `ctx.signal` | `AbortSignal` for cancellation. |
+| `ctx.fail` | Throw a typed contract error by `reason`, declared in the definition's `errors[]` (every tool and the resource). |
+| `ctx.enrich` | Success-path agent context — `ctx.enrich({ … })` for the declared `enrichment` fields, plus `.total(n)`, `.truncated({ shown, cap, guidance })`, and `.notice(text)`. Reaches `structuredContent` and `content[]`; lands only when the definition declares an `enrichment` block. |
 | `ctx.requestId` | Request ID — the one every log record of the call carries and its error envelope returns as `data.requestId`. |
-| `ctx.tenantId` | Tenant ID from JWT; `'default'` for stdio or HTTP with auth off. |
+
+This server is read-only over the local index: no `ctx.state` (the index is the store), no `ctx.requestInput` / `ctx.inputs`, no `ctx.content`.
 
 ---
 
@@ -221,14 +271,15 @@ Handlers throw — the framework catches, classifies, and formats.
 import { JsonRpcErrorCode } from '@cyanheads/mcp-ts-core/errors';
 
 errors: [
-  { reason: 'no_match', code: JsonRpcErrorCode.NotFound,
-    when: 'No item matched the query',
-    recovery: 'Broaden the query or check the spelling and try again.' },
+  { reason: 'index_not_ready', code: JsonRpcErrorCode.ServiceUnavailable,
+    when: 'No completed index generation is published yet.',
+    retryable: false,
+    recovery: 'The local ULS index has not been built yet; call fcc_spectrum_list_reference with topic "coverage" to see its build status. An operator must run the mirror:init script once before searches work.' },
 ],
 async handler(input, ctx) {
-  const item = await db.find(input.id);
-  if (!item) throw ctx.fail('no_match', `No item ${input.id}`);
-  return item;
+  const dataAsOf = await getUlsIndexService().dataAsOf();
+  if (dataAsOf === undefined) throw ctx.fail('index_not_ready');
+  // …
 }
 ```
 
@@ -259,20 +310,39 @@ See framework CLAUDE.md and the `api-errors` skill for the full auto-classificat
 
 ```text
 src/
-  index.ts                              # createApp() entry point
+  index.ts                              # createApp() entry; identity, sessionMode, setup/teardown wiring
   config/
-    server-config.ts                    # Server-specific env vars (Zod schema)
-  services/
-    [domain]/
-      [domain]-service.ts               # Domain service (init/accessor pattern)
-      types.ts                          # Domain types
+    server-config.ts                    # FCC_SPECTRUM_* env vars (Zod schema)
+  services/uls/
+    uls-index-service.ts                # read path over the published generation; the redact() chokepoint
+    types.ts                            # read-model types the tools return
+    ingest.ts                           # UlsIngester: weekly rebuild + daily refresh into generation files
+    ingest-schedule.ts                  # HTTP-only cron: Sunday rebuild, daily refresh
+    bulk-client.ts                      # paced HTTP client for the ULS bulk host
+    zip-reader.ts  dat.ts               # streaming ZIP reader; .dat record parsing
+    schema.ts                           # store spec, generation naming, current.json pointer, ingest lock
+    codes.ts                            # service groups and bundled code tables
+    normalize.ts                        # callsign / FRN / state / status / unit / DMS normalizers
+    organization-names.ts               # organization words for the blank/H applicant-type individual rule
+    state-lookup.ts  data/us-states.json # point-in-polygon state derivation
   mcp-server/
-    tools/definitions/
-      [tool-name].tool.ts               # Tool definitions
+    tools/
+      input-schemas.ts                  # shared z.preprocess input schemas, blankAsUnset
+      format-helpers.ts                 # shared format() helpers
+      definitions/
+        search-licenses.tool.ts         # fcc_spectrum_search_licenses
+        get-license.tool.ts             # fcc_spectrum_get_license
+        find-transmitters.tool.ts       # fcc_spectrum_find_transmitters
+        search-frequencies.tool.ts      # fcc_spectrum_search_frequencies
+        list-reference.tool.ts          # fcc_spectrum_list_reference
     resources/definitions/
-      [resource-name].resource.ts       # Resource definitions
-    prompts/definitions/
-      [prompt-name].prompt.ts           # Prompt definitions
+      license.resource.ts               # fcc-spectrum://license/{callsign}
+scripts/
+  fcc-mirror-init.ts                    # mirror:init — weekly rebuild, out-of-band
+  fcc-mirror-refresh.ts                 # mirror:refresh — daily refresh
+  fcc-mirror-verify.ts                  # mirror:verify — integrity and count check
+  _mirror-context.ts                    # shared setup for the three mirror scripts
+  build-state-boundaries.ts             # regenerate us-states.json (run by hand)
 ```
 
 ---
@@ -352,11 +422,17 @@ When you complete a skill's checklist, check the boxes and add a completion time
 | `bun run audit:refresh` | Delete `bun.lock` and reinstall. Last resort after `audit:fix`, `bun update <name>`, and `bun dedupe` — re-resolves every ranged dep (the framework pin included) and rewrites the lockfile as `lockfileVersion: 2` |
 | `bun run lint:mcp` | Run the MCP definition linter standalone (rule catalog: `api-linter` skill) |
 | `bun run lint:packaging` | Packaging surface checks — `server.json`/`manifest.json` env-var parity (run by devcheck) |
+| `bun run mirror:init` | Weekly rebuild of the ULS index into a new generation (skips when the published one already holds every selected group). The one-time operator step |
+| `bun run mirror:refresh` | Apply daily files newer than the index checkpoint (stdio deployments run it from cron) |
+| `bun run mirror:verify` | SQLite integrity check plus per-snapshot line-count comparison of the published index |
+| `bun run release:github` | Publish the GitHub Release (`.mcpb` bundle) — a `release-and-publish` step |
+| `bun run publish-mcp` | Publish to the MCP Registry — a `release-and-publish` step |
 | `bun run list-skills` | Print the skill registry |
 | `bun run tree` | Generate directory structure doc |
 | `bun run format` | Auto-fix formatting (safe fixes only) |
 | `bun run format:unsafe` | Also apply Biome's unsafe autofixes — review the diff; they can change behavior |
 | `bun run test` | Run tests (Vitest — use `bun run test`, not `bun test`) |
+| `bun run test:coverage` | Tests with a coverage report |
 | `bun run start:stdio` | Production mode (stdio) |
 | `bun run start:http` | Production mode (HTTP) |
 | `bun run changelog:build` | Regenerate `CHANGELOG.md` from `changelog/*.md` |
@@ -428,8 +504,11 @@ import { getMyService } from '@/services/my-domain/my-service.js';
 - [ ] Zod schemas: all fields have `.describe()`, only JSON-Schema-serializable types (no `z.custom()`, `z.date()`, `z.transform()`, `z.bigint()`, `z.symbol()`, `z.void()`, `z.map()`, `z.set()`, `z.function()`, `z.nan()`)
 - [ ] Optional nested objects: handler guards for empty inner values from form-based clients (`if (input.obj?.field && ...)`, not just `if (input.obj)`). When regex/length constraints matter, use `z.union([z.literal(''), z.string().regex(...).describe(...)])` — literal variants are exempt from `describe-on-fields`.
 - [ ] JSDoc `@fileoverview` + `@module` on every file
-- [ ] `ctx.log` for logging, `ctx.state` for storage
-- [ ] Handlers throw on failure — error factories or plain `Error`, no try/catch
+- [ ] `ctx.log` for logging; index reads only through `getUlsIndexService()`
+- [ ] Handlers throw on failure — `ctx.fail(reason)` against the declared `errors[]`, no try/catch
+- [ ] Every handler gates on `dataAsOf()` first and throws `index_not_ready` on a cold index, and writes its `ctx.enrich` defaults unconditionally before any validation that can throw
+- [ ] Text inputs normalize inside `z.preprocess` (via `input-schemas.ts`), so the advertised pattern holds for the normalized value; optional fields wrap in `blankAsUnset`
+- [ ] Any new output carrying a licensee, address, or trustee name reads it through the `UlsIndexService.redact()` chokepoint; contact fields stay un-ingested
 - [ ] `format()` renders all data the LLM needs — different clients forward different surfaces (Claude Code → `structuredContent`, Claude Desktop → `content[]`); both must carry the same data
 - [ ] If wrapping external API: raw/domain/output schemas reviewed against real upstream sparsity/nullability before finalizing required vs optional fields
 - [ ] If wrapping external API: normalization and `format()` preserve uncertainty; do not fabricate facts from missing upstream data
