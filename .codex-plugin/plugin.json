@@ -1,6 +1,6 @@
 {
   "name": "fcc-spectrum-mcp-server",
-  "version": "0.1.1",
+  "version": "0.1.2",
   "description": "Search FCC radio licenses, find nearby transmitter sites, and see who is licensed on a frequency.",
   "author": {
     "name": "cyanheads",

@@ -1,6 +1,6 @@
 # fcc-spectrum-mcp-server - Directory Structure
 
-Generated on: 2026-10-01 08:07:50
+Generated on: 2026-10-02 05:14:02
 
 ```text
 fcc-spectrum-mcp-server/
@@ -118,6 +118,7 @@ fcc-spectrum-mcp-server/
 ├── scripts/
 │   ├── _mirror-context.ts
 │   ├── build-changelog.ts
+│   ├── build-market-states.ts
 │   ├── build-state-boundaries.ts
 │   ├── build.ts
 │   ├── check-dependency-specifiers.ts
@@ -158,12 +159,15 @@ fcc-spectrum-mcp-server/
 │   ├── services/
 │   │   └── uls/
 │   │       ├── data/
+│   │       │   ├── market-states.json
 │   │       │   └── us-states.json
 │   │       ├── bulk-client.ts
 │   │       ├── codes.ts
 │   │       ├── dat.ts
+│   │       ├── ingest-job.ts
 │   │       ├── ingest-schedule.ts
 │   │       ├── ingest.ts
+│   │       ├── market-states.ts
 │   │       ├── normalize.ts
 │   │       ├── organization-names.ts
 │   │       ├── schema.ts
@@ -186,8 +190,10 @@ fcc-spectrum-mcp-server/
 │   │       ├── bulk-client.test.ts
 │   │       ├── codes.test.ts
 │   │       ├── dat.test.ts
+│   │       ├── ingest-job.test.ts
 │   │       ├── ingest-schedule.test.ts
 │   │       ├── ingest.test.ts
+│   │       ├── market-states.test.ts
 │   │       ├── normalize.test.ts
 │   │       ├── organization-names.test.ts
 │   │       ├── schema.test.ts

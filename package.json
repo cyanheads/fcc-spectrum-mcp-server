@@ -1,6 +1,6 @@
 {
   "name": "@cyanheads/fcc-spectrum-mcp-server",
-  "version": "0.1.1",
+  "version": "0.1.2",
   "mcpName": "io.github.cyanheads/fcc-spectrum-mcp-server",
   "description": "Search FCC radio licenses, find nearby transmitter sites, and see who is licensed on a frequency via MCP. STDIO or Streamable HTTP.",
   "type": "module",
