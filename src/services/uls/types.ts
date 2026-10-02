@@ -75,6 +75,7 @@ export interface SearchLicensesParams {
   frn?: string | undefined;
   licensee?: string | undefined;
   limit: number;
+  marketCode?: string | undefined;
   radioService?: string | undefined;
   state?: string | undefined;
   status: LicenseStatusFilter;
@@ -119,6 +120,7 @@ export interface LicenseAntenna {
 export interface LicenseSite {
   /** Street address; omitted on an individual's record while redaction is on. */
   address?: string;
+  /** Present only when the filed value is a registration number (seven digits, not `9999999`). */
   asrNumber?: string;
   city?: string;
   /** The filed coordinates as text, kept when validation drops the decimal pair. */
@@ -131,6 +133,7 @@ export interface LicenseSite {
   locationTypeCode?: string;
   locationTypeLabel?: string;
   longitude?: number;
+  /** Site name; omitted on an individual's record while redaction is on. */
   name?: string;
   overallHeightM?: number;
   radiusKm?: number;
@@ -206,17 +209,33 @@ export interface LicenseDetail {
   usi: string;
 }
 
-/** `getLicense` parameters: the record by exactly one of `callsign` or `usi`, and the page. */
+/**
+ * `getLicense` parameters: the record by exactly one of `callsign` or `usi`, the start of its
+ * location window by at most one of `locationOffset` or `locationNumber`, and the page.
+ */
 export type GetLicenseParams = (
   | { callsign: string; usi?: never }
   | { callsign?: never; usi: string }
-) & {
-  /** Index of the first lease listed, in lease-ID order (default 0). */
-  leaseOffset?: number;
-  /** Index of the first location number in the window, in number order (default 0). */
-  locationOffset?: number;
-  maxFrequencies: number;
-};
+) &
+  (
+    | {
+        locationNumber?: never;
+        /** Index of the first location number in the window, in number order (default 0). */
+        locationOffset?: number;
+      }
+    | {
+        /**
+         * Location number the window starts at, as an offset: the count of the record's
+         * location numbers below it, so an unfiled number starts at the next filed one.
+         */
+        locationNumber: number;
+        locationOffset?: never;
+      }
+  ) & {
+    /** Index of the first lease listed, in lease-ID order (default 0). */
+    leaseOffset?: number;
+    maxFrequencies: number;
+  };
 
 /** `getLicense` outcome: a miss is a result carrying callsign-prefix candidates. */
 export type GetLicenseResult =
@@ -232,7 +251,14 @@ export type GetLicenseResult =
       frequenciesShown: number;
       /** Frequency rows the record holds. */
       frequencyTotal: number;
+      /** Highest location number the record files; absent when it files none. */
+      lastLocationNumber?: number;
       license: LicenseDetail;
+      /**
+       * Offset of the window's first location number, in number order: `locationOffset`, or
+       * the offset `locationNumber` resolved to.
+       */
+      locationOffset: number;
       /** Location numbers the record files. */
       locationTotal: number;
       /** The window of location numbers, from `locationOffset`. */
@@ -265,6 +291,7 @@ export interface SiteFrequency {
 
 /** One `find_transmitters` site. */
 export interface TransmitterSite extends LicenseeFields {
+  /** Present only when the filed value is a registration number (seven digits, not `9999999`). */
   asrNumber?: string;
   callsign?: string;
   county?: string;
@@ -275,14 +302,19 @@ export interface TransmitterSite extends LicenseeFields {
   frequencyCount: number;
   groundElevationM?: number;
   isLease: boolean;
+  /** The site, or the center of an operating area filed with `radiusKm`. */
   latitude: number;
   licenseStatus: string;
   locationNumber: number;
+  /** Absent when the filing leaves the location type blank. */
   locationTypeCode?: string;
+  locationTypeLabel?: string;
   longitude: number;
   overallHeightM?: number;
   radioServiceCode: string;
   radioServiceLabel: string;
+  /** Radius of operation, filed on any location type (mobile and temporary-fixed areas mostly). */
+  radiusKm?: number;
   /**
    * Sites the license files under this location number, when more than one; the
    * frequencies are then the number's, not this site's alone.
@@ -299,6 +331,8 @@ export interface FindTransmittersParams {
   cursor?: string | undefined;
   latitude: number;
   limit: number;
+  /** One ULS location type code; unset matches every type, untyped sites included. */
+  locationType?: string | undefined;
   longitude: number;
   maxFrequenciesPerSite: number;
   radioService?: string | undefined;
@@ -319,6 +353,9 @@ export interface FrequencyAssignment extends LicenseeFields {
   latitude?: number;
   licenseStatus: string;
   locationNumber?: number;
+  /** Site rows at a single site; absent when the filing leaves the type blank. */
+  locationTypeCode?: string;
+  locationTypeLabel?: string;
   longitude?: number;
   marketCode?: string;
   marketName?: string;
@@ -327,10 +364,12 @@ export interface FrequencyAssignment extends LicenseeFields {
   partitionAreaIds?: number[];
   radioServiceCode: string;
   radioServiceLabel: string;
+  /** Radius of operation (site rows at a single site, when filed). */
+  radiusKm?: number;
   /**
    * Sites the license files under this location number, when more than one (site rows);
-   * the row then carries no site coordinates or place, since ULS does not say which site
-   * uses the frequency.
+   * the row then carries no site coordinates, location type, radius, or place, since ULS
+   * does not say which site uses the frequency.
    */
   sitesSharingNumber?: number;
   state?: string;
@@ -344,9 +383,11 @@ export interface FrequencyAssignment extends LicenseeFields {
 export interface SearchFrequenciesParams {
   band: Band;
   cursor?: string | undefined;
+  frn?: string | undefined;
   kind: 'site' | 'market' | 'both';
   licensee?: string | undefined;
   limit: number;
+  marketCode?: string | undefined;
   radioService?: string | undefined;
   state?: string | undefined;
   status: LiveStatusFilter;

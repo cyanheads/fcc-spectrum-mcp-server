@@ -4,7 +4,8 @@
  * `params`, the declared `index_not_ready` and `license_not_found` contracts, parity with the
  * record `fcc_spectrum_get_license` returns, the frequency-row counts under its fixed cap of
  * 100, the first page of a large license with the notice naming the call that reads the rest,
- * redaction on and off, and registry text kept verbatim in the JSON body.
+ * redaction on and off (site names and addresses included, on shared location numbers too),
+ * the ASR registration-number rule, and registry text kept verbatim in the JSON body.
  * @module tests/resources/license.resource.test
  */
 
@@ -18,7 +19,12 @@ import { getLicense } from '@/mcp-server/tools/definitions/get-license.tool.js';
 import { POINTER_FILE, writePointer } from '@/services/uls/schema.js';
 import type { GetLicenseResult } from '@/services/uls/types.js';
 import { releaseIndex, successOf, useIndex } from '../fixtures/tool-harness.js';
-import { sprawlingPagingWeekly, widePagingWeekly } from '../fixtures/uls-fixtures.js';
+import {
+  INDIVIDUAL_SITES_WEEKLY,
+  QUIRKS_WEEKLY,
+  sprawlingPagingWeekly,
+  widePagingWeekly,
+} from '../fixtures/uls-fixtures.js';
 import {
   buildFixtureIndex,
   type FixtureIndex,
@@ -262,25 +268,33 @@ describe('warm index', () => {
         isLease: true,
         licensee: { name: 'Leaseholder Wireless LLC', role: 'lessee' },
         leasedFrom: [{ callsign: 'KZZ801', usi: '2001' }],
-        market: { marketCode: 'BTA144', blocks: [{ lowMhz: 2496, highMhz: 2502 }] },
+        market: { marketCode: 'BTA138', blocks: [{ lowMhz: 2496, highMhz: 2502 }] },
       });
     });
   });
 
   describe('redaction', () => {
-    it("withholds an individual's name and site address while redacting", async () => {
+    it("withholds an individual's name, site address, and site name while redacting", async () => {
       const result = await read('KZZ903');
       expect(result.license.licensee).toMatchObject({ name: null, redacted: true });
       expect(result.locations[0]).not.toHaveProperty('address');
+      expect(result.locations[0]).not.toHaveProperty('name');
       expect(JSON.stringify(result)).not.toContain('Pat Q Example');
       expect(JSON.stringify(result)).not.toContain('42 Private Lane');
     });
 
-    it("returns an individual's name and site address with redaction off", async () => {
+    it("returns an individual's name, site address, and site name with redaction off", async () => {
       await useIndex(fixture.mirrorDir, { redactIndividuals: false });
       const result = await read('KZZ903');
       expect(result.license.licensee).toMatchObject({ name: 'Pat Q Example', redacted: false });
-      expect(result.locations[0]?.address).toBe('42 Private Lane');
+      expect(result.locations[0]).toMatchObject({
+        address: '42 Private Lane',
+        name: 'Pat Q Example',
+      });
+    });
+
+    it("returns an organization's site name while redacting", async () => {
+      expect((await read('KZZ901')).locations[0]?.name).toBe('Seattle Hill');
     });
   });
 
@@ -290,6 +304,66 @@ describe('warm index', () => {
     const body = JSON.stringify(result);
     expect(body).toContain('Carriage\\rReturn Paging');
     expect(JSON.parse(body)).toEqual(result);
+  });
+});
+
+describe('an individual whose sites file names', () => {
+  let individual: FixtureIndex;
+  beforeAll(async () => {
+    individual = await buildFixtureIndex({
+      groups: ['paging'],
+      weekly: { paging: INDIVIDUAL_SITES_WEEKLY },
+    });
+  });
+  afterAll(async () => {
+    await releaseIndex();
+    await individual.dispose();
+  });
+
+  it('withholds the name and address of each site sharing a number while redacting', async () => {
+    await useIndex(individual.mirrorDir, { services: ['paging'] });
+    const result = await read('KZZ521');
+    const [shared, single] = result.locations;
+    expect(shared?.sites).toHaveLength(2);
+    for (const site of [...(shared?.sites ?? []), single]) {
+      expect(site).not.toHaveProperty('name');
+      expect(site).not.toHaveProperty('address');
+    }
+    for (const filed of ['Robin', 'Sample', 'SAMPLE', 'Orchard', 'Ridge Rd']) {
+      expect(JSON.stringify(result), filed).not.toContain(filed);
+    }
+  });
+
+  it('returns them with redaction off', async () => {
+    await useIndex(individual.mirrorDir, { services: ['paging'], redactIndividuals: false });
+    const result = await read('KZZ521');
+    expect(result.locations[0]?.sites?.map((site) => site.name)).toEqual([
+      'Robin R Sample',
+      'SAMPLE BARN',
+    ]);
+    expect(result.locations[1]?.name).toBe('Sample Ridge');
+  });
+});
+
+describe('an ASR field holding something other than a registration number', () => {
+  let quirks: FixtureIndex;
+  beforeAll(async () => {
+    quirks = await buildFixtureIndex({ groups: ['paging'], weekly: { paging: QUIRKS_WEEKLY } });
+    await useIndex(quirks.mirrorDir, { services: ['paging'] });
+  });
+  afterAll(async () => {
+    await releaseIndex();
+    await quirks.dispose();
+  });
+
+  it('is omitted, while a seven-digit registration number is kept', async () => {
+    const result = await read('KZZ505');
+    const [shared, single] = result.locations;
+    for (const site of shared?.sites ?? []) expect(site).not.toHaveProperty('asrNumber');
+    expect(single?.asrNumber).toBe('1012345');
+    expect(JSON.stringify(result)).not.toContain('N/A');
+    expect(JSON.stringify(result)).not.toContain('9999999');
+    expect((await read('KZZ502')).locations[0]).not.toHaveProperty('asrNumber');
   });
 });
 

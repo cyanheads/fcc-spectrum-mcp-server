@@ -20,7 +20,7 @@ import {
 export const MIRROR_NAME = 'fcc-uls';
 
 /** Current store schema version; bump it and add a migration on any schema change. */
-const SCHEMA_VERSION = 4;
+const SCHEMA_VERSION = 5;
 
 /** License statuses whose records keep sites, antennas, frequencies, and market blocks. */
 export const LIVE_STATUSES = ['A', 'L', 'X'] as const;
@@ -307,6 +307,18 @@ function markRebuildRequired(handle: SqliteHandle): void {
   );
 }
 
+/**
+ * Schema 5: index `licenses.market_code` for the market-code filters, partially, since about
+ * one license in sixteen carries a code. The store spec's `indexes` take columns only, so the
+ * migration owns it: a schema 4 generation gains it in place on its next open, and a new
+ * generation gets it on creation, before any row is written.
+ */
+function addMarketCodeIndex(handle: SqliteHandle): void {
+  handle.exec(
+    'CREATE INDEX IF NOT EXISTS licenses_market_code ON licenses (market_code) WHERE market_code IS NOT NULL;',
+  );
+}
+
 /** True when the generation behind `handle` carries the {@link markRebuildRequired} mark. */
 export function isRebuildRequired(handle: SqliteHandle): boolean {
   return Boolean(handle.prepare('SELECT 1 FROM meta WHERE key = ?').get(META_KEYS.rebuildRequired));
@@ -332,6 +344,7 @@ export function createUlsStore(path: string): MirrorStore {
       { version: 2, up: addSiteSeq },
       { version: 3, up: addBandClasses },
       { version: 4, up: markRebuildRequired },
+      { version: 5, up: addMarketCodeIndex },
     ],
   });
 }
@@ -442,6 +455,8 @@ export async function readPointer(mirrorDir: string): Promise<GenerationPointer 
 export interface IngestLockHolder {
   mode: string;
   pid: number;
+  /** PID of the HTTP server that spawned the holder as a scheduled job; absent otherwise. */
+  serverPid?: number;
   startedAt: string;
 }
 
@@ -478,6 +493,7 @@ function parseLockHolder(text: string): IngestLockHolder {
       pid: Number(parsed.pid),
       mode: String(parsed.mode ?? 'unknown'),
       startedAt: String(parsed.startedAt ?? ''),
+      ...(parsed.serverPid !== undefined && { serverPid: Number(parsed.serverPid) }),
     };
   } catch {
     // A lock file that does not parse names no live process; the caller reclaims it.
@@ -587,18 +603,21 @@ export async function releaseIngestLock(
 }
 
 /**
- * Remove an ingest lock that names this process's PID and was taken before this process
- * started, returning the holder it recorded. Such a lock was left by an earlier process that
- * had the same PID, the norm after a container restart (the server is PID 1 again), and
- * {@link isProcessAlive} would otherwise report it held forever. A lock taken since this
- * process started is a live one, held by a process in another PID namespace sharing the
- * mirror directory, and stays.
+ * Remove an ingest lock an earlier process with this PID left behind, returning the holder it
+ * recorded: a lock taken before this process started that names this PID as its holder, or as
+ * the server that spawned its scheduled job while that job's own process is gone. Both are the
+ * norm after a container restart (the server is PID 1 again, and its job died with it), where
+ * {@link isProcessAlive} on the recorded PID could otherwise report the lock held for good. A
+ * lock taken since this process started, held by a process in another PID namespace sharing
+ * the mirror directory, stays, and so does a lock whose job is still running.
  */
 export async function clearInheritedLock(mirrorDir: string): Promise<IngestLockHolder | undefined> {
   const holder = await readIngestLock(mirrorDir);
+  if (!holder) return;
   // `startedAt` is in whole seconds, so the lock was taken up to a second after it.
-  if (holder?.pid !== process.pid) return;
   if (!(Date.parse(holder.startedAt) + 1000 <= performance.timeOrigin)) return;
+  const ownJob = holder.serverPid === process.pid && !isProcessAlive(holder.pid);
+  if (holder.pid !== process.pid && !ownJob) return;
   await rm(join(mirrorDir, LOCK_FILE), { force: true });
   return holder;
 }

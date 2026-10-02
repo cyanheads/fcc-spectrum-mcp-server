@@ -20,7 +20,7 @@ vi.mock('@cyanheads/mcp-ts-core', async (importOriginal) => ({
 
 vi.mock('@/services/uls/ingest-schedule.js', () => ({
   startIngestSchedule: vi.fn(async () => {}),
-  stopIngestSchedule: vi.fn(),
+  stopIngestSchedule: vi.fn(async () => {}),
 }));
 
 vi.mock('@/services/uls/uls-index-service.js', async (importOriginal) => {
@@ -195,4 +195,24 @@ describe('teardown()', () => {
       expect(close.mock.contexts[0]).toBe(indexService.getUlsIndexService());
     },
   );
+
+  it('closes the index service only once a running job has stopped', async () => {
+    const { options, schedule, indexService } = await loadIndex();
+    await options.setup?.(core('http'));
+    const close = vi.spyOn(indexService.UlsIndexService.prototype, 'close');
+    let jobStopped!: () => void;
+    vi.mocked(schedule.stopIngestSchedule).mockReturnValueOnce(
+      new Promise<void>((resolve) => {
+        jobStopped = resolve;
+      }),
+    );
+
+    const teardown = options.teardown?.(core('http'));
+    await new Promise((resolve) => setTimeout(resolve, 20));
+    expect(close).not.toHaveBeenCalled();
+
+    jobStopped();
+    await teardown;
+    expect(close).toHaveBeenCalledTimes(1);
+  });
 });

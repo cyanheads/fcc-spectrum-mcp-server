@@ -3,8 +3,10 @@
  * dangling, and malformed pointer states, every declared error reason on both surfaces,
  * coordinate and range validation, DMS and decimal inputs, blank optional inputs, unit
  * conversion, band filtering, cursor paging, the per-site frequency cap, zero-hit notices,
- * redaction, the antimeridian, the required enrichment on the zero-result and under-cap
- * pages, and `format()` parity with registry text carrying CR/LF and `|`.
+ * redaction, the antimeridian, the ASR registration-number rule, operating areas (location type
+ * label, radius of operation, and the `location_type` filter with its paging and notice), the
+ * required enrichment on the zero-result and under-cap pages, and `format()` parity with
+ * registry text carrying CR/LF and `|`.
  * @module tests/tools/find-transmitters.tool.test
  */
 
@@ -30,7 +32,7 @@ import {
   successOf,
   useIndex,
 } from '../fixtures/tool-harness.js';
-import { QUIRKS_WEEKLY } from '../fixtures/uls-fixtures.js';
+import { AREA_SITES_WEEKLY, QUIRKS_WEEKLY } from '../fixtures/uls-fixtures.js';
 import {
   buildFixtureIndex,
   type FixtureIndex,
@@ -249,6 +251,18 @@ describe('warm index', () => {
       expect(error.code).toBe(JsonRpcErrorCode.InvalidParams);
       expect(error.data?.reason).toBe('invalid_arguments');
     });
+
+    it.each([
+      ['an unknown code', 'Z'],
+      ['a label in place of its code', 'Mobile'],
+      ['two codes', 'F,M'],
+      ['a number naming no code', 7],
+    ])('rejects %s as location_type at that field, with InvalidParams', async (_label, value) => {
+      const error = errorOf(await run({ ...SEATTLE, location_type: value }));
+      expect(error.code).toBe(JsonRpcErrorCode.InvalidParams);
+      expect(error.data?.reason).toBe('invalid_arguments');
+      expect(error.data?.issues).toEqual([expect.objectContaining({ path: ['location_type'] })]);
+    });
   });
 
   describe('inputs', () => {
@@ -272,6 +286,7 @@ describe('warm index', () => {
         frequency_high: ' ',
         unit: '',
         radio_service: '  ',
+        location_type: ' ',
         status: '',
         cursor: '',
       };
@@ -283,7 +298,13 @@ describe('warm index', () => {
         limit: 25,
         max_frequencies_per_site: 10,
       });
-      for (const key of ['frequency_low', 'frequency_high', 'radio_service', 'cursor'] as const) {
+      for (const key of [
+        'frequency_low',
+        'frequency_high',
+        'radio_service',
+        'location_type',
+        'cursor',
+      ] as const) {
         expect(parsed[key]).toBeUndefined();
       }
       const result = page(await run(input));
@@ -566,6 +587,7 @@ describe('warm index', () => {
       const [seattle, unlisted, tacoma] = structured.sites;
       expect(seattle).toMatchObject({ county: 'KING', state: 'WA', stateFromCoordinates: false });
       expect(unlisted).not.toHaveProperty('locationTypeCode');
+      expect(unlisted).not.toHaveProperty('locationTypeLabel');
       expect(tacoma).toMatchObject({ usi: '1001', locationNumber: 2 });
       expect(contractText(result).split('\n')).toContain('- **Place:** KING, WA (state as filed)');
     });
@@ -604,6 +626,183 @@ describe('filing quirks', () => {
     );
     expectCarries(rendered, structured.sites);
   });
+
+  it('returns asrNumber only for a seven-digit registration number, in both surfaces', async () => {
+    // KZZ505's two location-1 sites file N/A and 9999999.
+    const shared = await run({ latitude: '47-40-00 N', longitude: '122-21-00 W', radius_km: 2 });
+    for (const site of page(shared).sites) expect(site).not.toHaveProperty('asrNumber');
+    expect(contractText(shared)).not.toContain('**ASR:**');
+    expect(contractText(shared)).not.toContain('N/A');
+    expect(contractText(shared)).not.toContain('9999999');
+
+    // KZZ502 files an ASR application file number.
+    const fileNumber = await run({
+      latitude: '47-31-00 N',
+      longitude: '122-31-00 W',
+      radius_km: 0.5,
+    });
+    expect(page(fileNumber).sites).toEqual([expect.objectContaining({ usi: '5002' })]);
+    expect(page(fileNumber).sites[0]).not.toHaveProperty('asrNumber');
+    expect(contractText(fileNumber)).not.toContain('A1090210');
+
+    // KZZ505 location 2 files a registration number.
+    const registered = await run({
+      latitude: '47-36-00 N',
+      longitude: '122-12-00 W',
+      radius_km: 0.5,
+    });
+    expect(page(registered).sites).toEqual([
+      expect.objectContaining({ usi: '5005', locationNumber: 2, asrNumber: '1012345' }),
+    ]);
+    expect(contractText(registered)).toContain(' · **ASR:** 1012345');
+  });
+});
+
+describe('operating areas', () => {
+  /** Location 1 of KZZ531 (fixed); its other numbers sit due north. */
+  const CENTER = { latitude: 46, longitude: -119 };
+  const SERVICE = 'IG (Industrial/Business Pool, Conventional)';
+
+  let areas: FixtureIndex;
+  beforeAll(async () => {
+    areas = await buildFixtureIndex({ groups: ['paging'], weekly: { paging: AREA_SITES_WEEKLY } });
+  });
+  beforeEach(async () => {
+    await useIndex(areas.mirrorDir, { services: ['paging'] });
+  });
+  afterAll(async () => {
+    await releaseIndex();
+    await areas.dispose();
+  });
+
+  it('returns each area at its center, with its type label and radius on both surfaces', async () => {
+    const result = await run(CENTER);
+    const structured = page(result);
+    expect(structured.totalCount).toBe(7);
+    expect(siteIds(structured.sites)).toEqual([
+      '5301:1',
+      '5301:2',
+      '5301:3',
+      '5301:4',
+      '5301:5',
+      '5301:6',
+      '5301:6',
+    ]);
+    const [fixed, mobile, temporary, fixedWithRadius, untyped, shared] = structured.sites;
+    expect(mobile).toMatchObject({
+      locationTypeCode: 'M',
+      locationTypeLabel: 'Mobile',
+      radiusKm: 4,
+      latitude: expect.closeTo(dms(46, 0, 30), 9),
+      longitude: -119,
+    });
+    expect(temporary).toMatchObject({ locationTypeLabel: 'Temporary Fixed', radiusKm: 80.5 });
+    expect(fixedWithRadius).toMatchObject({ locationTypeLabel: 'Fixed', radiusKm: 1.5 });
+    expect(fixed).not.toHaveProperty('radiusKm');
+    expect(untyped).not.toHaveProperty('locationTypeLabel');
+    expect(shared).toMatchObject({
+      locationTypeLabel: 'Mobile',
+      radiusKm: 8,
+      sitesSharingNumber: 2,
+    });
+
+    const rendered = contractText(result);
+    expectCarries(rendered, structured.sites);
+    const rows = rendered.split('\n');
+    for (const line of [
+      `### ${mobile?.distanceKm} km · KZZ531 · USI 5301 · location 2`,
+      `- **Status:** A · **Service:** ${SERVICE} · **Location type:** M (Mobile)`,
+      `- **Coordinates:** ${mobile?.latitude}, -119 · **Radius of operation:** 4 km`,
+      `- **Status:** A · **Service:** ${SERVICE} · **Location type:** T (Temporary Fixed)`,
+      `- **Coordinates:** ${temporary?.latitude}, -119 · **Radius of operation:** 80.5 km`,
+      '- **Coordinates:** 46, -119 · **Ground elevation:** 120 m',
+      `- **Status:** A · **Service:** ${SERVICE}`,
+    ]) {
+      expect(rows).toContain(line);
+    }
+  });
+
+  it('keeps one location type case-insensitively, echoing the code and counting only its sites', async () => {
+    const all = page(await run(CENTER));
+    const counts: Record<string, number> = {};
+    for (const code of ['f', ' M ', 't']) {
+      const result = await run({ ...CENTER, location_type: code });
+      const structured = page(result);
+      const normalized = code.trim().toUpperCase();
+      expect(structured.appliedFilters).toEqual({
+        location_type: normalized,
+        status: 'A',
+        max_frequencies_per_site: 10,
+      });
+      expect(structured.sites.every((site) => site.locationTypeCode === normalized)).toBe(true);
+      expect(structured.totalCount).toBe(structured.sites.length);
+      expect(contractText(result)).toContain(`location_type="${normalized}"`);
+      counts[normalized] = structured.totalCount;
+    }
+    expect(counts).toEqual({ F: 2, M: 3, T: 1 });
+    // The one untyped site is the rest of the unfiltered set.
+    expect(all.totalCount).toBe(2 + 3 + 1 + 1);
+    expect(siteIds(page(await run({ ...CENTER, location_type: 'F' })).sites)).toEqual([
+      '5301:1',
+      '5301:4',
+    ]);
+  });
+
+  it('pages through one location type past the first page, shared-number sites included', async () => {
+    const input = { ...CENTER, location_type: 'm', limit: 1 };
+    const one = page(await run(input));
+    expect(one).toMatchObject({ totalCount: 3, truncated: true, shown: 1 });
+    expect(one.notice).toBe(
+      'Showing 1 of 3 sites; pass nextCursor as cursor with the same inputs for the next page.',
+    );
+    const second = await run({ ...input, cursor: one.nextCursor });
+    const two = page(second);
+    expect(two).toMatchObject({ totalCount: 3, truncated: true, shown: 1 });
+    expect(two.sites[0]).toMatchObject({ locationNumber: 6, radiusKm: 8, sitesSharingNumber: 2 });
+    expect(contractText(second).split('\n')).toContain(
+      `- **Coordinates:** ${two.sites[0]?.latitude}, ${two.sites[0]?.longitude} · **Radius of operation:** 8 km`,
+    );
+    const three = page(await run({ ...input, cursor: two.nextCursor }));
+    expect(three).toMatchObject({ totalCount: 3, truncated: false, shown: 1 });
+    expect(three.nextCursor).toBeUndefined();
+    expect(
+      [...one.sites, ...two.sites, ...three.sites].map((site) => [
+        site.locationNumber,
+        site.locationTypeCode,
+        site.radiusKm,
+      ]),
+    ).toEqual([
+      [2, 'M', 4],
+      [6, 'M', 8],
+      [6, 'M', 12],
+    ]);
+  });
+
+  it('returns an empty page that still counts the matches for a cursor past the last site', async () => {
+    const cursor = forgeCursor(FIXTURE_GENERATION_ID, 't', 99, 9999, 1, 1);
+    const result = page(await run({ ...CENTER, location_type: 'M', cursor }));
+    expect(result).toMatchObject({ sites: [], totalCount: 3, shown: 0, truncated: false });
+    expect(result.nextCursor).toBeUndefined();
+    expect(result.notice).toBeUndefined();
+  });
+
+  it('names dropping location_type among the ways to widen a search that finds nothing', async () => {
+    const result = await run({ ...CENTER, location_type: '6' });
+    const structured = page(result);
+    expect(structured).toMatchObject({ totalCount: 0, sites: [] });
+    expect(structured.appliedFilters).toMatchObject({ location_type: '6' });
+    expect(structured.notice).toBe(
+      `No transmitter site within 5 km matches these filters; raise radius_km (max 100), drop location_type, or pass status "any". ${MARKET_HINT}`,
+    );
+    expect(contractText(result)).toContain(`> ${structured.notice}`);
+
+    const widest = page(
+      await run({ ...CENTER, location_type: '6', radius_km: 100, status: 'any' }),
+    );
+    expect(widest.notice).toBe(
+      `No transmitter site within 100 km matches these filters; drop location_type. ${MARKET_HINT}`,
+    );
+  });
 });
 
 describe('format()', () => {
@@ -618,9 +817,11 @@ describe('format()', () => {
     licenseeRedacted: false,
     locationNumber: 1,
     locationTypeCode: 'F',
+    locationTypeLabel: 'Fixed',
     distanceKm: 1.5,
     latitude: 47.5,
     longitude: -122.25,
+    radiusKm: 2.5,
     groundElevationM: 50.3,
     overallHeightM: 45.5,
     asrNumber: '1012345',
@@ -649,8 +850,8 @@ describe('format()', () => {
       '## Transmitter sites (1 on this page)',
       '### 1.5 km · KZZ 077 · USI 77 · location 1',
       '- **Licensee:** Acme Radio Co · **Redacted:** no · **Lease:** yes',
-      '- **Status:** A · **Service:** CD (Paging and Radiotelephone) · **Location type:** F',
-      '- **Coordinates:** 47.5, -122.25 · **Ground elevation:** 50.3 m · **Overall height:** 45.5 m · **ASR:** 1012345',
+      '- **Status:** A · **Service:** CD (Paging and Radiotelephone) · **Location type:** F (Fixed)',
+      '- **Coordinates:** 47.5, -122.25 · **Radius of operation:** 2.5 km · **Ground elevation:** 50.3 m · **Overall height:** 45.5 m · **ASR:** 1012345',
       '- **Place:** KI NG, WA (state as filed)',
       '- **Frequencies:** 1 of 3 listed',
     ]) {
@@ -702,6 +903,8 @@ describe('format()', () => {
     );
     expect(rows).toContain('- **Place:** WA (state derived from coordinates)');
     expect(rows.filter((line) => line.startsWith('- **Place:**'))).toHaveLength(1);
+    expect(rendered).not.toContain('**Location type:**');
+    expect(rendered).not.toContain('**Radius of operation:**');
     expect(rendered).not.toContain('| Frequency MHz');
     expect(rendered.endsWith('**nextCursor:** abc_DEF-1')).toBe(true);
   });

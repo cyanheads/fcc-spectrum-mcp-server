@@ -15,12 +15,15 @@ import {
   latitudeSchema,
   licenseStatusSchema,
   liveStatusSchema,
+  locationTypeSchema,
   longitudeSchema,
+  marketCodeSchema,
   radioServiceSchema,
   stateSchema,
   unitSchema,
   usiSchema,
 } from '@/mcp-server/tools/input-schemas.js';
+import { LOCATION_TYPES } from '@/services/uls/codes.js';
 
 /** Parse and return the value, or `undefined` for a rejection. */
 function accepted(schema: z.ZodType, value: unknown): unknown {
@@ -57,6 +60,36 @@ describe('frnSchema', () => {
     expect(frnSchema.safeParse('12345678901').success).toBe(false);
     expect(frnSchema.safeParse('12AB').success).toBe(false);
     expect(frnSchema.safeParse('').success).toBe(false);
+  });
+});
+
+describe('marketCodeSchema', () => {
+  it.each([
+    ['pea16', 'PEA016'],
+    [' PEA 016 ', 'PEA016'],
+    ['pea-016', 'PEA016'],
+    ['cma20', 'CMA020'],
+    ['d6037', 'D06037'],
+    ['P127', 'P00127'],
+    ['tl4', 'TL0004'],
+    ['TL0004', 'TL0004'],
+    ['nw', 'NW'],
+    ['NW', 'NW'],
+  ])('reads %j as %s', (input, code) => {
+    expect(accepted(marketCodeSchema, input)).toBe(code);
+  });
+
+  it.each([
+    ['a name', 'Seattle'],
+    ['digits past six characters', 'PEA0016'],
+    ['digits alone', '16'],
+    ['letters alone, other than NW', 'PEA'],
+    ['four letters', 'ABCD12'],
+    ['letters after digits', 'PEA16A'],
+    ['an empty string', ''],
+    ['a number', 16],
+  ])('rejects %s', (_label, input) => {
+    expect(marketCodeSchema.safeParse(input).success).toBe(false);
   });
 });
 
@@ -101,6 +134,27 @@ describe('radioServiceSchema', () => {
     expect(radioServiceSchema.safeParse('C').success).toBe(false);
     expect(radioServiceSchema.safeParse('CDX').success).toBe(false);
     expect(radioServiceSchema.safeParse('C-').success).toBe(false);
+  });
+});
+
+describe('locationTypeSchema', () => {
+  it('trims and uppercases to a code in the FCC table, every code accepted', () => {
+    expect(accepted(locationTypeSchema, ' f ')).toBe('F');
+    expect(accepted(locationTypeSchema, 'm')).toBe('M');
+    for (const code of Object.keys(LOCATION_TYPES)) {
+      expect(accepted(locationTypeSchema, code.toLowerCase())).toBe(code);
+    }
+  });
+
+  it('advertises exactly the FCC codes', () => {
+    const schema = z.toJSONSchema(locationTypeSchema, { io: 'input' }) as { enum?: string[] };
+    expect(schema.enum?.toSorted()).toEqual(Object.keys(LOCATION_TYPES).toSorted());
+  });
+
+  it('rejects an unknown code, a label, a code list, a blank, and a non-string', () => {
+    for (const value of ['Z', 'Mobile', 'F,M', 'FM', '', 6]) {
+      expect(locationTypeSchema.safeParse(value).success, String(value)).toBe(false);
+    }
   });
 });
 

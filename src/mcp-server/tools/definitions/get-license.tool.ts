@@ -114,7 +114,12 @@ const SiteSchema = z
       .string()
       .optional()
       .describe('Structure type code, as filed (e.g. TOWER, BTWR).'),
-    asrNumber: z.string().optional().describe('FCC Antenna Structure Registration number.'),
+    asrNumber: z
+      .string()
+      .optional()
+      .describe(
+        'FCC Antenna Structure Registration number: seven digits, never the 9999999 placeholder; omitted when the filing holds anything else (the placeholder, N/A, an application file number).',
+      ),
     radiusKm: z.number().optional().describe('Radius of operation for an area location, km.'),
     address: z
       .string()
@@ -134,7 +139,12 @@ const SiteSchema = z
       .boolean()
       .optional()
       .describe('True when state was derived from the coordinates rather than filed.'),
-    name: z.string().optional().describe('Location name, as filed.'),
+    name: z
+      .string()
+      .optional()
+      .describe(
+        "Site name, as filed; omitted on an individual licensee's record while redaction is on.",
+      ),
   })
   .describe('One filed site.');
 
@@ -282,7 +292,7 @@ const LicenseSchema = z
 
 export const getLicense = tool('fcc_spectrum_get_license', {
   title: 'Get an FCC ULS license',
-  description: `Fetch one FCC ULS license or spectrum lease in full by callsign or unique system identifier (USI): licensee (the lessee on a lease), status and key dates, its locations with coordinates, elevation, structure height, and ASR number, each location's antennas, and each antenna's authorized frequencies with power, ERP/EIRP, station class, transmitter, and emission designators; geographic-area licenses list their market and spectrum blocks, and lease links are shown in both directions. Large records are paged: one call lists whole locations up to ${LICENSE_PAGE.sites} sites and ${LICENSE_PAGE.antennas} antennas, up to max_frequencies frequency rows, and ${LICENSE_PAGE.leases} leases, and names the location_offset or lease_offset that reads the rest. Technical detail is kept for active, pending-legal, and term-pending records only. A callsign shared by several records returns the active one, else the most recent.`,
+  description: `Fetch one FCC ULS license or spectrum lease in full by callsign or unique system identifier (USI): licensee (the lessee on a lease), status and key dates, its locations with coordinates, elevation, structure height, and ASR number, each location's antennas, and each antenna's authorized frequencies with power, ERP/EIRP, station class, transmitter, and emission designators; geographic-area licenses list their market and spectrum blocks, and lease links are shown in both directions. Large records are paged: one call lists whole locations up to ${LICENSE_PAGE.sites} sites and ${LICENSE_PAGE.antennas} antennas, up to max_frequencies frequency rows, and ${LICENSE_PAGE.leases} leases, and names the location_offset or lease_offset that reads the rest; location_number starts the locations at a location number the search tools return. Technical detail is kept for active, pending-legal, and term-pending records only. A callsign shared by several records returns the active one, else the most recent.`,
   annotations: { readOnlyHint: true, idempotentHint: true, openWorldHint: false },
   input: z.object({
     callsign: blankAsUnset(callsignSchema.optional()).describe(
@@ -306,7 +316,15 @@ export const getLicense = tool('fcc_spectrum_get_license', {
       .min(0)
       .default(0)
       .describe(
-        'Location to start at, counted from 0 in location-number order; pass nextLocationOffset from the previous call to read the next locations.',
+        'Location to start at, counted from 0 in location-number order; pass nextLocationOffset from the previous call to read the next locations. To start at a location number instead, pass location_number.',
+      ),
+    location_number: z
+      .number()
+      .int()
+      .min(0)
+      .optional()
+      .describe(
+        'Location number to start at: the locationNumber of a fcc_spectrum_find_transmitters or fcc_spectrum_search_frequencies result. A number the record does not file starts at the next one it does. Pass this or a nonzero location_offset, not both; page on with nextLocationOffset.',
       ),
     lease_offset: z
       .number()
@@ -350,7 +368,7 @@ export const getLicense = tool('fcc_spectrum_get_license', {
       .array(LocationSchema)
       .optional()
       .describe(
-        `Locations with antennas and frequency rows, one entry per location number (a number filed at several sites lists them in sites): whole locations from location_offset up to ${LICENSE_PAGE.sites} sites and ${LICENSE_PAGE.antennas} antennas, or one larger location alone; present when found is true.`,
+        `Locations with antennas and frequency rows, one entry per location number (a number filed at several sites lists them in sites): whole locations from location_offset or location_number up to ${LICENSE_PAGE.sites} sites and ${LICENSE_PAGE.antennas} antennas, or one larger location alone; present when found is true.`,
       ),
     locationTotal: z
       .number()
@@ -403,7 +421,7 @@ export const getLicense = tool('fcc_spectrum_get_license', {
       .string()
       .optional()
       .describe(
-        'What this call left out and the call that reads it, or why an offset listed nothing.',
+        'What this call left out and the call that reads it, where an unfiled location_number started the locations, or why an offset or location number listed nothing.',
       ),
   },
   errors: [
@@ -421,6 +439,13 @@ export const getLicense = tool('fcc_spectrum_get_license', {
       when: 'Neither or both of callsign and usi were supplied.',
       recovery:
         "Pass exactly one of callsign or usi; find a record's USI with fcc_spectrum_search_licenses.",
+    },
+    {
+      reason: 'location_start_conflict',
+      code: JsonRpcErrorCode.ValidationError,
+      when: 'location_number was supplied with a nonzero location_offset.',
+      recovery:
+        'Pass location_number or location_offset, not both, then page on with nextLocationOffset.',
     },
   ],
 
@@ -440,11 +465,21 @@ export const getLicense = tool('fcc_spectrum_get_license', {
           ? { usi: input.usi }
           : undefined;
     if (!lookup) throw ctx.fail('identifier_required', 'Neither callsign nor usi was given.');
+    // The schema default makes an omitted location_offset 0, so only a nonzero one conflicts.
+    const requested = input.location_number;
+    if (requested !== undefined && input.location_offset > 0) {
+      throw ctx.fail(
+        'location_start_conflict',
+        'Both location_number and a nonzero location_offset were given; pass only one.',
+      );
+    }
 
     const result = await index.getLicense({
       ...lookup,
+      ...(requested !== undefined
+        ? { locationNumber: requested }
+        : { locationOffset: input.location_offset }),
       maxFrequencies: input.max_frequencies,
-      locationOffset: input.location_offset,
       leaseOffset: input.lease_offset,
     });
     if (!result.found) {
@@ -461,18 +496,24 @@ export const getLicense = tool('fcc_spectrum_get_license', {
     }
 
     ctx.enrich({ shown: result.frequenciesShown });
-    const { license, locations } = result;
+    const { license, locations, locationOffset } = result;
+    const firstListed = locations[0]?.locationNumber;
+    const unfiledStart =
+      requested !== undefined &&
+      firstListed !== undefined &&
+      firstListed !== requested &&
+      `Location ${requested} is not filed on this record; listing from location ${firstListed} (location_offset ${locationOffset}).`;
     const omitted: string[] = [];
     if (result.nextLocationOffset !== undefined) {
       omitted.push(
-        `Listing ${locations.length} of ${result.locationTotal} locations (${result.sitesShown} of ${result.siteTotal} sites) from location_offset ${input.location_offset}; one call lists at most ${LICENSE_PAGE.sites} sites and ${LICENSE_PAGE.antennas} antennas. Call fcc_spectrum_get_license with usi "${license.usi}" and location_offset ${result.nextLocationOffset} for the next locations.`,
+        `Listing ${locations.length} of ${result.locationTotal} locations (${result.sitesShown} of ${result.siteTotal} sites) from location_offset ${locationOffset}; one call lists at most ${LICENSE_PAGE.sites} sites and ${LICENSE_PAGE.antennas} antennas. Call fcc_spectrum_get_license with usi "${license.usi}" and location_offset ${result.nextLocationOffset} for the next locations.`,
       );
     }
     if (result.windowFrequencyTotal > result.frequenciesShown) {
       const belowCeiling = input.max_frequencies < 1000;
       const cut = result.frequencyCutAt;
       const remedy =
-        cut && cut.offset > input.location_offset
+        cut && cut.offset > locationOffset
           ? `Rows are missing from location ${cut.locationNumber} on; call again with location_offset ${cut.offset} to start there${belowCeiling ? ', or raise max_frequencies (up to 1000)' : ''}.`
           : belowCeiling
             ? 'Raise max_frequencies (up to 1000) to see more.'
@@ -486,15 +527,23 @@ export const getLicense = tool('fcc_spectrum_get_license', {
         `Listing leases ${input.lease_offset + 1}–${input.lease_offset + license.leases.length} of ${license.leaseCount}; call fcc_spectrum_get_license with usi "${license.usi}" and lease_offset ${result.nextLeaseOffset} for the next ones.`,
       );
     }
+    const { lastLocationNumber } = result;
     const pastEnd = [
-      input.location_offset > 0 &&
-        locations.length === 0 &&
-        `location_offset ${input.location_offset} is past the last location; this record has ${result.locationTotal}.`,
+      requested === undefined
+        ? input.location_offset > 0 &&
+          locations.length === 0 &&
+          `location_offset ${input.location_offset} is past the last location; this record has ${result.locationTotal}.`
+        : locations.length === 0 &&
+          (lastLocationNumber === undefined
+            ? `Location ${requested} is not filed; this record has 0 locations.`
+            : `Location ${requested} is past the last filed location, ${lastLocationNumber}; this record has ${result.locationTotal} locations.`),
       input.lease_offset > 0 &&
         license.leases.length === 0 &&
         `lease_offset ${input.lease_offset} is past the last lease; this record has ${license.leaseCount}.`,
-    ].filter((fragment): fragment is string => Boolean(fragment));
-    const notice = [...omitted, ...pastEnd].join(' ');
+    ];
+    const notice = [unfiledStart, ...omitted, ...pastEnd]
+      .filter((fragment): fragment is string => Boolean(fragment))
+      .join(' ');
     if (omitted.length) {
       ctx.enrich.truncated({
         shown: result.frequenciesShown,

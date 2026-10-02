@@ -3,17 +3,19 @@
  * the fixture zips: cold-index behavior (not ready, building, failed build, dangling and
  * malformed pointer), stored errors and read failures (an unreadable pointer, a generation
  * that will not open) kept free of the mirror path, readiness and service
- * codes, `searchLicenses`, `getLicense`, `findTransmitters`, `searchFrequencies` (redaction
- * on and off), and the switch to a newly published generation.
+ * codes, `searchLicenses`, `getLicense` (from a location offset or number), `findTransmitters`,
+ * `searchFrequencies` (redaction on and off, site names and addresses included), the ASR
+ * registration-number rule, operating areas (location type, radius of operation, and the
+ * location type filter), and the switch to a newly published generation.
  * @module tests/services/uls/uls-index-service.test
  */
 
-import { chmod, mkdir, writeFile } from 'node:fs/promises';
+import { chmod, mkdir, rename, rm, writeFile } from 'node:fs/promises';
 import { join } from 'node:path';
 import { JsonRpcErrorCode, McpError } from '@cyanheads/mcp-ts-core/errors';
 import { logger } from '@cyanheads/mcp-ts-core/utils';
 import { afterAll, beforeAll, describe, expect, it, vi } from 'vitest';
-import { SERVICE_GROUPS } from '@/services/uls/codes.js';
+import { SERVICE_GROUPS, USPS_CODES } from '@/services/uls/codes.js';
 import {
   createUlsStore,
   LOCK_FILE,
@@ -33,11 +35,16 @@ import type {
 } from '@/services/uls/types.js';
 import { radioServiceLabel, UlsIndexService } from '@/services/uls/uls-index-service.js';
 import {
+  AREA_SITES_WEEKLY,
   BAND_CLASS_WEEKLY,
   DAILY_PG_MON,
   FakeIngestClient,
+  INDIVIDUAL_SITES_WEEKLY,
+  MARKET_CODES_WEEKLY,
+  MARKET_STATES_WEEKLY,
   PAGING_WEEKLY,
   QUIRKS_WEEKLY,
+  sprawlingPagingWeekly,
 } from '../../fixtures/uls-fixtures.js';
 import {
   buildFixtureIndex,
@@ -312,6 +319,48 @@ describe('cold index', () => {
     expect(await service.ready()).toBe(true);
     expect((await service.coverage()).index.error).toBeUndefined();
     expect(await ingester.rebuild()).toMatchObject({ status: 'skipped' });
+  });
+
+  it('serves a schema 4 generation once it has added the market-code index in place', async () => {
+    const { mirror, service } = await coldService();
+    const { generation } = await fixtureIngester(mirror, {
+      client: new FakeIngestClient().set('complete/l_paging.zip', MARKET_CODES_WEEKLY),
+      groups: ['paging'],
+    }).rebuild();
+    const path = join(mirror.mirrorDir, generation);
+    const v4 = createUlsStore(path);
+    try {
+      // The schema 4 layout: no market-code index, stamped version 4.
+      (await v4.raw()).exec(
+        'DROP INDEX licenses_market_code; UPDATE schema_version SET version = 4;',
+      );
+    } finally {
+      await v4.close();
+    }
+
+    expect(await service.ready()).toBe(true);
+    expect(
+      usis(page(await service.searchLicenses(licenses({ marketCode: 'PEA016' }))).rows),
+    ).toEqual(['8003', '8004', '8006']);
+    const upgraded = createUlsStore(path);
+    try {
+      const db = await upgraded.raw();
+      expect(db.prepare<{ version: number }>('SELECT version FROM schema_version').get()).toEqual({
+        version: 5,
+      });
+      expect(
+        db.prepare('SELECT 1 FROM meta WHERE key = ?').get(META_KEYS.rebuildRequired),
+      ).toBeFalsy();
+      const plan = db
+        .prepare<{ detail: string }>(
+          "EXPLAIN QUERY PLAN SELECT usi FROM licenses WHERE market_code = 'PEA016'",
+        )
+        .all()
+        .map((row) => row.detail);
+      expect(plan.join(' ')).toContain('licenses_market_code');
+    } finally {
+      await upgraded.close();
+    }
   });
 
   it('reports a malformed pointer without its path, logs the path once, and recovers once mirror:init republishes', async () => {
@@ -894,7 +943,7 @@ describe('getLicense', () => {
   it('returns market blocks in frequency order, a blank partition included', async () => {
     const result = await on.getLicense({ usi: '2001', maxFrequencies: 100 });
     expect(result.found && result.license.market).toEqual({
-      marketCode: 'BTA144',
+      marketCode: 'BTA138',
       marketName: 'Fargo-Moorhead, ND-MN',
       channelBlock: 'A1',
       blocks: [
@@ -942,18 +991,28 @@ describe('getLicense', () => {
     });
   });
 
-  it("omits an individual's site address only while redacting", async () => {
+  it("omits an individual's site address and site name only while redacting", async () => {
     const redacted = await on.getLicense({ callsign: 'KZZ903', maxFrequencies: 10 });
     if (!redacted.found) throw new Error('expected a record');
     expect(redacted.locations[0]).not.toHaveProperty('address');
+    expect(redacted.locations[0]).not.toHaveProperty('name');
     expect(redacted.locations[0]).toMatchObject({
       city: 'SPOKANE',
       state: 'WA',
       stateFromCoordinates: false,
     });
     expect(redacted.license.licensee).toMatchObject({ name: null, redacted: true });
+    expect(JSON.stringify(redacted)).not.toContain('Pat Q Example');
     const open = await off.getLicense({ callsign: 'KZZ903', maxFrequencies: 10 });
-    expect(open.found && open.locations[0]?.address).toBe('42 Private Lane');
+    expect(open.found && open.locations[0]).toMatchObject({
+      address: '42 Private Lane',
+      name: 'Pat Q Example',
+    });
+  });
+
+  it("returns an organization's site names while redacting", async () => {
+    const result = await on.getLicense({ callsign: 'KZZ901', maxFrequencies: 10 });
+    expect(result.found && result.locations[0]?.name).toBe('Seattle Hill');
   });
 
   it('caps frequency rows by dropping the last location first', async () => {
@@ -1008,6 +1067,85 @@ describe('getLicense', () => {
       { frequencyMhz: 929.5, stationClass: 'FB', emissions: ['XYZ'] },
     ]);
     expect(result.locations[0]).not.toHaveProperty('state');
+  });
+});
+
+describe('getLicense from a location number', () => {
+  let gapped: FixtureIndex;
+  let service: UlsIndexService;
+  /** Sites at 0–59 and 70–129, and 135 filed on antenna and frequency rows alone. */
+  const numbers = [
+    ...Array.from({ length: 60 }, (_, i) => i),
+    ...Array.from({ length: 60 }, (_, i) => i + 70),
+  ];
+
+  beforeAll(async () => {
+    gapped = await buildFixtureIndex({
+      weekly: {
+        paging: sprawlingPagingWeekly({
+          locations: numbers,
+          siteless: [135],
+          sitesAtFirst: 1,
+          antennasPerLocation: 2,
+          leases: 0,
+        }),
+      },
+    });
+    service = gapped.service();
+  });
+  afterAll(async () => {
+    await gapped?.dispose();
+  });
+
+  const byNumber = (locationNumber: number) =>
+    service.getLicense({ usi: '7001', maxFrequencies: 100, locationNumber });
+  const byOffset = (locationOffset: number) =>
+    service.getLicense({ usi: '7001', maxFrequencies: 100, locationOffset });
+
+  it.each([
+    [0, 0],
+    [55, 55],
+    [70, 60],
+    [110, 100],
+    [135, 120],
+  ])('starts at filed location %i as location_offset %i does', async (number, offset) => {
+    const result = await byNumber(number);
+    expect(result).toEqual(await byOffset(offset));
+    if (!result.found) throw new Error('Expected KZZ701.');
+    expect(result.locations[0]?.locationNumber).toBe(number);
+    expect(result).toMatchObject({ locationOffset: offset, lastLocationNumber: 135 });
+  });
+
+  it.each([
+    [60, 60, 70],
+    [131, 120, 135],
+  ])(
+    'starts unfiled location %i at the next filed one, offset %i',
+    async (number, offset, next) => {
+      const result = await byNumber(number);
+      expect(result).toEqual(await byOffset(offset));
+      expect(result.found && result.locations[0]?.locationNumber).toBe(next);
+    },
+  );
+
+  it('lists nothing past the last filed location', async () => {
+    const result = await byNumber(136);
+    expect(result).toMatchObject({
+      found: true,
+      locations: [],
+      locationOffset: 121,
+      locationTotal: 121,
+      lastLocationNumber: 135,
+      frequenciesShown: 0,
+      windowFrequencyTotal: 0,
+    });
+    expect(result).not.toHaveProperty('nextLocationOffset');
+  });
+
+  it('reports the offset it was given when it starts from one', async () => {
+    expect(await byOffset(50)).toMatchObject({ locationOffset: 50, nextLocationOffset: 100 });
+    const plain = await service.getLicense({ usi: '7001', maxFrequencies: 100 });
+    expect(plain).toMatchObject({ locationOffset: 0, nextLocationOffset: 50 });
   });
 });
 
@@ -1176,7 +1314,7 @@ describe('searchFrequencies', () => {
       licenseeRedacted: false,
       frequencyMhz: 2496,
       upperMhz: 2502,
-      marketCode: 'BTA144',
+      marketCode: 'BTA138',
       marketName: 'Fargo-Moorhead, ND-MN',
       channelBlock: 'A1',
       partitionAreaIds: [1],
@@ -1421,6 +1559,106 @@ describe('searchFrequencies band walk', () => {
   });
 });
 
+describe('searchFrequencies market blocks by state', () => {
+  let markets: FixtureIndex;
+  let service: UlsIndexService;
+  beforeAll(async () => {
+    markets = await buildFixtureIndex({
+      groups: ['paging'],
+      weekly: { paging: MARKET_STATES_WEEKLY },
+    });
+    service = markets.service();
+  });
+  afterAll(async () => {
+    await markets?.dispose();
+  });
+
+  /** USIs of the 705 MHz market blocks a state matches. */
+  const inState = async (state: string) =>
+    usis(
+      page(await service.searchFrequencies(frequencies({ band: band(705), kind: 'market', state })))
+        .rows,
+    );
+
+  it('matches a code the area table does not list by the state code in its name', async () => {
+    expect(await inState('GA')).toEqual(['7004']);
+  });
+
+  it('never reads a leading state name: Washington-Baltimore is not in WA', async () => {
+    expect(await inState('WA')).not.toContain('7001');
+  });
+
+  it.each(['DC', 'MD', 'PA', 'VA', 'WV'])(
+    'matches MTA010, which names no state, in %s by the FCC area table',
+    async (state) => {
+      expect(await inState(state)).toContain('7001');
+    },
+  );
+
+  it.each(['CT', 'MA', 'NJ', 'NY', 'PA', 'VT'])(
+    'matches BEA010, its name cut before its states, in %s',
+    async (state) => {
+      expect(await inState(state)).toContain('7002');
+    },
+  );
+
+  it('matches a county-coded market by its FIPS state prefix', async () => {
+    expect(await inState('AK')).toEqual(['7003']);
+  });
+
+  it.each(['TX', 'OK'])(
+    'matches a P35 GSA in %s, where its license files a site',
+    async (state) => {
+      expect(await inState(state)).toEqual(['7005']);
+    },
+  );
+
+  it('matches the rural CMA by the area table and skips the nationwide lease filing a WA site', async () => {
+    expect(await inState('WA')).toEqual(['7010']);
+  });
+
+  it('matches nationwide and Gulf of Mexico markets in no state even where they file a site, and a Tribal land market without a site in none', async () => {
+    const unmatched = ['7006', '7007', '7008', '7009'];
+    for (const state of USPS_CODES) {
+      const rows = await inState(state);
+      expect(
+        rows.filter((usi) => unmatched.includes(usi)),
+        state,
+      ).toEqual([]);
+    }
+    expect(await inState('LA')).toEqual([]);
+  });
+
+  it('pages a state with several matching blocks past the first page', async () => {
+    const { pages, rows, total } = await allPages((cursor) =>
+      service.searchFrequencies(
+        frequencies({ band: band(705), kind: 'market', state: 'PA', limit: 1, cursor }),
+      ),
+    );
+    expect({ pages, total, rows: usis(rows) }).toEqual({
+      pages: 2,
+      total: 2,
+      rows: ['7001', '7002'],
+    });
+  });
+
+  it('walks the band to exactly the rows of the exact search', async () => {
+    const walker = markets.service({ frequencySearch: WALK_LIMITS });
+    for (const state of ['PA', 'WA', 'TX', 'AK', 'LA']) {
+      const exact = page(
+        await service.searchFrequencies(
+          frequencies({ band: band(0.001, 300_000), kind: 'both', state, limit: 200 }),
+        ),
+      );
+      const walked = await walkFrequencies(
+        walker,
+        frequencies({ band: band(0.001, 300_000), kind: 'both', state, limit: 1 }),
+      );
+      expect(walked.rows, state).toEqual(exact.rows);
+    }
+  });
+});
+
 describe('generation switch', () => {
   it('picks up a newly published generation and rejects cursors from the old one', async () => {
     const index = await buildFixtureIndex({ groups: ['paging'] });
@@ -1489,6 +1727,33 @@ describe('generation switch', () => {
       clock = 60_000;
       expect((await service.coverage()).index.generation).toBe('fcc-uls-20261004T133855Z.db');
     } finally {
+      await service.close();
+      await index.dispose();
+    }
+  });
+
+  it('opens the generation again on the next call after a failed open, not a pointer check later', async () => {
+    const index = await buildFixtureIndex({ groups: ['paging'] });
+    const generationPath = join(index.mirrorDir, FIXTURE_GENERATION);
+    const service = new UlsIndexService({
+      mirrorDir: index.mirrorDir,
+      pointerCheckMs: 60_000,
+      now: () => 0,
+      redactIndividuals: true,
+      services: ['paging'],
+    });
+    vi.spyOn(logger, 'error').mockImplementation(() => {});
+    try {
+      // A directory in the generation's place fails the open, as a write lock held past the
+      // busy timeout (another process migrating the generation) does.
+      await rename(generationPath, `${generationPath}.aside`);
+      await mkdir(generationPath);
+      await expect(service.ready()).rejects.toThrow(/could not be read/);
+      await rm(generationPath, { recursive: true });
+      await rename(`${generationPath}.aside`, generationPath);
+      expect(await service.ready()).toBe(true);
+    } finally {
+      vi.mocked(logger.error).mockRestore();
       await service.close();
       await index.dispose();
     }
@@ -1746,6 +2011,208 @@ describe('filing quirks', () => {
       ]);
       expect(single.rows[0]).not.toHaveProperty('sitesSharingNumber');
     });
+  });
+
+  describe('an ASR field holding something other than a registration number', () => {
+    it('omits it from get_license, at a single site and at each site sharing a number', async () => {
+      const result = await service.getLicense({ usi: '5005', maxFrequencies: 100 });
+      if (!result.found) throw new Error('Expected KZZ505.');
+      const [shared, single] = result.locations;
+      for (const site of shared?.sites ?? []) expect(site).not.toHaveProperty('asrNumber');
+      expect(shared?.sites).toHaveLength(2);
+      expect(single?.asrNumber).toBe('1012345');
+
+      const filed = await service.getLicense({ usi: '5002', maxFrequencies: 100 });
+      if (!filed.found) throw new Error('Expected KZZ502.');
+      expect(filed.locations[0]).not.toHaveProperty('asrNumber');
+      expect(filed.locations[0]?.locationNumber).toBe(1);
+    });
+
+    it('omits it from find_transmitters rows and keeps a seven-digit number', async () => {
+      const BETWEEN = { latitude: dms(47, 40, 0), longitude: dms(122, 21, 0, true) };
+      const shared = page(
+        await service.findTransmitters(transmitters({ ...BETWEEN, radiusKm: 2 })),
+      );
+      expect(shared.rows).toHaveLength(2);
+      for (const row of shared.rows) expect(row).not.toHaveProperty('asrNumber');
+
+      const near = (latitude: number, longitude: number) =>
+        service.findTransmitters(transmitters({ latitude, longitude, radiusKm: 0.5 }));
+      const single = page(await near(dms(47, 36, 0), dms(122, 12, 0, true)));
+      expect(single.rows).toEqual([
+        expect.objectContaining({ usi: '5005', locationNumber: 2, asrNumber: '1012345' }),
+      ]);
+      const fileNumber = page(await near(dms(47, 31, 0), dms(122, 31, 0, true)));
+      expect(fileNumber.rows).toEqual([expect.objectContaining({ usi: '5002' })]);
+      expect(fileNumber.rows[0]).not.toHaveProperty('asrNumber');
+    });
+  });
+});
+
+describe('locations filed as an operating area', () => {
+  /** Location 1 of KZZ531; every other number sits due north of it. */
+  const CENTER = { latitude: 46, longitude: -119 };
+  const siteKey = (row: TransmitterSite) => `${row.locationNumber}:${row.locationTypeCode ?? '-'}`;
+
+  let areas: FixtureIndex;
+  let service: UlsIndexService;
+  beforeAll(async () => {
+    areas = await buildFixtureIndex({ groups: ['paging'], weekly: { paging: AREA_SITES_WEEKLY } });
+    service = areas.service();
+  });
+  afterAll(async () => {
+    await areas?.dispose();
+  });
+
+  const near = (overrides: Partial<FindTransmittersParams> = {}) =>
+    service.findTransmitters(transmitters({ ...CENTER, ...overrides }));
+
+  it('returns every location type at its filed coordinates, ranked by their distance', async () => {
+    const result = page(await near());
+    expect(result.total).toBe(7);
+    expect(result.rows.map(siteKey)).toEqual(['1:F', '2:M', '3:T', '4:F', '5:-', '6:M', '6:M']);
+    const distances = result.rows.map((row) => row.distanceKm);
+    expect(distances).toEqual([...distances].sort((a, b) => a - b));
+    const [fixed, mobile] = result.rows;
+    expect(fixed?.distanceKm).toBe(0);
+    expect(mobile).toMatchObject({ latitude: expect.closeTo(dms(46, 0, 30), 9), longitude: -119 });
+    expect(mobile?.distanceKm).toBeCloseTo(0.927, 3);
+  });
+
+  it('labels each location type and carries a filed radius whatever the type', async () => {
+    const result = page(await near());
+    expect(
+      result.rows.map((row) => [row.locationTypeCode, row.locationTypeLabel, row.radiusKm]),
+    ).toEqual([
+      ['F', 'Fixed', undefined],
+      ['M', 'Mobile', 4],
+      ['T', 'Temporary Fixed', 80.5],
+      ['F', 'Fixed', 1.5],
+      [undefined, undefined, undefined],
+      ['M', 'Mobile', 8],
+      ['M', 'Mobile', 12],
+    ]);
+    const [fixed, , , , untyped, shared] = result.rows;
+    expect(fixed).not.toHaveProperty('radiusKm');
+    for (const field of ['locationTypeCode', 'locationTypeLabel', 'radiusKm']) {
+      expect(untyped).not.toHaveProperty(field);
+    }
+    expect(shared).toMatchObject({ sitesSharingNumber: 2, radiusKm: 8 });
+  });
+
+  it('keeps one location type, counts only its rows, and pages through them', async () => {
+    const fixed = page(await near({ locationType: 'F' }));
+    expect([fixed.total, fixed.rows.map(siteKey)]).toEqual([2, ['1:F', '4:F']]);
+    const temporary = page(await near({ locationType: 'T' }));
+    expect([temporary.total, temporary.rows.map(siteKey)]).toEqual([1, ['3:T']]);
+
+    const mobile = await allPages((cursor) => near({ locationType: 'M', limit: 1, cursor }));
+    expect([mobile.pages, mobile.total]).toEqual([3, 3]);
+    expect(mobile.rows.map((row) => [row.locationNumber, row.radiusKm])).toEqual([
+      [2, 4],
+      [6, 8],
+      [6, 12],
+    ]);
+
+    // The types partition the unfiltered set: F, M, T, and the one untyped site.
+    expect(fixed.total + mobile.total + temporary.total + 1).toBe(page(await near()).total);
+    expect(page(await near({ locationType: '6' }))).toEqual({ ok: true, rows: [], total: 0 });
+  });
+
+  it('combines the location type with a band', async () => {
+    const mobile = page(await near({ locationType: 'M', band: band(458.5) }));
+    expect(mobile.rows.map(siteKey)).toEqual(['6:M', '6:M']);
+    expect(page(await near({ locationType: 'F', band: band(458.5) })).total).toBe(0);
+  });
+
+  it("returns a shared location number's frequency without coordinates, type, or radius", async () => {
+    for (const state of [undefined, 'WA']) {
+      const result = page(
+        await service.searchFrequencies(frequencies({ band: band(458.5), kind: 'site', state })),
+      );
+      expect(result.rows, state).toEqual([
+        expect.objectContaining({ locationNumber: 6, sitesSharingNumber: 2 }),
+      ]);
+      for (const field of ['latitude', 'locationTypeCode', 'locationTypeLabel', 'radiusKm']) {
+        expect(result.rows[0], `${state} ${field}`).not.toHaveProperty(field);
+      }
+    }
+  });
+
+  it('carries the location type and a filed radius on single-site frequency rows', async () => {
+    const at = async (mhz: number, state?: string) => {
+      const result = page(
+        await service.searchFrequencies(frequencies({ band: band(mhz), kind: 'site', state })),
+      );
+      expect(result.rows).toHaveLength(1);
+      return result.rows[0];
+    };
+    for (const state of [undefined, 'WA']) {
+      expect(await at(456.0125, state), state).toMatchObject({
+        locationNumber: 2,
+        locationTypeCode: 'M',
+        locationTypeLabel: 'Mobile',
+        radiusKm: 4,
+        latitude: expect.closeTo(dms(46, 0, 30), 9),
+      });
+    }
+    expect(await at(457.5)).toMatchObject({ locationTypeCode: 'T', radiusKm: 80.5 });
+    expect(await at(452.5)).toMatchObject({ locationTypeLabel: 'Fixed', radiusKm: 1.5 });
+    const fixed = await at(451.0125);
+    expect(fixed).toMatchObject({ locationTypeCode: 'F', locationTypeLabel: 'Fixed' });
+    expect(fixed).not.toHaveProperty('radiusKm');
+    const untyped = await at(453.5);
+    expect(untyped).toMatchObject({
+      locationNumber: 5,
+      latitude: expect.closeTo(dms(46, 2, 0), 9),
+    });
+    for (const field of ['locationTypeCode', 'locationTypeLabel', 'radiusKm']) {
+      expect(untyped).not.toHaveProperty(field);
+    }
+  });
+});
+
+describe('an individual whose sites file names', () => {
+  let individual: FixtureIndex;
+  beforeAll(async () => {
+    individual = await buildFixtureIndex({
+      groups: ['paging'],
+      weekly: { paging: INDIVIDUAL_SITES_WEEKLY },
+    });
+  });
+  afterAll(async () => {
+    await individual?.dispose();
+  });
+
+  it('withholds the name and address of every site, shared numbers included, while redacting', async () => {
+    const result = await individual
+      .service({ redactIndividuals: true })
+      .getLicense({ callsign: 'KZZ521', maxFrequencies: 100 });
+    if (!result.found) throw new Error('Expected KZZ521.');
+    const [shared, single] = result.locations;
+    expect(shared?.sites).toHaveLength(2);
+    for (const site of [...(shared?.sites ?? []), single]) {
+      expect(site).not.toHaveProperty('name');
+      expect(site).not.toHaveProperty('address');
+      expect(site).toHaveProperty('city');
+    }
+    const body = JSON.stringify(result);
+    for (const filed of ['Robin', 'Sample', 'SAMPLE', 'Orchard', 'Ridge Rd']) {
+      expect(body, filed).not.toContain(filed);
+    }
+  });
+
+  it('returns them as filed with redaction off', async () => {
+    const result = await individual
+      .service({ redactIndividuals: false })
+      .getLicense({ callsign: 'KZZ521', maxFrequencies: 100 });
+    if (!result.found) throw new Error('Expected KZZ521.');
+    const [shared, single] = result.locations;
+    expect(shared?.sites?.map((site) => [site.name, site.address])).toEqual([
+      ['Robin R Sample', '7 Orchard Ln'],
+      ['SAMPLE BARN', '9 Orchard Ln'],
+    ]);
+    expect(single).toMatchObject({ name: 'Sample Ridge', address: '11 Ridge Rd' });
   });
 });
 

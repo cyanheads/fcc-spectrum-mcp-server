@@ -23,6 +23,7 @@ import {
   frequencySchema,
   latitudeSchema,
   liveStatusSchema,
+  locationTypeSchema,
   longitudeSchema,
   radioServiceSchema,
   unitSchema,
@@ -75,20 +76,53 @@ const SiteSchema = z
     licenseeRedacted: z
       .boolean()
       .describe('True when the licensee is an individual whose name is withheld.'),
-    locationNumber: z.number().describe('Location number within the license.'),
+    locationNumber: z
+      .number()
+      .describe(
+        "Location number within the license; pass it as location_number to fcc_spectrum_get_license to read the location's antennas and frequencies.",
+      ),
     locationTypeCode: z
       .string()
       .optional()
-      .describe('ULS location type code; absent when not filed.'),
-    distanceKm: z.number().describe('Great-circle distance from the search center, km.'),
-    latitude: z.number().describe('Site latitude, decimal degrees (NAD83 as filed).'),
-    longitude: z.number().describe('Site longitude, decimal degrees (NAD83 as filed).'),
+      .describe(
+        'ULS location type code, e.g. F (fixed), M (mobile), T (temporary fixed); absent when not filed.',
+      ),
+    locationTypeLabel: z
+      .string()
+      .optional()
+      .describe('Label of the location type code, e.g. "Mobile"; absent when no type is filed.'),
+    distanceKm: z
+      .number()
+      .describe(
+        'Great-circle distance from the search center to latitude/longitude, km; for an operating area (radiusKm filed) that is its center, so the area can reach nearer.',
+      ),
+    latitude: z
+      .number()
+      .describe(
+        'Latitude as filed, decimal degrees (NAD83): the site, or the center of an operating area.',
+      ),
+    longitude: z
+      .number()
+      .describe(
+        'Longitude as filed, decimal degrees (NAD83): the site, or the center of an operating area.',
+      ),
+    radiusKm: z
+      .number()
+      .optional()
+      .describe(
+        'Radius of operation around latitude/longitude, km, as filed; mobile (M) and temporary-fixed (T) areas file one, and some fixed and other sites do. Absent when not filed.',
+      ),
     groundElevationM: z
       .number()
       .optional()
       .describe('Ground elevation, meters above mean sea level.'),
     overallHeightM: z.number().optional().describe('Overall structure height, meters.'),
-    asrNumber: z.string().optional().describe('FCC Antenna Structure Registration number.'),
+    asrNumber: z
+      .string()
+      .optional()
+      .describe(
+        'FCC Antenna Structure Registration number: seven digits, never the 9999999 placeholder; omitted when the filing holds anything else (the placeholder, N/A, an application file number).',
+      ),
     county: z.string().optional().describe('Site county, as filed.'),
     state: z.string().optional().describe('Site state: as filed, or derived from the coordinates.'),
     stateFromCoordinates: z
@@ -112,7 +146,7 @@ const SiteSchema = z
 export const findTransmitters = tool('fcc_spectrum_find_transmitters', {
   title: 'Find FCC-licensed transmitters near a point',
   description:
-    'Find FCC-licensed transmitter sites within a radius of a coordinate, nearest first, each with its callsign, licensee, distance, coordinates, ground elevation, structure height, and the frequencies authorized there. Filter by frequency or band, radio service, and live status (active by default). Coordinates are decimal degrees or DMS strings; mobile-only and area-wide authorizations without a fixed coordinate are not returned, and market-area licenses without site records are found with fcc_spectrum_search_frequencies.',
+    'Find FCC-licensed transmitter sites within a radius of a coordinate, nearest first, each with its callsign, licensee, distance, coordinates, location type, ground elevation, structure height, and the frequencies authorized there. Filter by frequency or band, radio service, location type, and live status (active by default). Coordinates are decimal degrees or DMS strings. Mobile and temporary-fixed operating areas are filed as a center and a radius of operation: they are returned at their center with radiusKm, and match when the center lies within radius_km. Locations filed without coordinates are not returned, and market-area licenses without site records are found with fcc_spectrum_search_frequencies.',
   annotations: { readOnlyHint: true, idempotentHint: true, openWorldHint: false },
   input: z.object({
     latitude: latitudeSchema.describe(
@@ -131,6 +165,9 @@ export const findTransmitters = tool('fcc_spectrum_find_transmitters', {
     unit: blankAsUnset(unitSchema).describe('Unit of the frequencies: kHz, MHz (default), or GHz.'),
     radio_service: blankAsUnset(radioServiceSchema.optional()).describe(
       'Two-character radio service code, e.g. "IG" (industrial/business pool); see fcc_spectrum_list_reference topic "radio_services".',
+    ),
+    location_type: blankAsUnset(locationTypeSchema.optional()).describe(
+      'One ULS location type code, case-insensitive: "F" keeps fixed sites only, "M" mobile and "T" temporary-fixed operating areas; see fcc_spectrum_list_reference topic "location_types". Omit for every type.',
     ),
     status: blankAsUnset(liveStatusSchema).describe(
       'A active (default), L pending legal, X term pending, or "any" for all three. Other statuses keep no site records.',
@@ -174,6 +211,7 @@ export const findTransmitters = tool('fcc_spectrum_find_transmitters', {
         frequency_low_mhz: z.number().optional().describe('Band lower edge, converted to MHz.'),
         frequency_high_mhz: z.number().optional().describe('Band upper edge, converted to MHz.'),
         radio_service: z.string().optional().describe('Radio service code filter.'),
+        location_type: z.string().optional().describe('Location type code filter.'),
         status: z.string().describe('Status filter, default included.'),
         max_frequencies_per_site: z.number().describe('Per-site frequency cap applied.'),
       })
@@ -242,6 +280,7 @@ export const findTransmitters = tool('fcc_spectrum_find_transmitters', {
         frequency_high_mhz: band.highMhz,
       }),
       ...(input.radio_service && { radio_service: input.radio_service }),
+      ...(input.location_type && { location_type: input.location_type }),
       status: input.status,
       max_frequencies_per_site: input.max_frequencies_per_site,
     };
@@ -292,6 +331,7 @@ export const findTransmitters = tool('fcc_spectrum_find_transmitters', {
       radiusKm: input.radius_km,
       band: band && { lowMhz: band.lowMhz, highMhz: band.highMhz },
       radioService: input.radio_service,
+      locationType: input.location_type,
       status: input.status,
       limit: input.limit,
       maxFrequenciesPerSite: input.max_frequencies_per_site,
@@ -312,6 +352,7 @@ export const findTransmitters = tool('fcc_spectrum_find_transmitters', {
             ? 'widen the band with frequency_high'
             : 'widen the band (lower frequency_low or raise frequency_high)'),
         input.radio_service && 'drop radio_service',
+        input.location_type && 'drop location_type',
         input.status !== 'any' && 'pass status "any"',
         band && 'call fcc_spectrum_search_frequencies to search by state',
       ]);
@@ -344,8 +385,8 @@ export const findTransmitters = tool('fcc_spectrum_find_transmitters', {
         '',
         `### ${site.distanceKm} km · ${callsignText(site.callsign)} · USI ${site.usi} · location ${site.locationNumber}`,
         `- **Licensee:** ${licenseeText(site.licenseeName, site.licenseeRedacted)} · **Redacted:** ${yesNo(site.licenseeRedacted)} · **Lease:** ${yesNo(site.isLease)}`,
-        `- **Status:** ${site.licenseStatus} · **Service:** ${site.radioServiceCode} (${inline(site.radioServiceLabel)})${site.locationTypeCode ? ` · **Location type:** ${site.locationTypeCode}` : ''}`,
-        `- **Coordinates:** ${site.latitude}, ${site.longitude}${site.groundElevationM !== undefined ? ` · **Ground elevation:** ${site.groundElevationM} m` : ''}${site.overallHeightM !== undefined ? ` · **Overall height:** ${site.overallHeightM} m` : ''}${site.asrNumber ? ` · **ASR:** ${site.asrNumber}` : ''}`,
+        `- **Status:** ${site.licenseStatus} · **Service:** ${site.radioServiceCode} (${inline(site.radioServiceLabel)})${site.locationTypeCode ? ` · **Location type:** ${site.locationTypeCode}${site.locationTypeLabel ? ` (${site.locationTypeLabel})` : ''}` : ''}`,
+        `- **Coordinates:** ${site.latitude}, ${site.longitude}${site.radiusKm !== undefined ? ` · **Radius of operation:** ${site.radiusKm} km` : ''}${site.groundElevationM !== undefined ? ` · **Ground elevation:** ${site.groundElevationM} m` : ''}${site.overallHeightM !== undefined ? ` · **Overall height:** ${site.overallHeightM} m` : ''}${site.asrNumber ? ` · **ASR:** ${site.asrNumber}` : ''}`,
       );
       if (place) {
         lines.push(`- **Place:** ${place}${stateSourceText(site.stateFromCoordinates)}`);

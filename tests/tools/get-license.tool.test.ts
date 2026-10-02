@@ -2,9 +2,12 @@
  * @fileoverview Tests for `fcc_spectrum_get_license` over the fixture index: the cold,
  * dangling, and malformed pointer states, `identifier_required` for every way of passing
  * neither or both identifiers, input normalization and blank inputs, hits and misses by
- * callsign and USI, the `max_frequencies` cap and its 1000-row ceiling, redaction on and off,
- * leases and market blocks, the required enrichment on the zero-result (miss) and under-cap
- * (hit) pages, and `format()` parity with registry text carrying CR/LF and `|`.
+ * callsign and USI, the `max_frequencies` cap and its 1000-row ceiling, location paging by
+ * `location_offset` and `location_number` (with `location_start_conflict`) over a record
+ * numbered from 0 with a gap, redaction on and off (site names and addresses included, on
+ * shared location numbers too), the ASR registration-number rule, leases and market blocks,
+ * the required enrichment on the zero-result (miss) and under-cap (hit) pages, and
+ * `format()` parity with registry text carrying CR/LF and `|`.
  * @module tests/tools/get-license.tool.test
  */
 
@@ -29,6 +32,7 @@ import {
   useIndex,
 } from '../fixtures/tool-harness.js';
 import {
+  INDIVIDUAL_SITES_WEEKLY,
   QUIRKS_WEEKLY,
   sprawlingPagingWeekly,
   widePagingWeekly,
@@ -338,17 +342,26 @@ describe('warm index', () => {
       });
       const [site] = structured.locations ?? [];
       expect(site).not.toHaveProperty('address');
+      expect(site).not.toHaveProperty('name');
       expect(site).toMatchObject({ city: 'SPOKANE', state: 'WA' });
+      expect(JSON.stringify(result.structuredContent)).not.toContain('Pat Q Example');
       const rendered = contractText(result);
       expect(rendered.split('\n')).toContain(
         '**Licensee:** Redacted (individual licensee) · **Redacted:** yes · **Role:** licensee · **FRN:** 0005550001 · **Applicant type:** I · **State:** WA',
       );
+      expect(rendered.split('\n')).toContain('#### Location 1');
       expect(rendered.split('\n')).toContain('**Place:** SPOKANE, WA (state as filed)');
       expect(rendered).not.toContain('Pat Q Example');
       expect(rendered).not.toContain('42 Private Lane');
     });
 
-    it("shows the individual's name, city, and site address with redaction off", async () => {
+    it("keeps an organization's site name in both surfaces while redacting", async () => {
+      const result = await run({ callsign: 'KZZ901' });
+      expect(hit(result).locations?.[0]?.name).toBe('Seattle Hill');
+      expect(lines(result)).toContain('#### Location 1 — Seattle Hill');
+    });
+
+    it("shows the individual's name, city, site address, and site name with redaction off", async () => {
       await useIndex(fixture.mirrorDir, { redactIndividuals: false });
       const result = await run({ callsign: 'KZZ903' });
       const structured = hit(result);
@@ -357,11 +370,15 @@ describe('warm index', () => {
         redacted: false,
         city: 'SPOKANE',
       });
-      expect(structured.locations?.[0]?.address).toBe('42 Private Lane');
+      expect(structured.locations?.[0]).toMatchObject({
+        address: '42 Private Lane',
+        name: 'Pat Q Example',
+      });
       const rendered = lines(result);
       expect(rendered).toContain(
         '**Licensee:** Pat Q Example · **Redacted:** no · **Role:** licensee · **FRN:** 0005550001 · **Applicant type:** I · **City:** SPOKANE · **State:** WA',
       );
+      expect(rendered).toContain('#### Location 1 — Pat Q Example');
       expect(rendered).toContain('**Place:** 42 Private Lane, SPOKANE, WA (state as filed)');
     });
 
@@ -413,7 +430,7 @@ describe('warm index', () => {
         leasedFrom: [{ callsign: 'KZZ801', usi: '2001' }],
         leases: [],
         leaseCount: 0,
-        market: { marketCode: 'BTA144', blocks: [{ lowMhz: 2496, highMhz: 2502 }] },
+        market: { marketCode: 'BTA138', blocks: [{ lowMhz: 2496, highMhz: 2502 }] },
       });
       const rendered = lines(result);
       expect(rendered).toContain('## L000000001 · USI 2002');
@@ -431,7 +448,7 @@ describe('warm index', () => {
       const result = await run({ callsign: 'KZZ801' });
       const structured = hit(result);
       expect(structured.license?.market).toEqual({
-        marketCode: 'BTA144',
+        marketCode: 'BTA138',
         marketName: 'Fargo-Moorhead, ND-MN',
         channelBlock: 'A1',
         blocks: [
@@ -445,7 +462,7 @@ describe('warm index', () => {
       ]);
       const rendered = lines(result);
       expect(rendered).toContain(
-        '**Market:** BTA144 — Fargo-Moorhead, ND-MN · **Channel block:** A1',
+        '**Market:** BTA138 — Fargo-Moorhead, ND-MN · **Channel block:** A1',
       );
       expect(rendered).toContain(
         '**Spectrum blocks:** 2496–2502 MHz (partition area 1), 2502–2508 MHz',
@@ -731,6 +748,293 @@ describe('one location over the page caps', () => {
   });
 });
 
+/**
+ * KZZ701 numbered from 0 with a gap: sites at 0–59 and 70–129, and 135 filed on antenna and
+ * frequency rows alone, two antennas and two rows at each. Its windows are 0–49 (offset 0),
+ * 50–59 and 70–109 (offset 50), and 110–129 with 135 (offset 100).
+ */
+const GAPPED_NUMBERS = [
+  ...Array.from({ length: 60 }, (_, i) => i),
+  ...Array.from({ length: 60 }, (_, i) => i + 70),
+];
+const numbersListed = (locations: readonly Location[] | undefined) =>
+  (locations ?? []).map((location) => location.locationNumber);
+const range = (first: number, last: number) =>
+  Array.from({ length: last - first + 1 }, (_, i) => first + i);
+const GAPPED_WINDOW = (from: number, next: number) =>
+  `Listing 50 of 121 locations (50 of 120 sites) from location_offset ${from}; one call lists at most 50 sites and 100 antennas. Call fcc_spectrum_get_license with usi "7001" and location_offset ${next} for the next locations.`;
+
+describe('a record numbered from 0 with a gap', () => {
+  let gapped: FixtureIndex;
+  beforeAll(async () => {
+    gapped = await buildFixtureIndex({
+      weekly: {
+        paging: sprawlingPagingWeekly({
+          locations: GAPPED_NUMBERS,
+          siteless: [135],
+          sitesAtFirst: 1,
+          antennasPerLocation: 2,
+          leases: 0,
+        }),
+      },
+    });
+  });
+  beforeEach(async () => {
+    await useIndex(gapped.mirrorDir);
+  });
+  afterAll(async () => {
+    await releaseIndex();
+    await gapped.dispose();
+  });
+
+  describe('location_offset', () => {
+    it('counts location 0 first and pages across the gap in number order', async () => {
+      const first = hit(await run({ callsign: 'KZZ701' }));
+      expect(numbersListed(first.locations)).toEqual(range(0, 49));
+      expect(first).toMatchObject({
+        locationTotal: 121,
+        siteTotal: 120,
+        nextLocationOffset: 50,
+        notice: GAPPED_WINDOW(0, 50),
+      });
+
+      const second = hit(await run({ usi: '7001', location_offset: 50 }));
+      expect(numbersListed(second.locations)).toEqual([...range(50, 59), ...range(70, 109)]);
+      expect(second).toMatchObject({ nextLocationOffset: 100, notice: GAPPED_WINDOW(50, 100) });
+    });
+
+    it('lists a number filed only on antenna and frequency rows in its place, without a site', async () => {
+      const result = await run({ usi: '7001', location_offset: 100 });
+      const last = hit(result);
+      expect(numbersListed(last.locations)).toEqual([...range(110, 129), 135]);
+      const siteless = last.locations?.at(-1);
+      expect(siteless?.antennas).toHaveLength(2);
+      expect(siteless).not.toHaveProperty('latitude');
+      expect(last).not.toHaveProperty('nextLocationOffset');
+      expect(last.notice).toBeUndefined();
+      expect(lines(result)).toContain('#### Location 135');
+    });
+
+    it('says an offset past the end lists nothing', async () => {
+      const structured = hit(await run({ usi: '7001', location_offset: 121 }));
+      expect(structured).toMatchObject({ truncated: false, shown: 0, locations: [] });
+      expect(structured.notice).toBe(
+        'location_offset 121 is past the last location; this record has 121.',
+      );
+    });
+  });
+
+  describe('location_number', () => {
+    it('starts at location 0 with the window location_offset 0 lists', async () => {
+      const result = await run({ callsign: 'KZZ701', location_number: 0 });
+      expect(hit(result)).toEqual(hit(await run({ callsign: 'KZZ701' })));
+      expect(numbersListed(hit(result).locations)[0]).toBe(0);
+    });
+
+    it('starts at a filed number and names its offset in the notice and the next offset', async () => {
+      const result = await run({ callsign: 'KZZ701', location_number: 55 });
+      const structured = hit(result);
+      expect(numbersListed(structured.locations)).toEqual([...range(55, 59), ...range(70, 114)]);
+      expect(structured).toMatchObject({
+        truncated: true,
+        nextLocationOffset: 105,
+        notice: GAPPED_WINDOW(55, 105),
+      });
+      expect(lines(result)).toEqual(
+        expect.arrayContaining([
+          '### Locations (50 of 121 listed; 120 sites in all)',
+          '#### Location 55 — SITE 55-1',
+          '**Next location_offset:** 105',
+        ]),
+      );
+      expect(contractText(result)).toContain(GAPPED_WINDOW(55, 105));
+    });
+
+    it('reads a page past the first two windows, ending without a next offset or notice', async () => {
+      const structured = hit(await run({ usi: '7001', location_number: 110 }));
+      expect(numbersListed(structured.locations)).toEqual([...range(110, 129), 135]);
+      expect(structured).toMatchObject({ truncated: false, shown: 42 });
+      expect(structured).not.toHaveProperty('nextLocationOffset');
+      expect(structured.notice).toBeUndefined();
+    });
+
+    it('starts an unfiled number at the next filed one and says where the window starts', async () => {
+      const START =
+        'Location 65 is not filed on this record; listing from location 70 (location_offset 60).';
+      const result = await run({ usi: '7001', location_number: 65 });
+      const structured = hit(result);
+      expect(numbersListed(structured.locations)).toEqual(range(70, 119));
+      expect(structured).toMatchObject({
+        truncated: true,
+        nextLocationOffset: 110,
+        notice: `${START} ${GAPPED_WINDOW(60, 110)}`,
+      });
+      expect(contractText(result)).toContain(START);
+    });
+
+    it('starts at a number filed only on antenna and frequency rows', async () => {
+      const result = await run({ usi: '7001', location_number: 131 });
+      const structured = hit(result);
+      expect(numbersListed(structured.locations)).toEqual([135]);
+      expect(structured.notice).toBe(
+        'Location 131 is not filed on this record; listing from location 135 (location_offset 120).',
+      );
+      expect(structured.truncated).toBe(false);
+    });
+
+    it('lists nothing past the last filed number and names it with the location count', async () => {
+      const PAST =
+        'Location 136 is past the last filed location, 135; this record has 121 locations.';
+      const result = await run({ usi: '7001', location_number: 136 });
+      const structured = hit(result);
+      expect(structured).toMatchObject({
+        truncated: false,
+        shown: 0,
+        locations: [],
+        locationTotal: 121,
+        notice: PAST,
+      });
+      expect(structured).not.toHaveProperty('nextLocationOffset');
+      expect(contractText(result)).toContain(PAST);
+    });
+
+    it('reads the frequency cut against the offset the number resolved to', async () => {
+      // The first listed location loses rows: raising the cap is the only remedy.
+      const atFirst = hit(await run({ usi: '7001', location_number: 65, max_frequencies: 1 }));
+      expect(atFirst.notice).toBe(
+        `Location 65 is not filed on this record; listing from location 70 (location_offset 60). ${GAPPED_WINDOW(60, 110)} ${CAP_NOTICE(1, 100)} Raise max_frequencies (up to 1000) to see more.`,
+      );
+      const later = hit(await run({ usi: '7001', location_number: 70, max_frequencies: 3 }));
+      expect(later.notice).toBe(
+        `${GAPPED_WINDOW(60, 110)} ${CAP_NOTICE(3, 100)} Rows are missing from location 71 on; call again with location_offset 61 to start there, or raise max_frequencies (up to 1000).`,
+      );
+    });
+
+    it('fails location_start_conflict beside a nonzero location_offset', async () => {
+      const result = await run({ usi: '7001', location_number: 110, location_offset: 5 });
+      const error = expectDeclaredError(getLicense, result, 'location_start_conflict');
+      expect(error.code).toBe(JsonRpcErrorCode.ValidationError);
+      expect(error.message).toBe(
+        'Both location_number and a nonzero location_offset were given; pass only one.',
+      );
+      expect(Object.keys(result.structuredContent ?? {})).toEqual(['error']);
+    });
+
+    it('defers to location_number when location_offset is 0', async () => {
+      const structured = hit(await run({ usi: '7001', location_number: 110, location_offset: 0 }));
+      expect(numbersListed(structured.locations)[0]).toBe(110);
+    });
+
+    it('says a record with no locations does not file the number', async () => {
+      const structured = hit(await run({ callsign: 'KZ1CLB', location_number: 1 }));
+      expect(structured).toMatchObject({
+        technicalRetained: true,
+        locations: [],
+        locationTotal: 0,
+        truncated: false,
+        notice: 'Location 1 is not filed; this record has 0 locations.',
+      });
+    });
+
+    it.each([
+      ['a negative number', { usi: '7001', location_number: -1 }],
+      ['a fractional number', { usi: '7001', location_number: 1.5 }],
+      ['a string', { usi: '7001', location_number: 'one' }],
+    ])('rejects %s with InvalidParams', async (_label, input) => {
+      const error = errorOf(await run(input));
+      expect(error.code).toBe(JsonRpcErrorCode.InvalidParams);
+    });
+  });
+});
+
+/**
+ * KZZ701 numbering 1–69, each number with one antenna and one frequency row, where 10, 30,
+ * and 55 are filed on that frequency row alone (no site, no antenna record). Its windows are
+ * 1–52 (offset 0, 50 sites) and 53–69 (offset 52).
+ */
+const FREQUENCY_ONLY = [10, 30, 55];
+
+describe('location numbers filed only on frequency rows', () => {
+  let sparse: FixtureIndex;
+  beforeAll(async () => {
+    sparse = await buildFixtureIndex({
+      weekly: {
+        paging: sprawlingPagingWeekly({
+          locations: range(1, 69).filter((number) => !FREQUENCY_ONLY.includes(number)),
+          frequencyOnly: FREQUENCY_ONLY,
+          sitesAtFirst: 1,
+          antennasPerLocation: 1,
+          leases: 0,
+        }),
+      },
+    });
+  });
+  beforeEach(async () => {
+    await useIndex(sparse.mirrorDir);
+  });
+  afterAll(async () => {
+    await releaseIndex();
+    await sparse.dispose();
+  });
+
+  /** Every location number a walk from offset 0 lists, following nextLocationOffset. */
+  const walk = async (maxFrequencies: number) => {
+    const listed: number[] = [];
+    let next: number | undefined = 0;
+    while (next !== undefined) {
+      const offset: number = next;
+      const structured = hit(
+        await run({ usi: '7001', location_offset: offset, max_frequencies: maxFrequencies }),
+      );
+      next = structured.nextLocationOffset;
+      expect(structured.locationTotal).toBe(69);
+      expect(structured.locations).toHaveLength((next ?? 69) - offset);
+      listed.push(...numbersListed(structured.locations));
+    }
+    return listed;
+  };
+
+  it('lists a frequency-only number whose rows max_frequencies cuts, with no antennas', async () => {
+    const result = await run({ usi: '7001', max_frequencies: 1 });
+    const structured = hit(result);
+    expect(structured).toMatchObject({
+      locationTotal: 69,
+      siteTotal: 66,
+      nextLocationOffset: 52,
+      shown: 1,
+      truncated: true,
+    });
+    expect(numbersListed(structured.locations)).toEqual(range(1, 52));
+    expect(structured.locations).toHaveLength(structured.nextLocationOffset ?? 0);
+    const cut = structured.locations?.find((location) => location.locationNumber === 10);
+    expect(cut).toEqual({ locationNumber: 10, antennas: [] });
+    expect(structured.notice).toContain(
+      'Rows are missing from location 2 on; call again with location_offset 1 to start there',
+    );
+    expect(lines(result)).toEqual(expect.arrayContaining(['#### Location 10', '#### Location 30']));
+  });
+
+  it('lists a frequency-only number with its row under its antenna when the row fits', async () => {
+    const structured = hit(await run({ usi: '7001', location_number: 10, max_frequencies: 1 }));
+    expect(structured.locations?.[0]).toEqual({
+      locationNumber: 10,
+      antennas: [
+        {
+          antennaNumber: 1,
+          frequencies: [expect.objectContaining({ frequencyMhz: 150.125, stationClass: 'FB2' })],
+        },
+      ],
+    });
+  });
+
+  it.each([[1], [20], [100]])(
+    'walks every location number exactly once at max_frequencies %i',
+    async (maxFrequencies) => {
+      expect(await walk(maxFrequencies)).toEqual(range(1, 69));
+    },
+  );
+});
+
 describe('filing quirks', () => {
   let quirks: FixtureIndex;
   beforeAll(async () => {
@@ -792,6 +1096,80 @@ describe('filing quirks', () => {
       '**Filed records:** 2 (fields that differ between them are omitted)',
     );
     expectCarries(contractText(result), structured.locations);
+  });
+
+  it('returns asrNumber only for a seven-digit registration number, in both surfaces', async () => {
+    const result = await run({ callsign: 'KZZ505' });
+    const [shared, single] = hit(result).locations ?? [];
+    expect(shared?.sites?.map((site) => site.asrNumber)).toEqual([undefined, undefined]);
+    expect(single?.asrNumber).toBe('1012345');
+    const rendered = contractText(result);
+    expect(rendered.match(/\*\*ASR:\*\*/g)).toHaveLength(1);
+    expect(rendered).toContain('**ASR:** 1012345');
+    expect(rendered).not.toContain('N/A');
+    expect(rendered).not.toContain('9999999');
+
+    const fileNumber = await run({ callsign: 'KZZ502' });
+    expect(hit(fileNumber).locations?.[0]).not.toHaveProperty('asrNumber');
+    expect(contractText(fileNumber)).not.toContain('**ASR:**');
+    expect(contractText(fileNumber)).not.toContain('A1090210');
+  });
+});
+
+describe('an individual whose sites file names', () => {
+  let individual: FixtureIndex;
+  beforeAll(async () => {
+    individual = await buildFixtureIndex({
+      groups: ['paging'],
+      weekly: { paging: INDIVIDUAL_SITES_WEEKLY },
+    });
+  });
+  afterAll(async () => {
+    await releaseIndex();
+    await individual.dispose();
+  });
+
+  it('withholds every site name and address, shared numbers included, while redacting', async () => {
+    await useIndex(individual.mirrorDir, { services: ['paging'] });
+    const result = await run({ callsign: 'KZZ521' });
+    const [shared, single] = hit(result).locations ?? [];
+    expect(shared?.sites).toHaveLength(2);
+    for (const site of [...(shared?.sites ?? []), single]) {
+      expect(site).not.toHaveProperty('name');
+      expect(site).not.toHaveProperty('address');
+    }
+    const rendered = contractText(result);
+    expect(rendered.split('\n')).toEqual(
+      expect.arrayContaining([
+        '#### Location 1 — 2 sites share this number',
+        '##### Site 1 of 2',
+        '##### Site 2 of 2',
+        '#### Location 2',
+        '**Place:** YAKIMA, WA (state as filed)',
+        '**Place:** SELAH, WA (state as filed)',
+      ]),
+    );
+    const body = JSON.stringify(result.structuredContent);
+    for (const filed of ['Robin', 'Sample', 'SAMPLE', 'Orchard', 'Ridge Rd']) {
+      expect(rendered, filed).not.toContain(filed);
+      expect(body, filed).not.toContain(filed);
+    }
+  });
+
+  it('returns them in both surfaces with redaction off', async () => {
+    await useIndex(individual.mirrorDir, { services: ['paging'], redactIndividuals: false });
+    const result = await run({ callsign: 'KZZ521' });
+    const [shared, single] = hit(result).locations ?? [];
+    expect(shared?.sites?.map((site) => site.name)).toEqual(['Robin R Sample', 'SAMPLE BARN']);
+    expect(single).toMatchObject({ name: 'Sample Ridge', address: '11 Ridge Rd' });
+    expect(lines(result)).toEqual(
+      expect.arrayContaining([
+        '##### Site 1 of 2 — Robin R Sample',
+        '##### Site 2 of 2 — SAMPLE BARN',
+        '#### Location 2 — Sample Ridge',
+        '**Place:** 7 Orchard Ln, YAKIMA, WA (state as filed)',
+      ]),
+    );
   });
 });
 

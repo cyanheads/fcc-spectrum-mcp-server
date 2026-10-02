@@ -15,7 +15,7 @@
 
 A keyless FCC radio spectrum licensing server. It indexes the FCC Universal Licensing System (ULS) weekly and daily bulk files into an embedded SQLite index and answers every query from it, with no runtime calls to the FCC. The data is a US government work in the public domain.
 
-**Server-as-source.** The index is built as generation files under `FCC_SPECTRUM_MIRROR_DIR`; `current.json` names the published one and the read path follows it. The first build is an operator step (`mirror:init`, never on startup). Under HTTP the process schedules the weekly rebuild and daily refresh itself (`src/services/uls/ingest-schedule.ts`); under stdio, run `mirror:refresh` / `mirror:init` from cron. A cold index (no published generation) fails every tool and resource with the typed `index_not_ready` error, never an empty result. Cursors bind to the generation, so a rebuild invalidates them (`invalid_cursor`).
+**Server-as-source.** The index is built as generation files under `FCC_SPECTRUM_MIRROR_DIR`; `current.json` names the published one and the read path follows it. The first build is an operator step (`mirror:init`, never on startup). Under HTTP the process schedules the weekly rebuild and daily refresh itself (`src/services/uls/ingest-schedule.ts`), each run a child process on the server's runtime executing the compiled `ingest-job.js`, because SQLite calls are synchronous and an ingest step would otherwise block the serving thread for tens of seconds; the server relays the job's log lines and logs a non-zero exit or a kill as the run's failure. Under stdio nothing is spawned; run `mirror:refresh` / `mirror:init` from cron. A cold index (no published generation) fails every tool and resource with the typed `index_not_ready` error, never an empty result. Cursors bind to the generation, so a rebuild invalidates them (`invalid_cursor`).
 
 **Individual-licensee redaction is a first-class, fail-safe feature.** `FCC_SPECTRUM_REDACT_INDIVIDUALS` defaults to on, and only `false`/`0`/`no`/`off` disables it. Redaction happens at read time in one function, `UlsIndexService.redact()`, and individuals are excluded from name search. Contact details (phone, fax, email, ZIP, PO box) are never ingested for anyone. Do not add a read path that bypasses `redact()` or loosens the config parse.
 
@@ -231,8 +231,8 @@ await createApp({
     }
   },
   async teardown() {
-    // Jobs go first: a tick in flight writes to the index the service is about to close.
-    stopIngestSchedule();
+    // Jobs go first: a job in flight writes to the index the service is about to close.
+    await stopIngestSchedule();
     await getUlsIndexService().close();
   },
 });
@@ -242,7 +242,7 @@ await createApp({
 
 `sessionMode: 'stateless'` declares the HTTP session posture in `src/`; `MCP_SESSION_MODE` still wins whenever it carries a meaningful value. Stateless is correct here: every tool is a single-shot read over the local index. Do not add `require: 'stateful'`. `.env.example`, the `Dockerfile`, and the README env table carry `stateless` and must stay in step.
 
-`teardown` runs after the transport stops and before the logger closes, on every shutdown path. It stops the ingest jobs before closing the index, because a tick in flight writes to the index the service is about to close.
+`teardown` runs after the transport stops and before the logger closes, on every shutdown path. It awaits `stopIngestSchedule()` before closing the index, because a job in flight writes to the index the service is about to close: the stop sends a running job process SIGTERM, on which it persists its progress and releases the lock, then SIGKILL after 5 s, inside the framework's 10 s shutdown ceiling. A killed job's rebuild resumes from its last completed step at the next run.
 
 ---
 
@@ -317,7 +317,8 @@ src/
     uls-index-service.ts                # read path over the published generation; the redact() chokepoint
     types.ts                            # read-model types the tools return
     ingest.ts                           # UlsIngester: weekly rebuild + daily refresh into generation files
-    ingest-schedule.ts                  # HTTP-only cron: Sunday rebuild, daily refresh
+    ingest-schedule.ts                  # HTTP-only cron: Sunday rebuild, daily refresh, each a child process
+    ingest-job.ts                       # the scheduled job the child runs (compiled entry); log lines as JSON on stdout
     bulk-client.ts                      # paced HTTP client for the ULS bulk host
     zip-reader.ts  dat.ts               # streaming ZIP reader; .dat record parsing
     schema.ts                           # store spec, generation naming, current.json pointer, ingest lock
@@ -325,6 +326,7 @@ src/
     normalize.ts                        # callsign / FRN / state / status / unit / DMS normalizers
     organization-names.ts               # organization words for the blank/H applicant-type individual rule
     state-lookup.ts  data/us-states.json # point-in-polygon state derivation
+    market-states.ts  data/market-states.json # FCC market area → states, for the market state filter
   mcp-server/
     tools/
       input-schemas.ts                  # shared z.preprocess input schemas, blankAsUnset
@@ -343,6 +345,7 @@ scripts/
   fcc-mirror-verify.ts                  # mirror:verify — integrity and count check
   _mirror-context.ts                    # shared setup for the three mirror scripts
   build-state-boundaries.ts             # regenerate us-states.json (run by hand)
+  build-market-states.ts                # regenerate market-states.json from FCC sources (run by hand; --check)
 ```
 
 ---

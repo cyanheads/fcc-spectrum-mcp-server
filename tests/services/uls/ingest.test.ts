@@ -9,7 +9,7 @@
 
 import { spawnSync } from 'node:child_process';
 import { existsSync } from 'node:fs';
-import { readdir, writeFile } from 'node:fs/promises';
+import { readdir, readFile, writeFile } from 'node:fs/promises';
 import { join } from 'node:path';
 import { JsonRpcErrorCode } from '@cyanheads/mcp-ts-core/errors';
 import type { SqliteHandle } from '@cyanheads/mcp-ts-core/mirror';
@@ -781,6 +781,50 @@ describe('rebuild triggers and naming', () => {
       ['current.json is malformed; the rebuild republishes it.', { pointerPath }],
     ]);
   });
+
+  it.each([
+    ['rebuild', 'init', undefined],
+    ['refresh', 'refresh', undefined],
+    ['rebuild', 'init', 4242],
+    ['refresh', 'refresh', 4242],
+  ] as const)(
+    'holds the lock during a %s (mode %s), recording this process and server PID %s',
+    async (method, mode, serverPid) => {
+      const mirror = await tempMirror();
+      const lockPath = join(mirror.mirrorDir, LOCK_FILE);
+      const client = new FakeIngestClient().withWeekly(['paging']);
+      const ingester = fixtureIngester(mirror, {
+        client,
+        groups: ['paging'],
+        ...(serverPid && { serverPid }),
+      });
+      if (method === 'refresh') await ingester.rebuild();
+      const seen: unknown[] = [];
+      const recordLock = async () => {
+        seen.push(JSON.parse(await readFile(lockPath, 'utf8')));
+      };
+      const head = client.head.bind(client);
+      const listDailyFiles = client.listDailyFiles.bind(client);
+      client.head = async (path) => {
+        await recordLock();
+        return head(path);
+      };
+      client.listDailyFiles = async () => {
+        await recordLock();
+        return listDailyFiles();
+      };
+
+      await ingester[method]();
+      // Only a scheduled job names its server; an operator's mirror:* run records no serverPid.
+      expect(seen[0]).toEqual({
+        pid: process.pid,
+        mode,
+        startedAt: '2026-09-29T20:00:00Z',
+        ...(serverPid && { serverPid }),
+      });
+      expect(existsSync(lockPath)).toBe(false);
+    },
+  );
 
   it('refuses to start while a live process holds the lock, and leaves its lock in place', async () => {
     const mirror = await tempMirror();

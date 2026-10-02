@@ -1,15 +1,18 @@
 /**
  * @fileoverview Tests for the pure normalizers: DMS conversion, coordinate text, callsign,
- * FRN, state, status, and unit spellings, frequency conversion, and band resolution.
+ * FRN, market code, state, status, and unit spellings, frequency conversion, band
+ * resolution, and the ASR registration-number rule.
  * @module tests/services/uls/normalize.test
  */
 
 import { describe, expect, it } from 'vitest';
 import {
+  asrRegistrationNumber,
   dmsToDecimal,
   MAX_FREQUENCY_MHZ,
   normalizeCallsign,
   normalizeFrn,
+  normalizeMarketCode,
   normalizeStateInput,
   normalizeStatusInput,
   normalizeUnitInput,
@@ -149,6 +152,22 @@ describe('normalizeFrn', () => {
   });
 });
 
+describe('normalizeMarketCode', () => {
+  it('uppercases, drops spaces and hyphens, and pads the digits to six characters', () => {
+    expect(normalizeMarketCode(' pea 16 ')).toBe('PEA016');
+    expect(normalizeMarketCode('d-6037')).toBe('D06037');
+    expect(normalizeMarketCode('tl4')).toBe('TL0004');
+    expect(normalizeMarketCode('BEA170')).toBe('BEA170');
+  });
+
+  it('leaves NW, names, and over-long codes for the pattern check', () => {
+    expect(normalizeMarketCode('nw')).toBe('NW');
+    expect(normalizeMarketCode('Seattle')).toBe('SEATTLE');
+    expect(normalizeMarketCode('pea0016')).toBe('PEA0016');
+    expect(normalizeMarketCode('16')).toBe('16');
+  });
+});
+
 describe('normalizeStateInput', () => {
   it('uppercases two-letter codes', () => {
     expect(normalizeStateInput(' wa ')).toBe('WA');
@@ -224,5 +243,40 @@ describe('toMhz / resolveBand', () => {
       lowMhz: MAX_FREQUENCY_MHZ,
       highMhz: MAX_FREQUENCY_MHZ,
     });
+  });
+});
+
+describe('asrRegistrationNumber', () => {
+  it('keeps a seven-digit registration number as filed', () => {
+    for (const filed of ['1012345', '1334622', '1000002', '6603775', '0000001']) {
+      expect(asrRegistrationNumber(filed), filed).toBe(filed);
+    }
+  });
+
+  it('drops the 9999999 placeholder', () => {
+    expect(asrRegistrationNumber('9999999')).toBeNull();
+  });
+
+  it('drops placeholder words, application file numbers, and other lengths', () => {
+    for (const filed of [
+      'N/A',
+      'NA',
+      'n/a',
+      'N/a',
+      'A1090210',
+      '999999',
+      '123456',
+      '12345',
+      '12345678',
+      '123',
+      '101 2345',
+      '1012345A',
+    ]) {
+      expect(asrRegistrationNumber(filed), filed).toBeNull();
+    }
+  });
+
+  it('keeps an unfiled value unfiled', () => {
+    expect(asrRegistrationNumber(null)).toBeNull();
   });
 });

@@ -27,7 +27,7 @@ import {
   successOf,
   useIndex,
 } from '../fixtures/tool-harness.js';
-import { carrierNamesWeekly } from '../fixtures/uls-fixtures.js';
+import { carrierNamesWeekly, MARKET_CODES_WEEKLY } from '../fixtures/uls-fixtures.js';
 import {
   buildFixtureIndex,
   type FixtureIndex,
@@ -109,11 +109,28 @@ describe('warm index', () => {
       ['only status and limit', { status: 'any', limit: 5 }],
       [
         'every criterion blank',
-        { callsign: '', licensee: '   ', frn: ' ', radio_service: '', state: '', status: '' },
+        {
+          callsign: '',
+          licensee: '   ',
+          frn: ' ',
+          market_code: ' ',
+          radio_service: '',
+          state: '',
+          status: '',
+        },
       ],
     ])('fails no_criteria with %s', async (_label, input) => {
       const error = expectDeclaredError(searchLicenses, await run(input), 'no_criteria');
       expect(error.code).toBe(JsonRpcErrorCode.ValidationError);
+    });
+
+    it('names market_code among the criteria no_criteria asks for', async () => {
+      const error = expectDeclaredError(
+        searchLicenses,
+        await run({ status: 'any' }),
+        'no_criteria',
+      );
+      expect(error.data?.recovery?.hint).toContain('market_code');
     });
 
     it('fails unknown_radio_service for a code neither the table nor the index holds', async () => {
@@ -538,4 +555,107 @@ describe('licensee names joined by - or &', () => {
     const result = page(await run({ licensee: 'acme wire' }));
     expect(new Set(usis(result.licenses))).toEqual(new Set(['6006', '6007']));
   });
+});
+
+describe('market codes', () => {
+  let markets: FixtureIndex;
+  beforeAll(async () => {
+    markets = await buildFixtureIndex({
+      groups: ['paging'],
+      weekly: { paging: MARKET_CODES_WEEKLY },
+    });
+  });
+  beforeEach(async () => {
+    await useIndex(markets.mirrorDir, { services: ['paging'] });
+  });
+  afterAll(async () => {
+    await releaseIndex();
+    await markets.dispose();
+  });
+
+  const CODE_SOURCE =
+    'market_code matches a market code exactly; codes come from the marketCode field of fcc_spectrum_search_licenses and fcc_spectrum_search_frequencies results.';
+
+  it('searches by market code alone, normalized, on both surfaces', async () => {
+    const result = await run({ market_code: 'pea16' });
+    const structured = page(result);
+    expect(structured).toMatchObject({
+      totalCount: 2,
+      shown: 2,
+      truncated: false,
+      appliedFilters: { market_code: 'PEA016', status: 'A' },
+    });
+    expect(usis(structured.licenses)).toEqual(['8003', '8004']);
+    expect(structured.licenses.map((license) => license.marketCode)).toEqual(['PEA016', 'PEA016']);
+    expect(structured.notice).toBeUndefined();
+    const rendered = contractText(result);
+    expect(rendered).toContain('- **Market:** PEA016 — Seattle, WA');
+    expect(rendered).toContain('market_code="PEA016"');
+    expectCarries(rendered, structured.licenses);
+  });
+
+  it('keeps two codes apart, and every status under "any"', async () => {
+    expect(usis(page(await run({ market_code: 'PEA017' })).licenses)).toEqual(['8005']);
+    expect(usis(page(await run({ market_code: 'PEA016', status: 'any' })).licenses)).toEqual([
+      '8003',
+      '8004',
+      '8006',
+    ]);
+    expect(page(await run({ frn: '800003' })).totalCount).toBe(2);
+    expect(usis(page(await run({ frn: '800003', market_code: 'PEA017' })).licenses)).toEqual([
+      '8005',
+    ]);
+  });
+
+  it.each([
+    ['d6037', 'D06037', '8008'],
+    [' nw ', 'NW', '8007'],
+    ['cma-020', 'CMA020', '8001'],
+  ])('reads %s as %s', async (input, code, first) => {
+    const structured = page(await run({ market_code: input }));
+    expect(structured.appliedFilters).toMatchObject({ market_code: code });
+    expect(structured.licenses[0]?.usi).toBe(first);
+  });
+
+  it("withholds an individual's name and city on a market-code search", async () => {
+    const individual = page(await run({ market_code: 'PEA016' })).licenses.find(
+      (license) => license.usi === '8004',
+    );
+    expect(individual).toMatchObject({ licenseeName: null, licenseeRedacted: true });
+    expect(individual).not.toHaveProperty('licenseeCity');
+  });
+
+  it('pages a market-code search past its first page', async () => {
+    const first = page(await run({ market_code: 'PEA016', status: 'any', limit: 1 }));
+    expect(first).toMatchObject({ totalCount: 3, shown: 1, truncated: true });
+    const second = page(
+      await run({ market_code: 'PEA016', status: 'any', limit: 1, cursor: first.nextCursor }),
+    );
+    const third = page(
+      await run({ market_code: 'PEA016', status: 'any', limit: 1, cursor: second.nextCursor }),
+    );
+    expect([first, second, third].flatMap((result) => usis(result.licenses))).toEqual([
+      '8003',
+      '8004',
+      '8006',
+    ]);
+    expect(third.nextCursor).toBeUndefined();
+  });
+
+  it('says where codes come from when a well-formed code matches nothing', async () => {
+    const result = await run({ market_code: 'PEA999' });
+    const structured = page(result);
+    expect(structured).toMatchObject({ totalCount: 0, shown: 0, licenses: [] });
+    expect(structured.notice).toBe(`${ACTIVE_ONLY} ${CODE_SOURCE}`);
+    expect(contractText(result)).toContain(CODE_SOURCE);
+  });
+
+  it.each([['Seattle'], ['PEA0016'], ['16']])(
+    'rejects market_code %s with InvalidParams',
+    async (market_code) => {
+      const error = errorOf(await run({ market_code }));
+      expect(error.code).toBe(JsonRpcErrorCode.InvalidParams);
+      expect(error.message).toContain('market_code: Invalid string: must match pattern');
+    },
+  );
 });

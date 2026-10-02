@@ -441,10 +441,10 @@ describe('record decoders', () => {
 
   it('decodes MK and MF, keeping a blank MF partition area as null', () => {
     expect(
-      decodeMk(mk({ usi: 1, code: 'BTA144', block: 'A1', name: 'Fargo-Moorhead, ND-MN' })),
+      decodeMk(mk({ usi: 1, code: 'BTA138', block: 'A1', name: 'Fargo-Moorhead, ND-MN' })),
     ).toEqual({
       usi: 1,
-      marketCode: 'BTA144',
+      marketCode: 'BTA138',
       channelBlock: 'A1',
       marketName: 'Fargo-Moorhead, ND-MN',
     });

@@ -93,6 +93,8 @@ export interface UlsIngesterOptions {
   mirrorDir: string;
   now?: () => number;
   openArchive?: (path: string) => Promise<ZipArchive>;
+  /** PID of the HTTP server that spawned this ingest as a scheduled job, recorded in the lock. */
+  serverPid?: number;
   /** Weekly service groups to index, in build order. */
   services: readonly ServiceGroup[];
   /** Where downloaded zips wait for their steps; defaults to `<mirrorDir>/tmp`. */
@@ -144,7 +146,11 @@ const NEVER_ABORT = new AbortController().signal;
 /**
  * State codes named in a market name — the text after its last comma, split on `-` and
  * `/` (`Fargo-Moorhead, ND-MN` → `,ND,MN,`). `null` when the name has no comma or no
- * recognizable code (a nationwide market, or a name cut before its state).
+ * recognizable code (a nationwide market, or a name cut before its state). Stored as
+ * `market_states`, it is one of the market state filter's four tests and, with the license's
+ * site states, the only one that reaches a code neither the bundled FCC area table
+ * (`market-states.ts`) nor a county FIPS prefix covers (`MVD148 Albany, GA`); the filter
+ * resolves the others at read time.
  */
 export function marketStates(marketName: string | null): string | null {
   if (!marketName) return null;
@@ -165,6 +171,7 @@ export class UlsIngester {
   private readonly mirrorDir: string;
   private readonly now: () => number;
   private readonly openArchive: (path: string) => Promise<ZipArchive>;
+  private readonly serverPid: number | undefined;
   private readonly services: readonly ServiceGroup[];
   private readonly tempDir: string;
 
@@ -174,6 +181,7 @@ export class UlsIngester {
     this.mirrorDir = options.mirrorDir;
     this.now = options.now ?? Date.now;
     this.openArchive = options.openArchive ?? openZipArchive;
+    this.serverPid = options.serverPid;
     this.services = options.services;
     this.tempDir = options.tempDir ?? join(options.mirrorDir, 'tmp');
   }
@@ -684,7 +692,12 @@ export class UlsIngester {
    */
   private async withLock<T>(mode: 'init' | 'refresh', fn: () => Promise<T>): Promise<T> {
     const lockPath = join(this.mirrorDir, LOCK_FILE);
-    const holder = { pid: process.pid, mode, startedAt: toIsoSeconds(this.now()) };
+    const holder = {
+      pid: process.pid,
+      mode,
+      startedAt: toIsoSeconds(this.now()),
+      ...(this.serverPid !== undefined && { serverPid: this.serverPid }),
+    };
     const attempt = await acquireIngestLock(this.mirrorDir, holder);
     if (!attempt.taken) {
       const current = attempt.holder;

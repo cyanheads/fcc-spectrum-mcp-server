@@ -2,7 +2,9 @@
  * @fileoverview Synthetic ULS fixtures: record-line builders sized by `RECORD_FIELD_COUNTS`,
  * a minimal ZIP writer with knobs for malformed archives, the weekly and daily fixture zips
  * (paging, BRS/EBS, amateur), and a fake `IngestClient` that serves them from memory. Every
- * callsign, name, and place-bound value here is invented; none is copied from FCC data.
+ * callsign, licensee, and site value here is invented; none is copied from FCC data. Market
+ * codes are the FCC's own, filed under area names (some as the FCC spells them) that place
+ * them in the states the bundled FCC area table gives them.
  * @module tests/fixtures/uls-fixtures
  */
 
@@ -541,6 +543,7 @@ export const PAGING_WEEKLY: FixtureFile = {
           lat: [47, 0, 0, 'N'],
           lon: [122, 0, 0, 'W'],
         }),
+        // An individual filing their own name as the site name.
         lo({
           usi: 1003,
           number: 1,
@@ -550,6 +553,7 @@ export const PAGING_WEEKLY: FixtureFile = {
           state: 'wa',
           lat: [47, 39, 32, 'N'],
           lon: [117, 25, 33, 'W'],
+          name: 'Pat Q Example',
         }),
         lo({
           usi: 1006,
@@ -740,10 +744,10 @@ export const MDSITFS_WEEKLY: FixtureFile = {
     {
       name: 'MK.dat',
       data: datFile([
-        mk({ usi: 2001, code: 'BTA144', block: 'A1', name: 'Fargo-Moorhead, ND-MN' }),
-        mk({ usi: 2002, code: 'BTA144', block: 'A1', name: 'Fargo-Moorhead, ND-MN' }),
+        mk({ usi: 2001, code: 'BTA138', block: 'A1', name: 'Fargo-Moorhead, ND-MN' }),
+        mk({ usi: 2002, code: 'BTA138', block: 'A1', name: 'Fargo-Moorhead, ND-MN' }),
         mk({ usi: 2003, code: 'P35', name: 'P35 GSA' }),
-        mk({ usi: 2004, code: 'BTA144', block: 'A2', name: 'Fargo-Moorhead, ND-MN' }),
+        mk({ usi: 2004, code: 'BTA138', block: 'A2', name: 'Fargo-Moorhead, ND-MN' }),
         mk({ usi: 2005, code: 'BTA028', block: 'B', name: 'Bakersfield, CA' }),
         mk({ usi: 2006, code: 'BTA999', name: 'Sample Market/Other, ND/SD' }),
       ]),
@@ -965,8 +969,8 @@ export const DAILY_MK_MON: FixtureFile = {
     {
       name: 'MK.dat',
       data: datFile([
-        mk({ usi: 2001, code: 'BTA144', block: 'A1', name: 'Fargo-Moorhead, ND-MN' }),
-        mk({ usi: 2002, code: 'BTA144', block: 'A1', name: 'Fargo-Moorhead, ND-MN' }),
+        mk({ usi: 2001, code: 'BTA138', block: 'A1', name: 'Fargo-Moorhead, ND-MN' }),
+        mk({ usi: 2002, code: 'BTA138', block: 'A1', name: 'Fargo-Moorhead, ND-MN' }),
       ]),
     },
     {
@@ -1027,7 +1031,7 @@ export const DAILY_WIDE_MON: FixtureFile = {
     {
       name: 'MK.dat',
       data: datFile([
-        mk({ usi: 2100, code: 'BTA144', block: 'B1', name: 'Fargo-Moorhead, ND-MN' }),
+        mk({ usi: 2100, code: 'BTA138', block: 'B1', name: 'Fargo-Moorhead, ND-MN' }),
       ]),
     },
     {
@@ -1127,25 +1131,40 @@ export function carrierNamesWeekly(): FixtureFile {
 export interface SprawlOptions {
   /** Antennas filed at each location, each with one frequency row. */
   antennasPerLocation: number;
+  /** Location numbers filed only on FR rows, with no LO site and no AN antenna. */
+  frequencyOnly?: readonly number[];
   /** Leases carved from the license. */
   leases: number;
-  /** Location numbers the license files, 1 through `locations`. */
-  locations: number;
-  /** Sites filed under location 1; every other number has one. */
+  /** Location numbers the license files at sites: 1 through `locations`, or the numbers listed. */
+  locations: number | readonly number[];
+  /** Location numbers filed only on AN and FR rows, with no LO site. */
+  siteless?: readonly number[];
+  /** Sites filed under the first location number; every other number has one. */
   sitesAtFirst: number;
 }
 
 /**
- * A paging snapshot whose one active license, KZZ701 (USI 7001), files `locations` location
- * numbers (location 1 at `sitesAtFirst` sites, the rest at one), `antennasPerLocation`
- * antennas at each with one frequency row apiece, and `leases` active leases L000070001…
- * (USIs 7101…), each linked to it.
+ * A paging snapshot whose one active license, KZZ701 (USI 7001), files its `locations`
+ * (the first at `sitesAtFirst` sites, the rest at one) plus any `siteless` numbers,
+ * `antennasPerLocation` antennas at each with one frequency row apiece, any `frequencyOnly`
+ * numbers as those frequency rows alone, and `leases` active leases L000070001… (USIs 7101…),
+ * each linked to it.
  */
 export function sprawlingPagingWeekly(options: SprawlOptions): FixtureFile {
-  const { antennasPerLocation, leases, locations, sitesAtFirst } = options;
-  const numbers = Array.from({ length: locations }, (_, i) => i + 1);
+  const {
+    antennasPerLocation,
+    frequencyOnly = [],
+    leases,
+    locations,
+    siteless = [],
+    sitesAtFirst,
+  } = options;
+  const numbers =
+    typeof locations === 'number'
+      ? Array.from({ length: locations }, (_, i) => i + 1)
+      : [...locations];
   const sites = numbers.flatMap((number) =>
-    Array.from({ length: number === 1 ? sitesAtFirst : 1 }, (_, site) =>
+    Array.from({ length: number === numbers[0] ? sitesAtFirst : 1 }, (_, site) =>
       lo({
         usi: 7001,
         number,
@@ -1157,12 +1176,13 @@ export function sprawlingPagingWeekly(options: SprawlOptions): FixtureFile {
       }),
     ),
   );
-  const antennas = numbers.flatMap((location) =>
+  const filed = [...numbers, ...siteless];
+  const antennas = filed.flatMap((location) =>
     Array.from({ length: antennasPerLocation }, (_, i) =>
       an({ usi: 7001, antenna: i + 1, location, type: 'T' }),
     ),
   );
-  const frequencies = numbers.flatMap((location) =>
+  const frequencies = [...filed, ...frequencyOnly].flatMap((location) =>
     Array.from({ length: antennasPerLocation }, (_, i) =>
       fr({
         usi: 7001,
@@ -1286,7 +1306,9 @@ export function widePagingWeekly(count: number): FixtureFile {
  * 5004, CW) two blocks each filed under three partition areas; KZZ505 (USI 5005, IQ) two
  * sites under location 1, one minute of longitude either side of 47-40-00 N 122-21-00 W, each
  * with an AN record for antenna 1, and the number's two frequencies filed once against it
- * (both with freq_seq_id 1), beside an ordinary single-site location 2.
+ * (both with freq_seq_id 1), beside an ordinary single-site location 2. The ASR field holds a
+ * registration number only at KZZ505 location 2 (`1012345`); KZZ505's two location-1 sites
+ * file `N/A` and `9999999`, and KZZ502 an application file number, `A1090210`.
  */
 export const QUIRKS_WEEKLY: FixtureFile = {
   countsCreated: PAGING_WEEKLY.countsCreated,
@@ -1324,7 +1346,14 @@ export const QUIRKS_WEEKLY: FixtureFile = {
       name: 'LO.dat',
       data: datFile([
         lo({ usi: 5001, number: 1, type: 'F', lat: [47, 30, 0, 'N'], lon: [122, 30, 0, 'W'] }),
-        lo({ usi: 5002, number: 1, type: 'F', lat: [47, 31, 0, 'N'], lon: [122, 31, 0, 'W'] }),
+        lo({
+          usi: 5002,
+          number: 1,
+          type: 'F',
+          lat: [47, 31, 0, 'N'],
+          lon: [122, 31, 0, 'W'],
+          asr: 'A1090210',
+        }),
         lo({
           usi: 5005,
           number: 1,
@@ -1335,6 +1364,7 @@ export const QUIRKS_WEEKLY: FixtureFile = {
           groundElevation: 120,
           lat: [47, 40, 0, 'N'],
           lon: [122, 22, 0, 'W'],
+          asr: 'N/A',
           supportHeight: 9.8,
           overallHeight: 10.4,
           structureType: 'POLE',
@@ -1350,6 +1380,7 @@ export const QUIRKS_WEEKLY: FixtureFile = {
           groundElevation: 60,
           lat: [47, 40, 0, 'N'],
           lon: [122, 20, 0, 'W'],
+          asr: '9999999',
           supportHeight: 6.7,
           overallHeight: 6.7,
           structureType: 'POLE',
@@ -1365,6 +1396,7 @@ export const QUIRKS_WEEKLY: FixtureFile = {
           groundElevation: 40,
           lat: [47, 36, 0, 'N'],
           lon: [122, 12, 0, 'W'],
+          asr: '1012345',
           overallHeight: 15,
           structureType: 'TOWER',
           name: 'Single Site',
@@ -1456,6 +1488,90 @@ export const QUIRKS_WEEKLY: FixtureFile = {
 };
 
 /**
+ * A paging-slot snapshot of one active individual's license, KZZ521 (USI 5201, applicant type
+ * I, licensee Robin R Sample), whose sites all file a street address and a name: location 1 at
+ * two sites, the first named for the licensee and the second `SAMPLE BARN`, and location 2 at
+ * one, `Sample Ridge`, each number with one antenna and one frequency row.
+ */
+export const INDIVIDUAL_SITES_WEEKLY: FixtureFile = {
+  countsCreated: PAGING_WEEKLY.countsCreated,
+  lastModified: PAGING_WEEKLY.lastModified,
+  zip: buildZip([
+    { name: 'counts', data: countsFile('Sun Sep 27 09:38:53 EDT 2026', { HD: 1, EN: 1, LO: 3 }) },
+    {
+      name: 'HD.dat',
+      data: datFile([
+        hd({ usi: 5201, callsign: 'KZZ521', status: 'A', service: 'CD', grant: '01/01/2020' }),
+      ]),
+    },
+    {
+      name: 'EN.dat',
+      data: datFile([
+        en({
+          usi: 5201,
+          name: 'Robin R Sample',
+          city: 'YAKIMA',
+          state: 'WA',
+          applicantType: 'I',
+        }),
+      ]),
+    },
+    {
+      name: 'LO.dat',
+      data: datFile([
+        lo({
+          usi: 5201,
+          number: 1,
+          type: 'F',
+          address: '7 Orchard Ln',
+          city: 'YAKIMA',
+          state: 'WA',
+          lat: [46, 36, 0, 'N'],
+          lon: [120, 30, 0, 'W'],
+          name: 'Robin R Sample',
+        }),
+        lo({
+          usi: 5201,
+          number: 1,
+          type: 'F',
+          address: '9 Orchard Ln',
+          city: 'YAKIMA',
+          state: 'WA',
+          lat: [46, 36, 30, 'N'],
+          lon: [120, 30, 30, 'W'],
+          name: 'SAMPLE BARN',
+        }),
+        lo({
+          usi: 5201,
+          number: 2,
+          type: 'F',
+          address: '11 Ridge Rd',
+          city: 'SELAH',
+          state: 'WA',
+          lat: [46, 39, 0, 'N'],
+          lon: [120, 32, 0, 'W'],
+          name: 'Sample Ridge',
+        }),
+      ]),
+    },
+    {
+      name: 'AN.dat',
+      data: datFile([
+        an({ usi: 5201, antenna: 1, location: 1, type: 'T' }),
+        an({ usi: 5201, antenna: 1, location: 2, type: 'T' }),
+      ]),
+    },
+    {
+      name: 'FR.dat',
+      data: datFile([
+        fr({ usi: 5201, location: 1, antenna: 1, seq: 1, stationClass: 'FB', frequency: 152.48 }),
+        fr({ usi: 5201, location: 2, antenna: 1, seq: 1, stationClass: 'FB', frequency: 152.48 }),
+      ]),
+    },
+  ]),
+};
+
+/**
  * A paging-slot snapshot of occupied widths at and past the band-class ceilings, every record
  * active: KZZ601 (USI 6001, CD) files 100 MHz on a 62.5 kHz emission (exactly 2^-4 MHz wide),
  * 200 MHz on a 62.6 kHz one (just past it), 300 MHz with no emission (zero width), 400 MHz
@@ -1485,7 +1601,7 @@ export const BAND_CLASS_WEEKLY: FixtureFile = {
         en({ usi: 6003, name: 'Block Edge Wireless', state: 'WA', applicantType: 'C' }),
       ]),
     },
-    { name: 'MK.dat', data: datFile([mk({ usi: 6003, code: 'CMA001', name: 'Seattle, WA' })]) },
+    { name: 'MK.dat', data: datFile([mk({ usi: 6003, code: 'CMA020', name: 'Seattle, WA' })]) },
     {
       name: 'LO.dat',
       data: datFile([
@@ -1525,6 +1641,375 @@ export const BAND_CLASS_WEEKLY: FixtureFile = {
         mf({ usi: 6003, partition: 1, lower: 700, upper: 700.5 }),
         mf({ usi: 6003, partition: 1, lower: 10000, upper: 20000 }),
       ]),
+    },
+  ]),
+};
+
+/**
+ * A paging-slot snapshot of one active license, KZZ531 (USI 5301, IG), filing each kind of
+ * location a radius search meets, every number 30 seconds of latitude farther north of
+ * 46-00-00 N 119-00-00 W: location 1 a fixed site (`F`, no radius), 2 a mobile area (`M`, 4 km
+ * radius of operation), 3 a temporary-fixed area (`T`, 80.5 km), 4 a fixed site filing a 1.5 km
+ * radius, 5 a site filing no type, and 6 two mobile areas under one location number, the 8 km
+ * one at 46-02-30 N 119-00-00 W and the 12 km one 30 seconds of longitude east of it. Each
+ * number has one antenna and its own frequency: 451.0125, 456.0125, 457.5, 452.5, 453.5, and
+ * 458.5 MHz.
+ */
+export const AREA_SITES_WEEKLY: FixtureFile = {
+  countsCreated: PAGING_WEEKLY.countsCreated,
+  lastModified: PAGING_WEEKLY.lastModified,
+  zip: buildZip([
+    { name: 'counts', data: countsFile('Sun Sep 27 09:38:53 EDT 2026', { HD: 1, EN: 1, LO: 7 }) },
+    {
+      name: 'HD.dat',
+      data: datFile([
+        hd({ usi: 5301, callsign: 'KZZ531', status: 'A', service: 'IG', grant: '01/01/2020' }),
+      ]),
+    },
+    {
+      name: 'EN.dat',
+      data: datFile([en({ usi: 5301, name: 'Area Dispatch Co', state: 'WA', applicantType: 'C' })]),
+    },
+    {
+      name: 'LO.dat',
+      data: datFile([
+        lo({
+          usi: 5301,
+          number: 1,
+          type: 'F',
+          county: 'BENTON',
+          state: 'WA',
+          groundElevation: 120,
+          lat: [46, 0, 0, 'N'],
+          lon: [119, 0, 0, 'W'],
+        }),
+        lo({
+          usi: 5301,
+          number: 2,
+          type: 'M',
+          state: 'WA',
+          radiusKm: 4,
+          lat: [46, 0, 30, 'N'],
+          lon: [119, 0, 0, 'W'],
+        }),
+        lo({
+          usi: 5301,
+          number: 3,
+          type: 'T',
+          state: 'WA',
+          radiusKm: 80.5,
+          lat: [46, 1, 0, 'N'],
+          lon: [119, 0, 0, 'W'],
+        }),
+        lo({
+          usi: 5301,
+          number: 4,
+          type: 'F',
+          state: 'WA',
+          radiusKm: 1.5,
+          lat: [46, 1, 30, 'N'],
+          lon: [119, 0, 0, 'W'],
+        }),
+        lo({ usi: 5301, number: 5, state: 'WA', lat: [46, 2, 0, 'N'], lon: [119, 0, 0, 'W'] }),
+        lo({
+          usi: 5301,
+          number: 6,
+          type: 'M',
+          state: 'WA',
+          radiusKm: 8,
+          lat: [46, 2, 30, 'N'],
+          lon: [119, 0, 0, 'W'],
+        }),
+        lo({
+          usi: 5301,
+          number: 6,
+          type: 'M',
+          state: 'WA',
+          radiusKm: 12,
+          lat: [46, 2, 30, 'N'],
+          lon: [118, 59, 30, 'W'],
+        }),
+      ]),
+    },
+    {
+      name: 'AN.dat',
+      data: datFile(
+        [1, 2, 3, 4, 5, 6].map((location) => an({ usi: 5301, antenna: 1, location, type: 'T' })),
+      ),
+    },
+    {
+      name: 'FR.dat',
+      data: datFile(
+        (
+          [
+            [1, 451.0125, 'FB2'],
+            [2, 456.0125, 'MO'],
+            [3, 457.5, 'FB'],
+            [4, 452.5, 'FXO'],
+            [5, 453.5, 'FB'],
+            [6, 458.5, 'MO'],
+          ] as const
+        ).map(([location, frequency, stationClass]) =>
+          fr({ usi: 5301, location, antenna: 1, seq: 1, stationClass, frequency }),
+        ),
+      ),
+    },
+  ]),
+};
+
+/**
+ * Market blocks of one kind per rule the market state filter applies, each an active 704–710
+ * MHz block of its own license, USIs 7001–7010 in this order: MTA010 "Washington-Baltimore"
+ * (DC, MD, PA, VA, WV by the FCC area table, no state in the name); BEA010, its name cut before
+ * the states (CT, MA, NJ, NY, PA, VT); C02201, county-coded and cut before its state (AK); MVD148
+ * "Albany, GA", a code the table does not list (GA from the name); P00127, a P35 GSA filing
+ * sites in TX and OK; TL0004, a Tribal land market with no sites; the lease L000000701 on
+ * NWA255, nationwide, filing a site in WA; NW, nationwide; BEA176, the Gulf of Mexico, filing a
+ * site in LA; and CMA693 "Washington 1 - Clallam" (WA).
+ */
+export const MARKET_STATES_WEEKLY: FixtureFile = {
+  countsCreated: PAGING_WEEKLY.countsCreated,
+  lastModified: PAGING_WEEKLY.lastModified,
+  zip: buildZip([
+    { name: 'counts', data: countsFile('Sun Sep 27 09:38:53 EDT 2026', { HD: 10, EN: 10 }) },
+    {
+      name: 'HD.dat',
+      data: datFile(
+        (
+          [
+            [7001, 'KZZ711', 'CW'],
+            [7002, 'KZZ712', 'CW'],
+            [7003, 'KZZ713', 'UU'],
+            [7004, 'KZZ714', 'DV'],
+            [7005, 'KZZ715', 'ED'],
+            [7006, 'KZZ716', 'ED'],
+            [7007, 'L000000701', 'CN'],
+            [7008, 'KZZ718', 'MM'],
+            [7009, 'KZZ719', 'LS'],
+            [7010, 'KZZ720', 'CL'],
+          ] as const
+        ).map(([usi, callsign, service]) =>
+          hd({ usi, callsign, status: 'A', service, grant: '01/01/2020' }),
+        ),
+      ),
+    },
+    {
+      name: 'EN.dat',
+      data: datFile(
+        [7001, 7002, 7003, 7004, 7005, 7006, 7007, 7008, 7009, 7010].map((usi) =>
+          en({ usi, name: `Market Area Holdings ${usi}`, state: 'DE', applicantType: 'C' }),
+        ),
+      ),
+    },
+    {
+      name: 'MK.dat',
+      data: datFile([
+        mk({ usi: 7001, code: 'MTA010', block: 'A', name: 'Washington-Baltimore' }),
+        mk({ usi: 7002, code: 'BEA010', name: 'New York-No. New Jer.-Long Isl' }),
+        mk({ usi: 7003, code: 'C02201', name: 'PRINCE OF WALES-OUTER KETCHIKA' }),
+        mk({ usi: 7004, code: 'MVD148', name: 'Albany, GA' }),
+        mk({ usi: 7005, code: 'P00127', name: 'P35 GSA' }),
+        mk({ usi: 7006, code: 'TL0004', name: 'TL0004' }),
+        mk({ usi: 7007, code: 'NWA255', name: 'U.S. and Possessions' }),
+        mk({ usi: 7008, code: 'NW', name: 'Nationwide' }),
+        mk({ usi: 7009, code: 'BEA176', name: 'Gulf of Mexico' }),
+        mk({ usi: 7010, code: 'CMA693', block: 'A', name: 'Washington 1 - Clallam' }),
+      ]),
+    },
+    {
+      name: 'LO.dat',
+      data: datFile([
+        lo({
+          usi: 7005,
+          number: 1,
+          type: 'F',
+          state: 'TX',
+          lat: [32, 0, 0, 'N'],
+          lon: [97, 0, 0, 'W'],
+        }),
+        lo({
+          usi: 7005,
+          number: 2,
+          type: 'F',
+          state: 'OK',
+          lat: [35, 0, 0, 'N'],
+          lon: [97, 0, 0, 'W'],
+        }),
+        lo({
+          usi: 7007,
+          number: 1,
+          type: 'F',
+          state: 'WA',
+          lat: [47, 0, 0, 'N'],
+          lon: [122, 0, 0, 'W'],
+        }),
+        lo({
+          usi: 7009,
+          number: 1,
+          type: 'F',
+          state: 'LA',
+          lat: [30, 0, 0, 'N'],
+          lon: [91, 0, 0, 'W'],
+        }),
+      ]),
+    },
+    {
+      name: 'MF.dat',
+      data: datFile(
+        [7001, 7002, 7003, 7004, 7005, 7006, 7007, 7008, 7009, 7010].map((usi) =>
+          mf({ usi, partition: 1, lower: 704, upper: 710 }),
+        ),
+      ),
+    },
+  ]),
+};
+
+/**
+ * Licenses by market code and FRN, USIs 8001–8008: KZZ801 and KZZ802, cellular (CL) on
+ * CMA020 "Seattle-Everett, WA", file WA sites (KZZ801 869.04 and 880.02 MHz at location 1,
+ * KZZ802 870.03 MHz) and no market blocks; KZZ803 (WU, PEA016 "Seattle, WA", FRN 0000800003)
+ * files a 704–710 MHz block and a WA site on 709 MHz; KZZ804 (WU, PEA016) is an individual's
+ * (applicant type I, FRN 0000800004) 704–710 MHz block; KZZ805 (WU, PEA017
+ * "Minneapolis-St. Paul, MN", FRN 0000800003, the licensee of KZZ803) a 704–710 MHz block;
+ * KZZ806 (WU, PEA016) is expired; KZZ807 (WU, NW "Nationwide") and KZZ808 (WU, D06037
+ * "Los Angeles, CA") each hold a 704–710 MHz block.
+ */
+export const MARKET_CODES_WEEKLY: FixtureFile = {
+  countsCreated: PAGING_WEEKLY.countsCreated,
+  lastModified: PAGING_WEEKLY.lastModified,
+  zip: buildZip([
+    { name: 'counts', data: countsFile('Sun Sep 27 09:38:53 EDT 2026', { HD: 8, EN: 8 }) },
+    {
+      name: 'HD.dat',
+      data: datFile(
+        (
+          [
+            [8001, 'KZZ801', 'CL', 'A'],
+            [8002, 'KZZ802', 'CL', 'A'],
+            [8003, 'KZZ803', 'WU', 'A'],
+            [8004, 'KZZ804', 'WU', 'A'],
+            [8005, 'KZZ805', 'WU', 'A'],
+            [8006, 'KZZ806', 'WU', 'E'],
+            [8007, 'KZZ807', 'WU', 'A'],
+            [8008, 'KZZ808', 'WU', 'A'],
+          ] as const
+        ).map(([usi, callsign, service, status]) =>
+          hd({ usi, callsign, status, service, grant: '01/01/2020' }),
+        ),
+      ),
+    },
+    {
+      name: 'EN.dat',
+      data: datFile([
+        en({
+          usi: 8001,
+          name: 'Cascade Cellular Inc',
+          state: 'WA',
+          frn: '0000800001',
+          applicantType: 'C',
+        }),
+        en({
+          usi: 8002,
+          name: 'Sound Cellular LLC',
+          state: 'WA',
+          frn: '0000800002',
+          applicantType: 'C',
+        }),
+        en({
+          usi: 8003,
+          name: 'Puget Spectrum Co',
+          state: 'WA',
+          frn: '0000800003',
+          applicantType: 'C',
+        }),
+        en({
+          usi: 8004,
+          name: 'Jane Q Doe',
+          city: 'Tacoma',
+          state: 'WA',
+          frn: '0000800004',
+          applicantType: 'I',
+        }),
+        en({
+          usi: 8005,
+          name: 'Puget Spectrum Co',
+          state: 'WA',
+          frn: '0000800003',
+          applicantType: 'C',
+        }),
+        en({
+          usi: 8006,
+          name: 'Lapsed Spectrum Co',
+          state: 'WA',
+          frn: '0000800006',
+          applicantType: 'C',
+        }),
+        en({
+          usi: 8007,
+          name: 'Coast To Coast Co',
+          state: 'DE',
+          frn: '0000800007',
+          applicantType: 'C',
+        }),
+        en({
+          usi: 8008,
+          name: 'Basin Spectrum Co',
+          state: 'CA',
+          frn: '0000800008',
+          applicantType: 'C',
+        }),
+      ]),
+    },
+    {
+      name: 'MK.dat',
+      data: datFile([
+        mk({ usi: 8001, code: 'CMA020', block: 'A', name: 'Seattle-Everett, WA' }),
+        mk({ usi: 8002, code: 'CMA020', block: 'B', name: 'Seattle-Everett, WA' }),
+        mk({ usi: 8003, code: 'PEA016', block: 'A', name: 'Seattle, WA' }),
+        mk({ usi: 8004, code: 'PEA016', block: 'B', name: 'Seattle, WA' }),
+        mk({ usi: 8005, code: 'PEA017', block: 'A', name: 'Minneapolis-St. Paul, MN' }),
+        mk({ usi: 8006, code: 'PEA016', block: 'C', name: 'Seattle, WA' }),
+        mk({ usi: 8007, code: 'NW', name: 'Nationwide' }),
+        mk({ usi: 8008, code: 'D06037', name: 'Los Angeles, CA' }),
+      ]),
+    },
+    {
+      name: 'LO.dat',
+      data: datFile(
+        [8001, 8002, 8003].map((usi) =>
+          lo({
+            usi,
+            number: 1,
+            type: 'F',
+            state: 'WA',
+            lat: [47, 36, usi - 8000, 'N'],
+            lon: [122, 20, 0, 'W'],
+          }),
+        ),
+      ),
+    },
+    {
+      name: 'AN.dat',
+      data: datFile(
+        [8001, 8002, 8003].map((usi) => an({ usi, antenna: 1, location: 1, type: 'T' })),
+      ),
+    },
+    {
+      name: 'FR.dat',
+      data: datFile([
+        fr({ usi: 8001, location: 1, antenna: 1, seq: 1, stationClass: 'FB', frequency: 869.04 }),
+        fr({ usi: 8001, location: 1, antenna: 1, seq: 2, stationClass: 'FB', frequency: 880.02 }),
+        fr({ usi: 8002, location: 1, antenna: 1, seq: 1, stationClass: 'FB', frequency: 870.03 }),
+        fr({ usi: 8003, location: 1, antenna: 1, seq: 1, stationClass: 'FB', frequency: 709 }),
+      ]),
+    },
+    {
+      name: 'MF.dat',
+      data: datFile(
+        [8003, 8004, 8005, 8006, 8007, 8008].map((usi) =>
+          mf({ usi, partition: 1, lower: 704, upper: 710 }),
+        ),
+      ),
     },
   ]),
 };

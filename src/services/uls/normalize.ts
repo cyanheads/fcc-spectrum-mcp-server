@@ -1,7 +1,7 @@
 /**
- * @fileoverview Pure normalizers shared by tool inputs and the ingester: callsign,
- * FRN, state, status, and unit spellings; frequency unit conversion; and the
- * degrees-minutes-seconds coordinate rule.
+ * @fileoverview Pure normalizers shared by tool inputs, the ingester, and the read path:
+ * callsign, FRN, market code, state, status, and unit spellings; frequency unit conversion;
+ * the degrees-minutes-seconds coordinate rule; and the ASR registration-number rule.
  * @module services/uls/normalize
  */
 
@@ -44,6 +44,19 @@ export function dmsToDecimal(
   const decimal = degrees + minutes / 60 + seconds / 3600;
   if (decimal > max) return null;
   return direction === negative ? -decimal : decimal;
+}
+
+/** A placeholder filed in the registration-number form; issued numbers run far below it. */
+const ASR_PLACEHOLDER = '9999999';
+
+/**
+ * The filed Antenna Structure Registration value when it is a registration number: seven
+ * digits, the FCC's format, other than the `9999999` placeholder. Anything else filed in the
+ * field (`N/A`, an `A`-prefixed application file number, a numeric of another length) is
+ * `null`, as an unfiled one is.
+ */
+export function asrRegistrationNumber(filed: string | null): string | null {
+  return filed !== null && /^\d{7}$/.test(filed) && filed !== ASR_PLACEHOLDER ? filed : null;
 }
 
 /** Longest coordinate text read; longer text is never a coordinate and is left to the schema. */
@@ -92,6 +105,23 @@ export function normalizeCallsign(raw: string): string {
 export function normalizeFrn(raw: string): string {
   const stripped = raw.replace(/[\s-]/g, '');
   return /^\d{1,10}$/.test(stripped) ? stripped.padStart(10, '0') : stripped;
+}
+
+/**
+ * Trim, uppercase, drop spaces and hyphens, and left-pad the digits of a letters-then-digits
+ * code with zeros to six characters, the width of every ULS market code but `NW` (`pea16` →
+ * `PEA016`, `d6037` → `D06037`, `tl4` → `TL0004`). Other text is left for the pattern check.
+ */
+export function normalizeMarketCode(raw: string): string {
+  return raw
+    .trim()
+    .toUpperCase()
+    .replace(/[\s-]/g, '')
+    .replace(
+      /^([A-Z]+)(\d+)$/,
+      (_, letters: string, digits: string) =>
+        `${letters}${digits.padStart(6 - letters.length, '0')}`,
+    );
 }
 
 /** Uppercase a two-letter code, or map a full state or territory name to its USPS code. */

@@ -23,6 +23,8 @@ import {
   SERVICE_GROUPS,
   type ServiceGroup,
 } from './codes.js';
+import { countyFipsPrefix, marketCodesIn, STATELESS_MARKET_CODES } from './market-states.js';
+import { asrRegistrationNumber } from './normalize.js';
 import {
   bandClassBounds,
   createUlsStore,
@@ -94,7 +96,10 @@ export interface UlsIndexServiceOptions {
   now?: () => number;
   /** Minimum gap between pointer checks, in ms (default one minute; 0 checks every call). */
   pointerCheckMs?: number;
-  /** Withhold individual licensees' names, cities, and site addresses, and trustee names. */
+  /**
+   * Withhold individual licensees' names, cities, site addresses, and site names, and
+   * trustee names.
+   */
   redactIndividuals: boolean;
   /** Service groups this deployment is configured to index. */
   services: readonly ServiceGroup[];
@@ -310,8 +315,10 @@ type SiteAssignmentRow = LicenseHeadRow & {
   frequency: number;
   lat: number | null;
   location_number: number;
+  location_type: string | null;
   lon: number | null;
   max_erp: number | null;
+  radius_km: number | null;
   site_state: string | null;
   sites: number;
   state_derived: number | null;
@@ -329,6 +336,39 @@ type MarketBlockRow = LicenseHeadRow & {
 
 /** Licenses whose licensee name matches an FTS query ({@link ftsQuery}). */
 const LICENSEE_MATCH_SQL = 'l.usi IN (SELECT rowid FROM licenses_fts WHERE licenses_fts MATCH ?)';
+
+const placeholders = (count: number) => Array.from({ length: count }, () => '?').join(', ');
+
+/**
+ * The market-side state test of `searchFrequencies`, resolved at read time. A block matches
+ * when the FCC area table lists the state for its market code (a multi-state market under each
+ * of its states), its county-coded market (`C`/`D` + FIPS) carries the state's FIPS prefix, its
+ * name-derived `market_states` holds the state, or its license files a site in the state.
+ * Nationwide (`NW`, `NWA…`) and Gulf of Mexico markets match no state. Every column is pinned,
+ * so the band index or another filter drives the plan, and the site test reads the license's
+ * own locations by USI: driven from `locations_site_state` instead, it would scan every site
+ * in the state for each candidate block.
+ */
+function marketStateCondition(state: string): Condition {
+  const codes = marketCodesIn(state);
+  const fips = countyFipsPrefix(state);
+  const arms = [
+    condition(`+l.market_code IN (${placeholders(codes.length)})`, ...codes),
+    ...(fips ? [condition('+l.market_code GLOB ?', `[CD]${fips}[0-9][0-9][0-9]`)] : []),
+    condition('l.market_states LIKE ?', `%,${state},%`),
+    condition(
+      'EXISTS (SELECT 1 FROM locations lo WHERE lo.usi = l.usi AND +lo.site_state = ?)',
+      state,
+    ),
+  ];
+  return condition(
+    `(COALESCE(l.market_code, '') NOT GLOB 'NW*'
+      AND COALESCE(l.market_code, '') NOT IN (${placeholders(STATELESS_MARKET_CODES.length)})
+      AND (${arms.map((arm) => arm.sql).join(' OR ')}))`,
+    ...STATELESS_MARKET_CODES,
+    ...whereArgs(arms),
+  );
+}
 
 /** Omit a field whose value is null or undefined; with `exactOptionalPropertyTypes` a field is present or absent. */
 function opt<K extends string, V>(key: K, value: V | null | undefined): { [P in K]?: V } {
@@ -536,11 +576,23 @@ function collapseFrequencies(
   }));
 }
 
-/** One LO row's site fields; the street address only when redaction leaves it visible. */
-function siteFields(lo: LocationRow, addressVisible: boolean): LicenseSite {
+/** A location's type code and its label, both absent when the filing leaves the type blank. */
+function locationType(
+  code: string | null,
+): Pick<LicenseSite, 'locationTypeCode' | 'locationTypeLabel'> {
   return {
-    ...opt('locationTypeCode', lo.location_type),
-    ...opt('locationTypeLabel', lo.location_type && codeLabel(LOCATION_TYPES, lo.location_type)),
+    ...opt('locationTypeCode', code),
+    ...opt('locationTypeLabel', code && codeLabel(LOCATION_TYPES, code)),
+  };
+}
+
+/**
+ * One LO row's site fields: the street address and site name only when redaction leaves them
+ * visible, and the ASR value only when it is a registration number.
+ */
+function siteFields(lo: LocationRow, nameAndAddressVisible: boolean): LicenseSite {
+  return {
+    ...locationType(lo.location_type),
     ...opt('locationClassCode', lo.location_class),
     ...opt('latitude', lo.lat),
     ...opt('longitude', lo.lon),
@@ -549,14 +601,14 @@ function siteFields(lo: LocationRow, addressVisible: boolean): LicenseSite {
     ...opt('supportHeightM', lo.support_height_m),
     ...opt('overallHeightM', lo.overall_height_m),
     ...opt('structureType', lo.structure_type),
-    ...opt('asrNumber', lo.asr_number),
+    ...opt('asrNumber', asrRegistrationNumber(lo.asr_number)),
     ...opt('radiusKm', lo.radius_km),
-    ...(addressVisible && opt('address', lo.address)),
+    ...(nameAndAddressVisible && opt('address', lo.address)),
     ...opt('city', lo.city),
     ...opt('county', lo.county),
     ...opt('state', lo.site_state),
     ...(lo.site_state !== null && { stateFromCoordinates: lo.state_derived === 1 }),
-    ...opt('name', lo.location_name),
+    ...(nameAndAddressVisible && opt('name', lo.location_name)),
   };
 }
 
@@ -712,6 +764,7 @@ export class UlsIndexService {
     };
     if (params.callsign) filter('l.callsign = ?', params.callsign);
     if (params.frn) filter('l.frn = ?', params.frn);
+    if (params.marketCode) filter('l.market_code = ?', params.marketCode);
     if (params.radioService) filter('l.radio_service_code = ?', params.radioService);
     if (params.status !== 'any') filter('l.license_status = ?', params.status);
     if (params.state) filter('l.licensee_state = ?', params.state);
@@ -900,10 +953,10 @@ export class UlsIndexService {
 
     const technicalRetained = (LIVE_STATUSES as readonly string[]).includes(row.license_status);
     const window = technicalRetained
-      ? this.locationWindow(db, row.usi, params.locationOffset ?? 0, params.maxFrequencies)
+      ? this.locationWindow(db, row.usi, params, params.maxFrequencies)
       : undefined;
-    const { locations, shown } = window?.range
-      ? this.licenseLocations(db, row, window.range, params.maxFrequencies)
+    const { locations, shown } = window
+      ? this.licenseLocations(db, row, window.listed, params.maxFrequencies)
       : { locations: [], shown: 0 };
     const { license, nextLeaseOffset } = this.licenseDetail(db, row, params.leaseOffset ?? 0);
     return {
@@ -917,6 +970,8 @@ export class UlsIndexService {
       })),
       frequencyTotal: window?.frequencyTotal ?? 0,
       frequenciesShown: shown,
+      locationOffset: window?.offset ?? params.locationOffset ?? 0,
+      ...(window?.lastNumber !== undefined && { lastLocationNumber: window.lastNumber }),
       locationTotal: window?.locationTotal ?? 0,
       siteTotal: window?.siteTotal ?? 0,
       sitesShown: window?.sitesShown ?? 0,
@@ -929,13 +984,21 @@ export class UlsIndexService {
 
   /**
    * The window of location numbers one `getLicense` call lists: whole locations from
-   * `offset`, in number order, until the next would pass {@link LICENSE_PAGE}'s site or
-   * antenna budget. The first location is always listed, so one larger than a budget is
-   * listed alone rather than split. Sites count every site of a shared number; antennas and
-   * frequency rows count those {@link licenseLocations} lists. `cutAt` is the first location
-   * whose frequency rows `maxFrequencies` drops, since rows are read in location order.
+   * `start.locationOffset`, or from the offset of `start.locationNumber` (the count of the
+   * record's numbers below it, so an unfiled number starts at the next filed one), in number
+   * order, until the next would pass {@link LICENSE_PAGE}'s site or antenna budget. The first
+   * location is always listed, so one larger than a budget is listed alone rather than split.
+   * Sites count every site of a shared number; antennas and frequency rows count those
+   * {@link licenseLocations} lists. `listed` holds the window's numbers, in order. `cutAt` is
+   * the first location whose frequency rows `maxFrequencies` drops, since rows are read in
+   * location order.
    */
-  private locationWindow(db: SqliteHandle, usi: number, offset: number, maxFrequencies: number) {
+  private locationWindow(
+    db: SqliteHandle,
+    usi: number,
+    start: Pick<GetLicenseParams, 'locationNumber' | 'locationOffset'>,
+    maxFrequencies: number,
+  ) {
     const summary = new Map<
       number,
       { antennas: Set<number>; frequencies: number; sites: number }
@@ -973,6 +1036,11 @@ export class UlsIndexService {
       counts.frequencies += count;
     }
     const ordered = [...summary].sort(([a], [b]) => a - b);
+    const { locationNumber, locationOffset = 0 } = start;
+    const offset =
+      locationNumber === undefined
+        ? locationOffset
+        : ordered.filter(([number]) => number < locationNumber).length;
 
     const listed: number[] = [];
     let sites = 0;
@@ -992,12 +1060,12 @@ export class UlsIndexService {
       antennas += counts.antennas.size;
       frequencies += counts.frequencies;
     }
-    const [first] = listed;
-    const last = listed.at(-1);
     const end = offset + listed.length;
     return {
-      range: first !== undefined && last !== undefined ? { first, last } : undefined,
+      listed,
       cutAt,
+      offset,
+      lastNumber: ordered.at(-1)?.[0],
       locationTotal: ordered.length,
       siteTotal: ordered.reduce((sum, [, counts]) => sum + counts.sites, 0),
       sitesShown: sites,
@@ -1117,22 +1185,27 @@ export class UlsIndexService {
   }
 
   /**
-   * Locations → antennas → frequencies for a live record's location numbers `range.first`
-   * through `range.last`. Frequency rows are read in `(location, antenna, freq_seq_id)` order
-   * and capped at `maxFrequencies`, so the cap drops the last locations' rows first. A row
-   * whose antenna or location has no record of its own is kept under a bare antenna or
-   * location entry rather than dropped. A location number filed at several sites lists them
-   * in `sites`; AN and FR rows carry only the number, so its antennas stay on the entry, each
-   * merged across the AN records filed for it (a field is kept only when every record agrees
-   * on it).
+   * Locations → antennas → frequencies for a live record's `listed` location numbers, one
+   * window of {@link locationWindow} in number order. Frequency rows are read in
+   * `(location, antenna, freq_seq_id)` order and capped at `maxFrequencies`, so the cap drops
+   * the last locations' rows first. A row whose antenna or location has no record of its own is
+   * kept under a bare antenna or location entry rather than dropped, and every listed number
+   * gets an entry, so a number filed only on frequency rows the cap drops is still listed, with
+   * no antennas. A location number filed at several sites lists them in `sites`; AN and FR rows
+   * carry only the number, so its antennas stay on the entry, each merged across the AN records
+   * filed for it (a field is kept only when every record agrees on it).
    */
   private licenseLocations(
     db: SqliteHandle,
     row: LicenseRow,
-    range: { first: number; last: number },
+    listed: readonly number[],
     maxFrequencies: number,
   ): { locations: LicenseLocation[]; shown: number } {
-    const { siteAddressVisible } = this.redact(row);
+    const first = listed[0];
+    const last = listed.at(-1);
+    // An offset past the last location lists nothing.
+    if (first === undefined || last === undefined) return { locations: [], shown: 0 };
+    const { siteNameAndAddressVisible } = this.redact(row);
     const locations = new Map<number, LicenseLocation>();
     const antennas = new Map<string, LicenseAntenna>();
     const location = (number: number) => {
@@ -1155,7 +1228,7 @@ export class UlsIndexService {
     };
 
     const inRange = 'usi = ? AND location_number BETWEEN ? AND ?';
-    const rangeArgs = [row.usi, range.first, range.last];
+    const rangeArgs = [row.usi, first, last];
     const sites = Map.groupBy(
       db
         .prepare<LocationRow>(
@@ -1169,8 +1242,8 @@ export class UlsIndexService {
       locations.set(locationNumber, {
         locationNumber,
         ...(filedSites.length > 1
-          ? { sites: filedSites.map((lo) => siteFields(lo, siteAddressVisible)) }
-          : only && siteFields(only, siteAddressVisible)),
+          ? { sites: filedSites.map((lo) => siteFields(lo, siteNameAndAddressVisible)) }
+          : only && siteFields(only, siteNameAndAddressVisible)),
         antennas: [],
       });
     }
@@ -1222,6 +1295,7 @@ export class UlsIndexService {
         emissions: fr.emissions?.split(',') ?? [],
       });
     }
+    for (const number of listed) location(number);
     const sorted = [...locations.values()].sort((a, b) => a.locationNumber - b.locationNumber);
     for (const entry of sorted) entry.antennas.sort((a, b) => a.antennaNumber - b.antennaNumber);
     return { locations: sorted, shown: frequencies.length };
@@ -1232,10 +1306,12 @@ export class UlsIndexService {
   /**
    * Transmitter sites within `radiusKm` of a point, nearest first: a bounding-box query on
    * `locations(lat, lon)`, then haversine distance in JS, keyset-paginated on
-   * `(distance, usi, location_number, site_seq)`. With a band, only sites authorized on an
-   * overlapping frequency match, and each site lists only its overlapping frequencies.
-   * Frequencies are filed against a location number, so every site sharing one lists the
-   * number's frequencies and carries `sitesSharingNumber`.
+   * `(distance, usi, location_number, site_seq)`. A mobile or temporary-fixed area is filed as
+   * a center and a radius of operation, so it is a site at its center, matched and ranked by
+   * the center's distance. With a band, only sites authorized on an overlapping frequency
+   * match, and each site lists only its overlapping frequencies; with a location type, only
+   * sites of that type match. Frequencies are filed against a location number, so every site
+   * sharing one lists the number's frequencies and carries `sitesSharingNumber`.
    */
   async findTransmitters(params: FindTransmittersParams): Promise<PageResult<TransmitterSite>> {
     const { db, id } = await this.requireGeneration();
@@ -1256,6 +1332,10 @@ export class UlsIndexService {
     if (params.radioService) {
       where.push('l.radio_service_code = ?');
       args.push(params.radioService);
+    }
+    if (params.locationType) {
+      where.push('lo.location_type = ?');
+      args.push(params.locationType);
     }
     const overlap = params.band && this.overlapArgs(params.band);
     if (overlap) {
@@ -1318,13 +1398,14 @@ export class UlsIndexService {
         {
           ...this.siteHead(site),
           locationNumber: site.location_number,
-          ...opt('locationTypeCode', site.location_type),
+          ...locationType(site.location_type),
           distanceKm: Math.round(candidate.distance * 1000) / 1000,
           latitude: candidate.lat,
           longitude: candidate.lon,
+          ...opt('radiusKm', site.radius_km),
           ...opt('groundElevationM', site.ground_elevation_m),
           ...opt('overallHeightM', site.overall_height_m),
-          ...opt('asrNumber', site.asr_number),
+          ...opt('asrNumber', asrRegistrationNumber(site.asr_number)),
           ...opt('county', site.county),
           ...opt('state', site.site_state),
           ...(site.site_state !== null && { stateFromCoordinates: site.state_derived === 1 }),
@@ -1354,7 +1435,8 @@ export class UlsIndexService {
    * walked through the band in result order ({@link searchSide}). A walk can stop partway, so
    * a page may hold fewer than `limit` rows and still carry a cursor, and its total may be a
    * lower bound. A frequency filed against a location number several sites share is one row
-   * carrying `sitesSharingNumber` in place of a site's coordinates and place.
+   * carrying `sitesSharingNumber` in place of a site's coordinates, type, radius, and place.
+   * `marketCode` and `frn` test the license, so they filter site and market rows alike.
    */
   async searchFrequencies(
     params: SearchFrequenciesParams,
@@ -1406,6 +1488,17 @@ export class UlsIndexService {
         drive: [condition(LICENSEE_MATCH_SQL, match)],
       });
       if (this.redactIndividuals) filters.push({ pinned: [condition('l.is_individual = 0')] });
+    }
+    // A license's market code and FRN apply to both sides: cellular CMA licenses file sites.
+    for (const [column, value] of [
+      ['market_code', params.marketCode],
+      ['frn', params.frn],
+    ] as const) {
+      if (!value) continue;
+      filters.push({
+        pinned: [condition(`+l.${column} = ?`, value)],
+        drive: [condition(`l.${column} = ?`, value)],
+      });
     }
 
     const overlap = this.overlapArgs(params.band);
@@ -1678,7 +1771,7 @@ export class UlsIndexService {
         f.upper_mhz AS upper, max(f.bandwidth_mhz) AS bandwidth,
         group_concat(f.class_station, '|') AS classes, max(f.erp_w) AS max_erp,
         group_concat(f.emissions, ',') AS emissions,
-        lo.lat, lo.lon, lo.county, lo.site_state, lo.state_derived,
+        lo.lat, lo.lon, lo.location_type, lo.radius_km, lo.county, lo.site_state, lo.state_derived,
         (SELECT count(*) FROM locations s
          WHERE s.usi = f.usi AND s.location_number = f.location_number) AS sites`,
       group: 'GROUP BY f.frequency_mhz, f.usi, f.location_number, f.upper_mhz',
@@ -1698,8 +1791,10 @@ export class UlsIndexService {
           ...(row.sites > 1
             ? { sitesSharingNumber: row.sites }
             : {
+                ...locationType(row.location_type),
                 ...opt('latitude', row.lat),
                 ...opt('longitude', row.lon),
+                ...opt('radiusKm', row.radius_km),
                 ...opt('county', row.county),
                 ...opt('state', row.site_state),
                 ...(row.site_state !== null && { stateFromCoordinates: row.state_derived === 1 }),
@@ -1732,7 +1827,7 @@ export class UlsIndexService {
         condition('COALESCE(mb.upper, mb.lower) >= ?', overlap.low),
       ],
       filters: params.state
-        ? [...filters, { pinned: [condition('l.market_states LIKE ?', `%,${params.state},%`)] }]
+        ? [...filters, { pinned: [marketStateCondition(params.state)] }]
         : filters,
       select: `${LICENSE_HEAD_COLUMNS}, l.market_code, l.market_name, l.channel_block,
         mb.lower, mb.upper, ${PARTITION_AREAS_SQL} AS partitions`,
@@ -1787,15 +1882,16 @@ export class UlsIndexService {
 
   /**
    * The redaction chokepoint. While redaction is on, an individual's record loses its
-   * licensee name and city (flagged `licenseeRedacted`) and its sites' street addresses,
-   * and every trustee name is withheld (`null`) — a trustee is always a person.
+   * licensee name and city (flagged `licenseeRedacted`) and its sites' street addresses and
+   * site names (some individuals file their own name as one), and every trustee name is
+   * withheld (`null`) — a trustee is always a person.
    */
   private redact(
     row: Pick<LicenseRow, 'is_individual' | 'licensee_name'> &
       Partial<Pick<LicenseRow, 'licensee_city' | 'trustee_name'>>,
   ): LicenseeFields & {
     licenseeCity: string | null;
-    siteAddressVisible: boolean;
+    siteNameAndAddressVisible: boolean;
     trusteeName: string | null;
   } {
     const individual = this.redactIndividuals && row.is_individual === 1;
@@ -1803,7 +1899,7 @@ export class UlsIndexService {
       licenseeName: individual ? null : row.licensee_name,
       licenseeRedacted: individual,
       licenseeCity: individual ? null : (row.licensee_city ?? null),
-      siteAddressVisible: !individual,
+      siteNameAndAddressVisible: !individual,
       trusteeName: this.redactIndividuals ? null : (row.trustee_name ?? null),
     };
   }
@@ -1827,7 +1923,8 @@ export class UlsIndexService {
    * handle closed. Every query runs synchronously once it holds the handle, so a swap never
    * closes a handle mid-query. A call that arrives while a check is in flight waits for it,
    * so concurrent first calls never see the not-yet-opened state. A failure to read the
-   * pointer or open the generation reaches callers through {@link unreadable}.
+   * pointer or open the generation reaches callers through {@link unreadable}, and the next
+   * call checks again: a failed check holds no result to serve until the interval passes.
    */
   private generation(): Promise<OpenGeneration | undefined> {
     if (this.pendingCheck) return this.pendingCheck;
@@ -1836,6 +1933,7 @@ export class UlsIndexService {
     }
     this.pendingCheck = this.syncPointer()
       .catch((err: unknown) => {
+        this.lastPointerCheck = Number.NEGATIVE_INFINITY;
         throw this.unreadable(err);
       })
       .finally(() => {

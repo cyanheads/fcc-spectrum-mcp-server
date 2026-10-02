@@ -62,6 +62,7 @@ export interface FixtureIngesterOptions {
   logger?: MirrorLogger;
   now?: number;
   openArchive?: (path: string) => Promise<ZipArchive>;
+  serverPid?: number;
 }
 
 /** A `UlsIngester` over a temp mirror, on the fixture clock unless `now` says otherwise. */
@@ -75,6 +76,7 @@ export function fixtureIngester(mirror: TempMirror, options: FixtureIngesterOpti
     now: () => now,
     ...(options.logger && { logger: options.logger }),
     ...(options.openArchive && { openArchive: options.openArchive }),
+    ...(options.serverPid !== undefined && { serverPid: options.serverPid }),
   });
 }
 

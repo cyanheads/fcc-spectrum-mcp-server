@@ -5,7 +5,8 @@
  * @module tests/services/uls/schema.test
  */
 
-import { spawnSync } from 'node:child_process';
+import { type ChildProcess, spawn, spawnSync } from 'node:child_process';
+import { once } from 'node:events';
 import { existsSync } from 'node:fs';
 import { mkdtemp, readdir, readFile, rm, utimes, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
@@ -255,6 +256,12 @@ describe('readIngestLock', () => {
     });
   });
 
+  it('reads the spawning server PID a scheduled job records', async () => {
+    const holder = { pid: 4242, mode: 'init', startedAt: '2026-09-29T20:00:00Z', serverPid: 1 };
+    await writeFile(join(dir, LOCK_FILE), JSON.stringify(holder));
+    expect(await readIngestLock(dir)).toEqual(holder);
+  });
+
   it('fills defaults for missing mode and start time', async () => {
     await writeFile(join(dir, LOCK_FILE), JSON.stringify({ pid: 7 }));
     expect(await readIngestLock(dir)).toEqual({ pid: 7, mode: 'unknown', startedAt: '' });
@@ -301,6 +308,65 @@ describe('clearInheritedLock', () => {
 
   it('leaves a lock naming any other process', async () => {
     const body = JSON.stringify({ pid: process.pid + 1, mode: 'refresh', startedAt: '' });
+    await writeFile(join(dir, LOCK_FILE), body);
+    expect(await clearInheritedLock(dir)).toBeUndefined();
+    expect(await readFile(join(dir, LOCK_FILE), 'utf8')).toBe(body);
+  });
+
+  it('removes a lock left by a job an earlier server with this PID spawned, once that job is gone', async () => {
+    const holder = {
+      pid: deadPid(),
+      mode: 'init',
+      startedAt: '2026-09-29T19:00:00Z',
+      serverPid: process.pid,
+    };
+    await writeFile(join(dir, LOCK_FILE), JSON.stringify(holder));
+    expect(await clearInheritedLock(dir)).toEqual(holder);
+    expect(await readdir(dir)).toEqual([]);
+  });
+
+  describe('a lock naming this PID as the server of a job', () => {
+    let job: ChildProcess;
+    beforeEach(async () => {
+      job = spawn(process.execPath, ['-e', 'setInterval(() => {}, 1000)'], { stdio: 'ignore' });
+      await once(job, 'spawn');
+    });
+    afterEach(async () => {
+      job.kill('SIGKILL');
+      if (job.exitCode === null && job.signalCode === null) await once(job, 'exit');
+    });
+
+    it('leaves the lock while its job is still running', async () => {
+      const body = JSON.stringify({
+        pid: job.pid,
+        mode: 'init',
+        startedAt: '2026-09-29T19:00:00Z',
+        serverPid: process.pid,
+      });
+      await writeFile(join(dir, LOCK_FILE), body);
+      expect(await clearInheritedLock(dir)).toBeUndefined();
+      expect(await readFile(join(dir, LOCK_FILE), 'utf8')).toBe(body);
+    });
+  });
+
+  it.each([
+    {
+      label: 'naming this PID as its server, taken after this process started',
+      startedAt: () => toIsoSeconds(Date.now()),
+      serverPid: process.pid,
+    },
+    {
+      label: 'naming another server',
+      startedAt: () => '2026-09-29T19:00:00Z',
+      serverPid: process.pid + 1,
+    },
+  ])('leaves a job lock $label, its job gone', async ({ startedAt, serverPid }) => {
+    const body = JSON.stringify({
+      pid: deadPid(),
+      mode: 'init',
+      startedAt: startedAt(),
+      serverPid,
+    });
     await writeFile(join(dir, LOCK_FILE), body);
     expect(await clearInheritedLock(dir)).toBeUndefined();
     expect(await readFile(join(dir, LOCK_FILE), 'utf8')).toBe(body);
@@ -379,8 +445,10 @@ describe('acquireIngestLock and releaseIngestLock', () => {
   });
 
   it('lets exactly one of several concurrent reclaimers take a dead lock', async () => {
+    // One exited process serves every round: spawning one per round was most of this test's time.
+    const stale = deadLock();
     for (let round = 0; round < 40; round++) {
-      await writeFile(lockPath(), deadLock());
+      await writeFile(lockPath(), stale);
       const contenders = Array.from({ length: 4 }, (_, i) => holder(`contender-${round}-${i}`));
       const attempts = await Promise.all(contenders.map((h) => acquireIngestLock(dir, h)));
       const winners = contenders.filter((_, i) => attempts[i]?.taken);
@@ -608,6 +676,69 @@ describe('createUlsStore', () => {
       expect(indexes).toEqual(expect.arrayContaining(['frequencies_band', 'market_blocks_band']));
       expect(indexes).not.toContain('frequencies_occ_low');
       expect(indexes).not.toContain('market_blocks_lower');
+    } finally {
+      await upgraded.close();
+    }
+  });
+
+  it('creates the partial market-code index on a new generation, before any row is written', async () => {
+    const store = createUlsStore(join(dir, 'gen.db'));
+    try {
+      const db = await store.raw();
+      expect(db.prepare<{ n: number }>('SELECT count(*) AS n FROM licenses').get()?.n).toBe(0);
+      expect(db.prepare<{ version: number }>('SELECT version FROM schema_version').get()).toEqual({
+        version: 5,
+      });
+      expect(
+        db
+          .prepare<{ sql: string }>(
+            "SELECT sql FROM sqlite_master WHERE name = 'licenses_market_code'",
+          )
+          .get()?.sql,
+      ).toMatch(/ON licenses \(market_code\) WHERE market_code IS NOT NULL$/);
+    } finally {
+      await store.close();
+    }
+  });
+
+  it('adds the market-code index to a schema 4 generation without marking it for a rebuild', async () => {
+    const path = join(dir, 'gen.db');
+    const v4 = createUlsStore(path);
+    try {
+      // The schema 4 layout: licenses with and without a market code, no index, stamped version 4.
+      (await v4.raw()).exec(
+        `DROP INDEX licenses_market_code;
+         INSERT INTO licenses (usi, callsign, license_status, radio_service_code, market_code)
+           VALUES (1, 'KZZ1', 'A', 'WU', 'PEA016'), (2, 'KZZ2', 'A', 'WU', 'PEA017'),
+                  (3, 'KZZ3', 'A', 'CD', NULL), (4, 'KZZ4', 'A', 'WU', 'PEA016');
+         UPDATE schema_version SET version = 4;`,
+      );
+    } finally {
+      await v4.close();
+    }
+    const upgraded = createUlsStore(path);
+    try {
+      const db = await upgraded.raw();
+      expect(db.prepare<{ version: number }>('SELECT version FROM schema_version').get()).toEqual({
+        version: 5,
+      });
+      expect(db.prepare('SELECT 1 FROM meta').get()).toBeFalsy();
+      const plan = db
+        .prepare<{ detail: string }>(
+          "EXPLAIN QUERY PLAN SELECT usi FROM licenses WHERE market_code = 'PEA016'",
+        )
+        .all()
+        .map((row) => row.detail);
+      expect(plan.join(' ')).toMatch(
+        /SEARCH licenses USING (?:COVERING )?INDEX licenses_market_code \(market_code=\?\)/,
+      );
+      expect(
+        db
+          .prepare<{ usi: number }>(
+            "SELECT usi FROM licenses INDEXED BY licenses_market_code WHERE market_code = 'PEA016' ORDER BY usi",
+          )
+          .all(),
+      ).toEqual([{ usi: 1 }, { usi: 4 }]);
     } finally {
       await upgraded.close();
     }

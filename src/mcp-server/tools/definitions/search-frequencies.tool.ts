@@ -1,7 +1,8 @@
 /**
  * @fileoverview `fcc_spectrum_search_frequencies` — ULS authorizations whose occupied band
  * overlaps a frequency or band: site assignments (one row per site and frequency) and
- * market-area spectrum blocks, filtered by state, radio service, licensee, and status.
+ * market-area spectrum blocks, filtered by state, radio service, licensee, FRN, market code,
+ * and status.
  * @module mcp-server/tools/definitions/search-frequencies
  */
 
@@ -23,8 +24,10 @@ import {
   caseFolded,
   cursorSchema,
   frequencySchema,
+  frnSchema,
   licenseeSchema,
   liveStatusSchema,
+  marketCodeSchema,
   radioServiceSchema,
   stateSchema,
   unitSchema,
@@ -85,15 +88,37 @@ const AssignmentSchema = z
     locationNumber: z
       .number()
       .optional()
-      .describe('Location number within the license (site rows).'),
+      .describe(
+        "Location number within the license (site rows); pass it as location_number to fcc_spectrum_get_license to read the location's antennas and frequencies.",
+      ),
+    locationTypeCode: z
+      .string()
+      .optional()
+      .describe(
+        'ULS location type code, e.g. F (fixed), M (mobile), T (temporary fixed) (site rows at a single site; absent when not filed).',
+      ),
+    locationTypeLabel: z
+      .string()
+      .optional()
+      .describe('Label of the location type code, e.g. "Mobile" (site rows at a single site).'),
     latitude: z
       .number()
       .optional()
-      .describe('Site latitude, decimal degrees (site rows with valid coordinates).'),
+      .describe(
+        'Site latitude, decimal degrees (site rows with valid coordinates); the center of an operating area when radiusKm is filed.',
+      ),
     longitude: z
       .number()
       .optional()
-      .describe('Site longitude, decimal degrees (site rows with valid coordinates).'),
+      .describe(
+        'Site longitude, decimal degrees (site rows with valid coordinates); the center of an operating area when radiusKm is filed.',
+      ),
+    radiusKm: z
+      .number()
+      .optional()
+      .describe(
+        'Radius of operation around latitude/longitude, km, as filed (site rows at a single site); mobile (M) and temporary-fixed (T) areas file one, and some fixed and other sites do.',
+      ),
     county: z.string().optional().describe('Site county, as filed (site rows).'),
     state: z
       .string()
@@ -107,9 +132,12 @@ const AssignmentSchema = z
       .number()
       .optional()
       .describe(
-        'Sites the license files under this location number, when more than one (site rows); ULS does not say which of them uses the frequency, so the row has no coordinates, county, or state. fcc_spectrum_get_license lists the sites.',
+        'Sites the license files under this location number, when more than one (site rows); ULS does not say which of them uses the frequency, so the row has no coordinates, location type, radius, county, or state. fcc_spectrum_get_license lists the sites.',
       ),
-    marketCode: z.string().optional().describe('Market code (market rows).'),
+    marketCode: z
+      .string()
+      .optional()
+      .describe('Market code (market rows); pass it as market_code to search that market.'),
     marketName: z
       .string()
       .optional()
@@ -127,7 +155,7 @@ const AssignmentSchema = z
 export const searchFrequencies = tool('fcc_spectrum_search_frequencies', {
   title: 'Search FCC ULS authorizations by frequency',
   description:
-    "Find FCC ULS authorizations whose occupied band overlaps a frequency or band. Site assignments (land mobile, microwave, paging, cellular sites) return one row per site and frequency with the site's state and coordinates; market-area licenses and leases (PCS, AWS, 700 MHz, 3.45 and 3.7 GHz, and other auctioned blocks) return one row per spectrum block with its market code and name; 3.5 GHz Priority Access Licenses file no frequency, so list them with fcc_spectrum_search_licenses and radio_service PL. Filter by state, radio service, licensee, and live status (active by default). For transmitter sites near a coordinate, use fcc_spectrum_find_transmitters.",
+    "Find FCC ULS authorizations whose occupied band overlaps a frequency or band. Site assignments (land mobile, microwave, paging, cellular sites) return one row per site and frequency with the site's state and coordinates; market-area licenses and leases (PCS, AWS, 700 MHz, 3.45 and 3.7 GHz, and other auctioned blocks) return one row per spectrum block with its market code and name; 3.5 GHz Priority Access Licenses file no frequency, so list them with fcc_spectrum_search_licenses and radio_service PL. Filter by state, radio service, licensee, FRN, market code, and live status (active by default). For transmitter sites near a coordinate, use fcc_spectrum_find_transmitters.",
   annotations: { readOnlyHint: true, idempotentHint: true, openWorldHint: false },
   input: z.object({
     frequency_low: frequencySchema.describe(
@@ -141,13 +169,19 @@ export const searchFrequencies = tool('fcc_spectrum_search_frequencies', {
       'site: transmitter-site assignments only; market: market-area spectrum blocks only; both (default).',
     ),
     state: blankAsUnset(stateSchema.optional()).describe(
-      'Two-letter USPS code or full state name. Sites match on their filed state, or the state derived from their coordinates; market blocks match on the state codes in the market name.',
+      'Two-letter USPS code or full state name. Sites match on their filed state, or the state derived from their coordinates. Market blocks match when their FCC market area reaches the state (a multi-state market matches each of its states), their market name carries the state code, or their license files a site there; nationwide and Gulf of Mexico markets match no state.',
     ),
     radio_service: blankAsUnset(radioServiceSchema.optional()).describe(
       'Two-character radio service code, e.g. "WU" (700 MHz upper band); see fcc_spectrum_list_reference topic "radio_services".',
     ),
     licensee: blankAsUnset(licenseeSchema.optional()).describe(
       'Licensee name words, with at least one letter or digit; every word must match the start of a word in the name, in any order. A word joined by - or & ("T-Mobile", "AT&T") matches its pieces side by side.',
+    ),
+    frn: blankAsUnset(frnSchema.optional()).describe(
+      "Licensee's FCC Registration Number, up to 10 digits; spaces and hyphens are removed and it is left-padded with zeros. Individual licensees match and are returned redacted.",
+    ),
+    market_code: blankAsUnset(marketCodeSchema.optional()).describe(
+      'Market code of the license, matched exactly, e.g. "PEA016", "CMA020", or "NW" (nationwide); market rows carry it as marketCode. Applies to site and market rows alike, since cellular (CMA) licenses file sites rather than blocks. Case, spaces, and hyphens are ignored, and the digits are left-padded with zeros ("pea16" reads as PEA016).',
     ),
     status: blankAsUnset(liveStatusSchema).describe(
       'A active (default), L pending legal, X term pending, or "any" for all three. Other statuses keep no frequency records.',
@@ -196,6 +230,8 @@ export const searchFrequencies = tool('fcc_spectrum_search_frequencies', {
         state: z.string().optional().describe('Normalized state filter.'),
         radio_service: z.string().optional().describe('Radio service code filter.'),
         licensee: z.string().optional().describe('Licensee name words searched.'),
+        frn: z.string().optional().describe('Normalized FRN filter.'),
+        market_code: z.string().optional().describe('Normalized market code filter.'),
         status: z.string().describe('Status filter, default included.'),
       })
       .describe('Filters as the server applied them, normalized values and defaults included.'),
@@ -271,6 +307,8 @@ export const searchFrequencies = tool('fcc_spectrum_search_frequencies', {
       ...(input.state && { state: input.state }),
       ...(input.radio_service && { radio_service: input.radio_service }),
       ...(input.licensee && { licensee: input.licensee }),
+      ...(input.frn && { frn: input.frn }),
+      ...(input.market_code && { market_code: input.market_code }),
       status: input.status,
     };
     ctx.enrich({ dataAsOf, truncated: false, shown: 0, cap: input.limit, appliedFilters });
@@ -299,6 +337,8 @@ export const searchFrequencies = tool('fcc_spectrum_search_frequencies', {
       state: input.state,
       radioService: input.radio_service,
       licensee: input.licensee,
+      frn: input.frn,
+      marketCode: input.market_code,
       status: input.status,
       limit: input.limit,
       cursor: input.cursor,
@@ -321,17 +361,29 @@ export const searchFrequencies = tool('fcc_spectrum_search_frequencies', {
         input.state && 'drop state',
         input.radio_service && 'drop radio_service',
         input.licensee && 'drop licensee',
+        input.market_code && 'drop market_code',
+        input.frn && 'drop frn',
         'widen the band',
         input.kind !== 'both' && 'pass kind "both"',
       ]);
       fragments.push(
         `No authorization overlaps ${bandText(band.lowMhz, band.highMhz)}${input.state ? ` in ${input.state}` : ''} under these filters; ${widen}.`,
       );
+      if (input.market_code) {
+        fragments.push(
+          'market_code matches a market code exactly; codes come from the marketCode field of fcc_spectrum_search_licenses and fcc_spectrum_search_frequencies results.',
+        );
+      }
     }
     if (input.state && input.kind !== 'site') {
       fragments.push(
-        'State filtering on market licenses reads the state codes in the market name; markets with no state in their name are skipped.',
+        'State filtering on market licenses matches a block whose FCC market area reaches the state, whose market name carries the state code, or whose license files a site there; it skips nationwide and Gulf of Mexico markets, and Tribal land (TL) and MVDDS (MVD) markets with no state code in the name.',
       );
+      if (!input.market_code) {
+        fragments.push(
+          'To search one market, including one this rule skips, pass its code as market_code without state.',
+        );
+      }
     }
     if (input.licensee && index.redactIndividuals) {
       fragments.push(
@@ -395,7 +447,7 @@ export const searchFrequencies = tool('fcc_spectrum_search_frequencies', {
       ) {
         const place = [row.county && inline(row.county), row.state].filter(Boolean).join(', ');
         lines.push(
-          `- **Site:** location ${row.locationNumber ?? '—'}${row.latitude !== undefined && row.longitude !== undefined ? ` · ${row.latitude}, ${row.longitude}` : ''}${place ? ` · ${place}` : ''}${stateSourceText(row.stateFromCoordinates)}${row.sitesSharingNumber !== undefined ? ` · ${row.sitesSharingNumber} sites share this location number; ULS does not say which uses this frequency` : ''}`,
+          `- **Site:** location ${row.locationNumber ?? '—'}${row.locationTypeCode ? ` · type ${row.locationTypeCode}${row.locationTypeLabel ? ` (${row.locationTypeLabel})` : ''}` : ''}${row.latitude !== undefined && row.longitude !== undefined ? ` · ${row.latitude}, ${row.longitude}` : ''}${row.radiusKm !== undefined ? ` · radius of operation ${row.radiusKm} km` : ''}${place ? ` · ${place}` : ''}${stateSourceText(row.stateFromCoordinates)}${row.sitesSharingNumber !== undefined ? ` · ${row.sitesSharingNumber} sites share this location number; ULS does not say which uses this frequency` : ''}`,
         );
       }
       const technical = [

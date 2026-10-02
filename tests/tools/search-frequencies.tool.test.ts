@@ -3,8 +3,9 @@
  * dangling, and malformed pointer states, every declared error reason on both surfaces,
  * input validation and blank optional inputs, unit conversion, kind and state filtering,
  * the merged frequency order and cursor paging, the status, state, redaction, and zero-hit
- * notices, the required enrichment on the zero-result and under-cap pages, and `format()`
- * parity with registry text carrying CR/LF and `|`.
+ * notices, a single site's location type and radius (none on a shared location number), the
+ * required enrichment on the zero-result and under-cap pages, and `format()` parity with
+ * registry text carrying CR/LF and `|`.
  * @module tests/tools/search-frequencies.tool.test
  */
 
@@ -29,7 +30,12 @@ import {
   successOf,
   useIndex,
 } from '../fixtures/tool-harness.js';
-import { QUIRKS_WEEKLY } from '../fixtures/uls-fixtures.js';
+import {
+  AREA_SITES_WEEKLY,
+  MARKET_CODES_WEEKLY,
+  MARKET_STATES_WEEKLY,
+  QUIRKS_WEEKLY,
+} from '../fixtures/uls-fixtures.js';
 import {
   buildFixtureIndex,
   type FixtureIndex,
@@ -58,8 +64,14 @@ const BRS_ORDER = [
 
 const ACTIVE_ONLY =
   'Only active records were searched; pass status "any" to include pending-legal and term-pending ones.';
-const STATE_IN_MARKET_NAMES =
-  'State filtering on market licenses reads the state codes in the market name; markets with no state in their name are skipped.';
+const MARKET_STATE_RULE =
+  'State filtering on market licenses matches a block whose FCC market area reaches the state, whose market name carries the state code, or whose license files a site there; it skips nationwide and Gulf of Mexico markets, and Tribal land (TL) and MVDDS (MVD) markets with no state code in the name.';
+const MARKET_CODE_POINTER =
+  'To search one market, including one this rule skips, pass its code as market_code without state.';
+/** The state fragment of a search without market_code. */
+const STATE_FRAGMENT = `${MARKET_STATE_RULE} ${MARKET_CODE_POINTER}`;
+const CODE_SOURCE =
+  'market_code matches a market code exactly; codes come from the marketCode field of fcc_spectrum_search_licenses and fcc_spectrum_search_frequencies results.';
 const NAME_SEARCH_EXCLUDES_INDIVIDUALS =
   'Individual licensees are excluded from name search while redaction is on; search without licensee to see them.';
 const NEXT_PAGE = (shown: number, total: number | string) =>
@@ -352,7 +364,7 @@ describe('warm index', () => {
         licenseeName: 'Leaseholder Wireless LLC',
         frequencyMhz: 2496,
         upperMhz: 2502,
-        marketCode: 'BTA144',
+        marketCode: 'BTA138',
         marketName: 'Fargo-Moorhead, ND-MN',
         channelBlock: 'A1',
       });
@@ -367,7 +379,7 @@ describe('warm index', () => {
       expect(result.assignments).toEqual([
         expect.objectContaining({ usi: '2006', callsign: 'L000000003', isLease: true }),
       ]);
-      expect(result.notice).toBe(STATE_IN_MARKET_NAMES);
+      expect(result.notice).toBe(STATE_FRAGMENT);
     });
   });
 
@@ -526,7 +538,7 @@ describe('warm index', () => {
     ])('adds the state fragment for kind %s', async (kind, expected) => {
       const result = page(await run({ ...BRS, state: 'nd', kind }));
       expect(rowIds(result.assignments)).toEqual(expected);
-      expect(result.notice).toBe(STATE_IN_MARKET_NAMES);
+      expect(result.notice).toBe(STATE_FRAGMENT);
     });
 
     it('leaves the state fragment off for kind site', async () => {
@@ -539,7 +551,7 @@ describe('warm index', () => {
     it('composes the state fragment and the paging guidance into one notice', async () => {
       const result = page(await run({ ...BRS, state: 'ND', limit: 2 }));
       expect(result).toMatchObject({ totalCount: 5, truncated: true, shown: 2, cap: 2 });
-      expect(result.notice).toBe(`${STATE_IN_MARKET_NAMES} ${NEXT_PAGE(2, 5)}`);
+      expect(result.notice).toBe(`${STATE_FRAGMENT} ${NEXT_PAGE(2, 5)}`);
     });
 
     it('lists every option when every filter is set', async () => {
@@ -548,7 +560,7 @@ describe('warm index', () => {
       );
       expect(result.totalCount).toBe(0);
       expect(result.notice).toBe(
-        `${ACTIVE_ONLY} No authorization overlaps 2496–2530 MHz in TX under these filters; drop state, drop radio_service, drop licensee, widen the band, or pass kind "both". ${STATE_IN_MARKET_NAMES} ${NAME_SEARCH_EXCLUDES_INDIVIDUALS}`,
+        `${ACTIVE_ONLY} No authorization overlaps 2496–2530 MHz in TX under these filters; drop state, drop radio_service, drop licensee, widen the band, or pass kind "both". ${STATE_FRAGMENT} ${NAME_SEARCH_EXCLUDES_INDIVIDUALS}`,
       );
     });
 
@@ -593,7 +605,7 @@ describe('warm index', () => {
       expect(rows).toContain(
         '- **Licensee:** Carriage Return Paging · **Redacted:** no · **Lease:** no',
       );
-      expect(rows).toContain('- **Site:** location 1 · ID (state as filed)');
+      expect(rows).toContain('- **Site:** location 1 · type F (Fixed) · ID (state as filed)');
     });
   });
 
@@ -747,6 +759,299 @@ describe('filing quirks', () => {
   });
 });
 
+describe('operating areas', () => {
+  let areas: FixtureIndex;
+  beforeAll(async () => {
+    areas = await buildFixtureIndex({ groups: ['paging'], weekly: { paging: AREA_SITES_WEEKLY } });
+  });
+  beforeEach(async () => {
+    await useIndex(areas.mirrorDir, { services: ['paging'] });
+  });
+  afterAll(async () => {
+    await releaseIndex();
+    await areas.dispose();
+  });
+
+  it("carries a single site's location type and radius on both surfaces", async () => {
+    const result = await run({ frequency_low: 456.0125, kind: 'site', state: 'WA' });
+    const structured = page(result);
+    expect(structured.totalCount).toBe(1);
+    const [row] = structured.assignments;
+    expect(row).toMatchObject({
+      usi: '5301',
+      locationNumber: 2,
+      locationTypeCode: 'M',
+      locationTypeLabel: 'Mobile',
+      radiusKm: 4,
+      longitude: -119,
+    });
+    const rendered = contractText(result);
+    expectCarries(rendered, structured.assignments);
+    expect(rendered.split('\n')).toContain(
+      `- **Site:** location 2 · type M (Mobile) · ${row?.latitude}, -119 · radius of operation 4 km · WA (state as filed)`,
+    );
+  });
+
+  it('renders a fixed site with no radius and an untyped site without inventing either', async () => {
+    const result = await run({ frequency_low: 451, frequency_high: 454, kind: 'site' });
+    const structured = page(result);
+    expect(rowIds(structured.assignments)).toEqual([
+      's5301:1@451.0125',
+      's5301:4@452.5',
+      's5301:5@453.5',
+    ]);
+    const [fixed, fixedWithRadius, untyped] = structured.assignments;
+    expect(fixed).not.toHaveProperty('radiusKm');
+    expect(fixedWithRadius).toMatchObject({ locationTypeCode: 'F', radiusKm: 1.5 });
+    for (const field of ['locationTypeCode', 'locationTypeLabel', 'radiusKm']) {
+      expect(untyped).not.toHaveProperty(field);
+    }
+    const rows = contractText(result).split('\n');
+    expect(rows).toContain(
+      '- **Site:** location 1 · type F (Fixed) · 46, -119 · BENTON, WA (state as filed)',
+    );
+    expect(rows).toContain(
+      `- **Site:** location 5 · ${untyped?.latitude}, -119 · WA (state as filed)`,
+    );
+    expectCarries(contractText(result), structured.assignments);
+  });
+
+  it('gives a shared location number no type or radius, as it gives no coordinates', async () => {
+    const result = await run({ frequency_low: 458.5, kind: 'site' });
+    const [row] = page(result).assignments;
+    expect(row).toMatchObject({ locationNumber: 6, sitesSharingNumber: 2 });
+    for (const field of ['latitude', 'locationTypeCode', 'locationTypeLabel', 'radiusKm']) {
+      expect(row).not.toHaveProperty(field);
+    }
+    expect(contractText(result).split('\n')).toContain(
+      '- **Site:** location 6 · 2 sites share this location number; ULS does not say which uses this frequency',
+    );
+  });
+});
+
+describe('market areas by state', () => {
+  let markets: FixtureIndex;
+  beforeAll(async () => {
+    markets = await buildFixtureIndex({
+      groups: ['paging'],
+      weekly: { paging: MARKET_STATES_WEEKLY },
+    });
+  });
+  beforeEach(async () => {
+    await useIndex(markets.mirrorDir, { services: ['paging'] });
+  });
+  afterAll(async () => {
+    await releaseIndex();
+    await markets.dispose();
+  });
+
+  /** The 704–710 MHz market blocks, one per license (USIs 7001–7010). */
+  const MARKET = { frequency_low: 705, kind: 'market' };
+
+  it('matches market areas that name no state in each state they reach, on both surfaces', async () => {
+    const result = await run({ ...MARKET, state: 'pennsylvania' });
+    const structured = page(result);
+    expect(structured).toMatchObject({
+      totalCount: 2,
+      truncated: false,
+      shown: 2,
+      appliedFilters: { state: 'PA', kind: 'market' },
+      notice: STATE_FRAGMENT,
+    });
+    expect(structured.assignments.map((row) => [row.usi, row.marketCode, row.marketName])).toEqual([
+      ['7001', 'MTA010', 'Washington-Baltimore'],
+      ['7002', 'BEA010', 'New York-No. New Jer.-Long Isl'],
+    ]);
+    const rendered = contractText(result);
+    expectCarries(rendered, structured.assignments);
+    expect(rendered).toContain(`> ${STATE_FRAGMENT}`);
+  });
+
+  it('pages a state past its first page and composes the rule with the paging guidance', async () => {
+    const first = page(await run({ ...MARKET, state: 'PA', limit: 1 }));
+    expect(first).toMatchObject({ totalCount: 2, truncated: true, shown: 1, cap: 1 });
+    expect(first.notice).toBe(`${STATE_FRAGMENT} ${NEXT_PAGE(1, 2)}`);
+    expect(rowIds(first.assignments)).toEqual(['m7001@704']);
+    const second = page(await run({ ...MARKET, state: 'PA', limit: 1, cursor: first.nextCursor }));
+    expect(second).toMatchObject({ totalCount: 2, truncated: false, shown: 1 });
+    expect(rowIds(second.assignments)).toEqual(['m7002@704']);
+    expect(second.nextCursor).toBeUndefined();
+  });
+
+  it('returns an empty page for a cursor past the last match', async () => {
+    const result = page(
+      await run({
+        ...MARKET,
+        state: 'PA',
+        cursor: forgeCursor(FIXTURE_GENERATION_ID, 'f', 704, 0, 9999, 0, 710),
+      }),
+    );
+    expect(result).toMatchObject({ totalCount: 2, shown: 0, truncated: false });
+    expect(result.assignments).toEqual([]);
+  });
+
+  it('finds nothing in a state only Gulf of Mexico and nationwide filings touch', async () => {
+    const result = page(await run({ ...MARKET, state: 'LA' }));
+    expect(result).toMatchObject({ totalCount: 0, shown: 0, truncated: false });
+    expect(result.notice).toBe(
+      `${ACTIVE_ONLY} No authorization overlaps 705 MHz in LA under these filters; drop state, widen the band, or pass kind "both". ${STATE_FRAGMENT}`,
+    );
+  });
+
+  it('reaches a market the state rule skips through market_code', async () => {
+    const result = page(await run({ ...MARKET, market_code: 'tl4' }));
+    expect(result).toMatchObject({ totalCount: 1, appliedFilters: { market_code: 'TL0004' } });
+    expect(rowIds(result.assignments)).toEqual(['m7006@704']);
+  });
+});
+
+describe('market code and FRN filters', () => {
+  let markets: FixtureIndex;
+  beforeAll(async () => {
+    markets = await buildFixtureIndex({
+      groups: ['paging'],
+      weekly: { paging: MARKET_CODES_WEEKLY },
+    });
+  });
+  beforeEach(async () => {
+    await useIndex(markets.mirrorDir, { services: ['paging'] });
+  });
+  afterAll(async () => {
+    await releaseIndex();
+    await markets.dispose();
+  });
+
+  /** 704–710 MHz: the 700 MHz blocks of USIs 8003–8008 and KZZ803's 709 MHz site. */
+  const UPPER_700 = { frequency_low: 704, frequency_high: 710 };
+  /** 824–894 MHz: the cellular sites of KZZ801 and KZZ802. */
+  const CELLULAR = { frequency_low: 824, frequency_high: 894 };
+
+  it('filters both row kinds by the license market code, on both surfaces', async () => {
+    const result = await run({ ...UPPER_700, market_code: 'pea16' });
+    const structured = page(result);
+    expect(structured).toMatchObject({
+      totalCount: 3,
+      shown: 3,
+      truncated: false,
+      appliedFilters: { market_code: 'PEA016', kind: 'both' },
+    });
+    expect(rowIds(structured.assignments)).toEqual(['m8003@704', 'm8004@704', 's8003:1@709']);
+    expect(structured.notice).toBeUndefined();
+    const rendered = contractText(result);
+    expect(rendered).toContain('market_code="PEA016"');
+    expectCarries(rendered, structured.assignments);
+  });
+
+  it('keeps two codes apart, against the unfiltered band', async () => {
+    const all = page(await run(UPPER_700));
+    expect(rowIds(all.assignments)).toEqual([
+      'm8003@704',
+      'm8004@704',
+      'm8005@704',
+      'm8007@704',
+      'm8008@704',
+      's8003:1@709',
+    ]);
+    expect(rowIds(page(await run({ ...UPPER_700, market_code: 'PEA017' })).assignments)).toEqual([
+      'm8005@704',
+    ]);
+    expect(rowIds(page(await run({ ...UPPER_700, market_code: 'nw' })).assignments)).toEqual([
+      'm8007@704',
+    ]);
+  });
+
+  it('returns the site rows of a cellular market code, and no market rows', async () => {
+    const sites = page(await run({ ...CELLULAR, market_code: 'CMA020' }));
+    expect(rowIds(sites.assignments)).toEqual([
+      's8001:1@869.04',
+      's8002:1@870.03',
+      's8001:1@880.02',
+    ]);
+    const blocks = page(await run({ ...CELLULAR, market_code: 'CMA020', kind: 'market' }));
+    expect(blocks).toMatchObject({ totalCount: 0, assignments: [] });
+    expect(blocks.notice).toBe(
+      `${ACTIVE_ONLY} No authorization overlaps 824–894 MHz under these filters; drop market_code, widen the band, or pass kind "both". ${CODE_SOURCE}`,
+    );
+  });
+
+  it('applies state and market_code together, judging market rows by the state rule', async () => {
+    const wa = page(await run({ ...UPPER_700, market_code: 'PEA016', state: 'WA' }));
+    expect(rowIds(wa.assignments)).toEqual(['m8003@704', 'm8004@704', 's8003:1@709']);
+    expect(wa.notice).toBe(MARKET_STATE_RULE);
+    const oregon = page(await run({ ...UPPER_700, market_code: 'PEA016', state: 'OR' }));
+    expect(oregon.totalCount).toBe(0);
+    expect(oregon.notice).toBe(
+      `${ACTIVE_ONLY} No authorization overlaps 704–710 MHz in OR under these filters; drop state, drop market_code, or widen the band. ${CODE_SOURCE} ${MARKET_STATE_RULE}`,
+    );
+    const minnesota = page(await run({ ...UPPER_700, market_code: 'PEA017', state: 'MN' }));
+    expect(rowIds(minnesota.assignments)).toEqual(['m8005@704']);
+    const cellularWa = page(
+      await run({ ...CELLULAR, market_code: 'CMA020', state: 'WA', kind: 'site' }),
+    );
+    expect(cellularWa.totalCount).toBe(3);
+  });
+
+  it('filters by FRN, normalized, returning an individual redacted', async () => {
+    const company = page(await run({ ...UPPER_700, frn: '800-003' }));
+    expect(company.appliedFilters).toMatchObject({ frn: '0000800003' });
+    expect(rowIds(company.assignments)).toEqual(['m8003@704', 'm8005@704', 's8003:1@709']);
+    const result = await run({ ...UPPER_700, frn: '800004' });
+    const individual = page(result);
+    expect(rowIds(individual.assignments)).toEqual(['m8004@704']);
+    expect(individual.assignments[0]).toMatchObject({
+      licenseeName: null,
+      licenseeRedacted: true,
+    });
+    expect(contractText(result)).toContain('Redacted (individual licensee)');
+    expect(contractText(result)).not.toContain('Jane');
+    const both = page(await run({ ...UPPER_700, frn: '800003', market_code: 'PEA017' }));
+    expect(rowIds(both.assignments)).toEqual(['m8005@704']);
+  });
+
+  it('pages a market-code search past its first page', async () => {
+    const seen: string[] = [];
+    let cursor: string | undefined;
+    for (let call = 0; call < 3; call++) {
+      const next = page(
+        await run({ ...UPPER_700, market_code: 'PEA016', limit: 1, ...(cursor && { cursor }) }),
+      );
+      expect(next).toMatchObject({ totalCount: 3, shown: 1 });
+      seen.push(...rowIds(next.assignments));
+      cursor = next.nextCursor;
+    }
+    expect(seen).toEqual(['m8003@704', 'm8004@704', 's8003:1@709']);
+    expect(cursor).toBeUndefined();
+  });
+
+  it('says where codes come from when a well-formed code matches nothing', async () => {
+    const result = await run({ ...UPPER_700, market_code: 'PEA999', frn: '800003' });
+    const structured = page(result);
+    expect(structured).toMatchObject({ totalCount: 0, shown: 0, assignments: [] });
+    expect(structured.notice).toBe(
+      `${ACTIVE_ONLY} No authorization overlaps 704–710 MHz under these filters; drop market_code, drop frn, or widen the band. ${CODE_SOURCE}`,
+    );
+    expect(contractText(result)).toContain(CODE_SOURCE);
+  });
+
+  it('reads blank market_code and frn as unset', async () => {
+    const blank = page(await run({ ...UPPER_700, market_code: '  ', frn: '' }));
+    expect(blank.appliedFilters).not.toHaveProperty('market_code');
+    expect(blank.appliedFilters).not.toHaveProperty('frn');
+    expect(blank.totalCount).toBe(6);
+  });
+
+  it.each([
+    ['market_code', 'Seattle'],
+    ['market_code', 'PEA0016'],
+    ['frn', 'abc'],
+    ['frn', '12345678901'],
+  ])('rejects %s %s with InvalidParams', async (key, value) => {
+    const error = errorOf(await run({ ...UPPER_700, [key]: value }));
+    expect(error.code).toBe(JsonRpcErrorCode.InvalidParams);
+    expect(error.message).toContain(`${key}: Invalid string: must match pattern`);
+  });
+});
+
 describe('format()', () => {
   const site: Assignment = {
     kind: 'site',
@@ -764,8 +1069,11 @@ describe('format()', () => {
     maxErpW: 250,
     emissions: ['11K2F3E', '10|M0'],
     locationNumber: 1,
+    locationTypeCode: 'F',
+    locationTypeLabel: 'Fixed',
     latitude: 47.5,
     longitude: -122.25,
+    radiusKm: 2.5,
     county: 'KI\r\nNG',
     state: 'WA',
     stateFromCoordinates: false,
@@ -782,7 +1090,7 @@ describe('format()', () => {
     licenseeRedacted: false,
     frequencyMhz: 2496,
     upperMhz: 2502,
-    marketCode: 'BTA144',
+    marketCode: 'BTA138',
     marketName: 'Fargo\r\nMoorhead, ND-MN',
     channelBlock: 'A\n1',
   };
@@ -796,11 +1104,11 @@ describe('format()', () => {
       '### 152.24 MHz · site · KZZ 077 · USI 77',
       '- **Licensee:** Acme Radio Co · **Redacted:** no · **Lease:** no',
       '- **Status:** A · **Service:** CD (Paging and Radiotelephone)',
-      '- **Site:** location 1 · 47.5, -122.25 · KI NG, WA (state as filed)',
+      '- **Site:** location 1 · type F (Fixed) · 47.5, -122.25 · radius of operation 2.5 km · KI NG, WA (state as filed)',
       '### 2496–2502 MHz · market · L000 000001 · USI 2002',
       '- **Licensee:** Lease holder Wireless · **Redacted:** no · **Lease:** yes',
       '- **Status:** A · **Service:** BR (Broadband Radio Service)',
-      '- **Market:** BTA144 — Fargo Moorhead, ND-MN · **Block:** A 1',
+      '- **Market:** BTA138 — Fargo Moorhead, ND-MN · **Block:** A 1',
     ]) {
       expect(rows).toContain(line);
     }
@@ -855,6 +1163,7 @@ describe('format()', () => {
     expect(rows).toContain(
       '- **Licensee:** Redacted (individual licensee) · **Redacted:** yes · **Lease:** no',
     );
+    expect(rendered).not.toContain('radius of operation');
     expect(rendered).not.toContain('**Bandwidth:**');
     expect(rendered).not.toContain('**Station classes:**');
     expect(rendered).not.toContain('**Market:**');

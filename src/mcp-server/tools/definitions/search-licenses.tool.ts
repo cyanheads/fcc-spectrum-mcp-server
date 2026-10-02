@@ -1,7 +1,7 @@
 /**
  * @fileoverview `fcc_spectrum_search_licenses` — search ULS licenses and spectrum leases
- * by callsign, licensee name, FRN, radio service, status, and licensee state, one row per
- * record with the USI that `fcc_spectrum_get_license` takes.
+ * by callsign, licensee name, FRN, market code, radio service, status, and licensee state,
+ * one row per record with the USI that `fcc_spectrum_get_license` takes.
  * @module mcp-server/tools/definitions/search-licenses
  */
 
@@ -21,6 +21,7 @@ import {
   frnSchema,
   licenseeSchema,
   licenseStatusSchema,
+  marketCodeSchema,
   radioServiceSchema,
   stateSchema,
 } from '@/mcp-server/tools/input-schemas.js';
@@ -83,7 +84,12 @@ const LicenseSchema = z
     frequencyCount: z
       .number()
       .describe('Frequency rows indexed for the record; 0 when its status is not A, L, or X.'),
-    marketCode: z.string().optional().describe('Market code of a geographic-area license.'),
+    marketCode: z
+      .string()
+      .optional()
+      .describe(
+        "Market code of a geographic-area license; pass it as market_code to list the market's licenses.",
+      ),
     marketName: z.string().optional().describe('Market name of a geographic-area license.'),
   })
   .describe('One license or lease record.');
@@ -91,7 +97,7 @@ const LicenseSchema = z
 export const searchLicenses = tool('fcc_spectrum_search_licenses', {
   title: 'Search FCC ULS licenses',
   description:
-    'Search FCC ULS licenses and spectrum leases by callsign, licensee name, FCC Registration Number (FRN), radio service, status, and licensee state, returning one row per record with its unique system identifier (USI) for fcc_spectrum_get_license. At least one of callsign, licensee, frn, radio_service, or state is required; status only narrows. Defaults to active records; pass status "any" to include expired, cancelled, and terminated ones. Licensee name matching is word-based (every word must appear as a word prefix), not fuzzy.',
+    'Search FCC ULS licenses and spectrum leases by callsign, licensee name, FCC Registration Number (FRN), market code, radio service, status, and licensee state, returning one row per record with its unique system identifier (USI) for fcc_spectrum_get_license. At least one of callsign, licensee, frn, market_code, radio_service, or state is required; status only narrows. Defaults to active records; pass status "any" to include expired, cancelled, and terminated ones. Licensee name matching is word-based (every word must appear as a word prefix), not fuzzy.',
   annotations: { readOnlyHint: true, idempotentHint: true, openWorldHint: false },
   input: z.object({
     callsign: blankAsUnset(callsignSchema.optional()).describe(
@@ -102,6 +108,9 @@ export const searchLicenses = tool('fcc_spectrum_search_licenses', {
     ),
     frn: blankAsUnset(frnSchema.optional()).describe(
       'FCC Registration Number, up to 10 digits; spaces and hyphens are removed and it is left-padded with zeros.',
+    ),
+    market_code: blankAsUnset(marketCodeSchema.optional()).describe(
+      'Market code of a geographic-area license, matched exactly, e.g. "PEA016", "CMA020", "D06037", or "NW" (nationwide); results carry it as marketCode. Case, spaces, and hyphens are ignored, and the digits are left-padded with zeros ("pea16" reads as PEA016).',
     ),
     radio_service: blankAsUnset(radioServiceSchema.optional()).describe(
       'Two-character radio service code, e.g. "CD" (paging) or "BR" (BRS); see fcc_spectrum_list_reference topic "radio_services".',
@@ -139,6 +148,7 @@ export const searchLicenses = tool('fcc_spectrum_search_licenses', {
         callsign: z.string().optional().describe('Normalized callsign filter.'),
         licensee: z.string().optional().describe('Licensee name words searched.'),
         frn: z.string().optional().describe('Normalized FRN filter.'),
+        market_code: z.string().optional().describe('Normalized market code filter.'),
         radio_service: z.string().optional().describe('Radio service code filter.'),
         status: z.string().describe('Status filter, default included.'),
         state: z.string().optional().describe('Normalized licensee state filter.'),
@@ -164,7 +174,7 @@ export const searchLicenses = tool('fcc_spectrum_search_licenses', {
       code: JsonRpcErrorCode.ValidationError,
       when: 'No search field was supplied.',
       recovery:
-        'Provide at least one of callsign, licensee, frn, radio_service, or state; call fcc_spectrum_list_reference with topic "radio_services" for valid service codes.',
+        'Provide at least one of callsign, licensee, frn, market_code, radio_service, or state; call fcc_spectrum_list_reference with topic "radio_services" for valid service codes.',
     },
     {
       reason: 'unknown_radio_service',
@@ -199,6 +209,7 @@ export const searchLicenses = tool('fcc_spectrum_search_licenses', {
       ...(input.callsign && { callsign: input.callsign }),
       ...(input.licensee && { licensee: input.licensee }),
       ...(input.frn && { frn: input.frn }),
+      ...(input.market_code && { market_code: input.market_code }),
       ...(input.radio_service && { radio_service: input.radio_service }),
       status: input.status,
       ...(input.state && { state: input.state }),
@@ -206,7 +217,14 @@ export const searchLicenses = tool('fcc_spectrum_search_licenses', {
     ctx.enrich({ dataAsOf, truncated: false, shown: 0, cap: input.limit, appliedFilters });
     ctx.enrich.total(0);
 
-    if (!input.callsign && !input.licensee && !input.frn && !input.radio_service && !input.state) {
+    if (
+      !input.callsign &&
+      !input.licensee &&
+      !input.frn &&
+      !input.market_code &&
+      !input.radio_service &&
+      !input.state
+    ) {
       throw ctx.fail('no_criteria');
     }
     if (input.radio_service) {
@@ -230,6 +248,7 @@ export const searchLicenses = tool('fcc_spectrum_search_licenses', {
       callsign: input.callsign,
       licensee: input.licensee,
       frn: input.frn,
+      marketCode: input.market_code,
       radioService: input.radio_service,
       status: input.status,
       state: input.state,
@@ -261,6 +280,11 @@ export const searchLicenses = tool('fcc_spectrum_search_licenses', {
       if (input.frn) {
         fragments.push(
           `No record matching these filters carries FRN ${input.frn}; some licensees file no FRN, so also search by licensee name.`,
+        );
+      }
+      if (input.market_code) {
+        fragments.push(
+          'market_code matches a market code exactly; codes come from the marketCode field of fcc_spectrum_search_licenses and fcc_spectrum_search_frequencies results.',
         );
       }
     }

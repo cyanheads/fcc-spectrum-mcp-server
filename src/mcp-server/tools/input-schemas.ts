@@ -8,11 +8,12 @@
  */
 
 import { z } from '@cyanheads/mcp-ts-core';
-import { USPS_CODES } from '@/services/uls/codes.js';
+import { LOCATION_TYPES, USPS_CODES } from '@/services/uls/codes.js';
 import {
   FREQUENCY_UNITS,
   normalizeCallsign,
   normalizeFrn,
+  normalizeMarketCode,
   normalizeStateInput,
   normalizeStatusInput,
   normalizeUnitInput,
@@ -55,6 +56,16 @@ export const callsignSchema = z.preprocess(
 /** FCC Registration Number: spaces and hyphens stripped, left-padded to 10 digits. */
 export const frnSchema = z.preprocess(normalizedString(normalizeFrn), z.string().regex(/^\d{10}$/));
 
+/**
+ * ULS market code: trimmed, uppercased, spaces and hyphens dropped, digits left-padded to six
+ * characters. The pattern holds every code the bulk files carry: three letters and three
+ * digits (`PEA016`), one letter and five (`D06037`), two letters and four (`TL0004`), or `NW`.
+ */
+export const marketCodeSchema = z.preprocess(
+  normalizedString(normalizeMarketCode),
+  z.string().regex(/^(?:[A-Z]{3}\d{3}|[A-Z]\d{5}|[A-Z]{2}\d{4}|NW)$/),
+);
+
 /** Unique system identifier as a decimal string without leading zeros. */
 export const usiSchema = z.preprocess(
   normalizedString((raw) => raw.trim()),
@@ -68,6 +79,12 @@ export const stateSchema = z.preprocess(normalizedString(normalizeStateInput), z
 export const radioServiceSchema = z.preprocess(
   normalizedString((raw) => raw.trim().toUpperCase()),
   z.string().regex(/^[A-Z0-9]{2}$/),
+);
+
+/** One ULS location type code from the FCC table (`F`, `M`, `T`, …), trimmed and uppercased. */
+export const locationTypeSchema = z.preprocess(
+  normalizedString((raw) => raw.trim().toUpperCase()),
+  z.enum(Object.keys(LOCATION_TYPES) as [string, ...string[]]),
 );
 
 /** Every license status plus `any`, for tools that read all statuses; defaults to `A`. */
