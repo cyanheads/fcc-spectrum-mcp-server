@@ -38,6 +38,7 @@ import {
   AREA_SITES_WEEKLY,
   BAND_CLASS_WEEKLY,
   DAILY_PG_MON,
+  DATA_QUALITY_WEEKLY,
   FakeIngestClient,
   INDIVIDUAL_SITES_WEEKLY,
   MARKET_CODES_WEEKLY,
@@ -190,6 +191,148 @@ afterAll(async () => {
   await Promise.all(services.map((service) => service.close()));
   await fixture?.dispose();
   await Promise.all(mirrors.map((mirror) => mirror.remove()));
+});
+
+describe('filed location classes', () => {
+  let index: FixtureIndex;
+  let service: UlsIndexService;
+  beforeAll(async () => {
+    index = await buildFixtureIndex({
+      groups: ['paging'],
+      weekly: { paging: DATA_QUALITY_WEEKLY },
+    });
+    service = index.service();
+  });
+  afterAll(async () => {
+    await index.dispose();
+  });
+
+  it('keeps independent unnumbered records and whole-location budgets across every window', async () => {
+    const first = await service.getLicense({ callsign: 'KZZ541', maxFrequencies: 1 });
+    expect(first).toMatchObject({ found: true, nextLocationOffset: 1, frequenciesShown: 1 });
+    if (!first.found) throw new Error('Missing fixture');
+    expect(first.locations.map((entry) => entry.locationNumber)).toEqual([1]);
+    expect(first.locations[0]?.antennas).toEqual([
+      expect.objectContaining({ antennaNumber: 1, make: 'AGREED', recordCount: 2 }),
+    ]);
+    expect(first.locations[0]?.antennas[0]).not.toHaveProperty('model');
+    const second = await service.getLicense({
+      callsign: 'KZZ541',
+      locationOffset: 1,
+      maxFrequencies: 1,
+    });
+    expect(second).toMatchObject({
+      found: true,
+      nextLocationOffset: 2,
+      frequencyTotal: 6,
+      sitesShown: 2,
+    });
+    if (!second.found) throw new Error('Missing fixture');
+    expect(second.locations.map((entry) => entry.locationNumber)).toEqual([2]);
+    const unnumbered = second.locations[0]!.antennas.filter(
+      (entry) => entry.antennaNumber === undefined,
+    );
+    expect(unnumbered).toHaveLength(101);
+    expect(unnumbered.map((entry) => entry.model)).toEqual([
+      'DUPLICATE',
+      'DUPLICATE',
+      ...Array.from({ length: 99 }, (_, i) => `MODEL${i + 2}`),
+    ]);
+    expect(
+      unnumbered.every(
+        (entry) => entry.frequencies.length === 0 && entry.recordCount === undefined,
+      ),
+    ).toBe(true);
+    expect(
+      second.locations[0]?.antennas.find((entry) => entry.antennaNumber === 1)?.frequencies,
+    ).toHaveLength(1);
+    const last = await service.getLicense({
+      callsign: 'KZZ541',
+      locationOffset: 2,
+      maxFrequencies: 10,
+    });
+    expect(last).toMatchObject({
+      found: true,
+      locations: [
+        { locationNumber: 3 },
+        { locationNumber: 4 },
+        { locationNumber: 5 },
+        { locationNumber: 6 },
+        { locationNumber: 7 },
+      ],
+    });
+    expect(last).not.toHaveProperty('nextLocationOffset');
+    expect(
+      await service.getLicense({ callsign: 'KZZ541', locationOffset: 99, maxFrequencies: 1 }),
+    ).toMatchObject({ found: true, locations: [], frequenciesShown: 0 });
+  });
+
+  it('omits invalid decimals on detail and frequency search while retaining filed state and classes', async () => {
+    const detail = await service.getLicense({
+      callsign: 'KZZ541',
+      locationNumber: 6,
+      maxFrequencies: 10,
+    });
+    expect(detail).toMatchObject({
+      found: true,
+      locations: [
+        {
+          locationNumber: 6,
+          state: 'NY',
+          coordinatesDms: '0-0-0 N 0-0-0 W',
+          locationClassLabel: 'Transmit Location',
+        },
+        { locationNumber: 7 },
+      ],
+    });
+    if (!detail.found) throw new Error('Missing fixture');
+    expect(detail.locations[0]).not.toHaveProperty('latitude');
+    expect(detail.locations[0]).not.toHaveProperty('longitude');
+    const rows = page(
+      await service.searchFrequencies(frequencies({ band: band(152, 157), kind: 'site' })),
+    ).rows;
+    expect(rows[0]).toMatchObject({
+      locationClassCode: 'T',
+      locationClassLabel: 'Transmit Location',
+    });
+    expect(rows[1]).not.toHaveProperty('locationClassCode');
+    expect(rows[1]).not.toHaveProperty('locationClassLabel');
+    expect(rows[3]).toMatchObject({ locationClassCode: 'Z' });
+    expect(rows[3]).not.toHaveProperty('locationClassLabel');
+    expect(rows[5]).toMatchObject({ state: 'NY', stateFromCoordinates: false });
+    expect(rows[5]).not.toHaveProperty('latitude');
+    expect(rows[5]).not.toHaveProperty('longitude');
+    expect(
+      page(
+        await service.findTransmitters(transmitters({ latitude: 0, longitude: 0, radiusKm: 0.1 })),
+      ).rows,
+    ).toEqual([]);
+  });
+
+  it('filters each site before totals and every cursor page without losing shared-number ambiguity', async () => {
+    const base = transmitters({ latitude: 47, longitude: -122, radiusKm: 5, limit: 1 });
+    const all = await allPages((cursor) => service.findTransmitters({ ...base, cursor }));
+    expect(all.rows.map((row) => row.locationNumber)).toEqual([1, 2, 2, 3, 4, 5]);
+    for (const code of ['T', 'R', 'P']) {
+      const selected = await allPages((cursor) =>
+        service.findTransmitters({ ...base, locationClass: code, cursor }),
+      );
+      expect(selected.rows).toEqual(all.rows.filter((row) => row.locationClassCode === code));
+      expect(selected.total).toBe(selected.rows.length);
+    }
+    expect(all.rows[0]).toMatchObject({
+      locationClassCode: 'T',
+      locationClassLabel: 'Transmit Location',
+    });
+    expect(all.rows[1]).toMatchObject({
+      locationClassCode: 'R',
+      locationClassLabel: 'Receive Location',
+      sitesSharingNumber: 2,
+    });
+    expect(all.rows[4]).toMatchObject({ locationClassCode: 'Z' });
+    expect(all.rows[4]).not.toHaveProperty('locationClassLabel');
+    expect(all.rows[5]).not.toHaveProperty('locationClassCode');
+  });
 });
 
 describe('cold index', () => {
@@ -346,7 +489,7 @@ describe('cold index', () => {
     try {
       const db = await upgraded.raw();
       expect(db.prepare<{ version: number }>('SELECT version FROM schema_version').get()).toEqual({
-        version: 5,
+        version: 7,
       });
       expect(
         db.prepare('SELECT 1 FROM meta WHERE key = ?').get(META_KEYS.rebuildRequired),
@@ -399,7 +542,7 @@ describe('cold index', () => {
 
   /**
    * A failure reading the index reaches callers as a path-free `ServiceUnavailable` with no
-   * `data` path and no `cause` (the framework forwards a cause's message as `rootCause`); the
+   * `data` path and no `cause`; the
    * operator log keeps the original error, path included.
    */
   function expectPathFree(mirror: TempMirror, failure: unknown, logged: string) {
@@ -445,7 +588,7 @@ describe('cold index', () => {
 
   it('fails path-free, logging the full error, when the published generation cannot be opened', async () => {
     const { mirror, service } = await coldService();
-    // A directory where the generation file should be: the store's open fails, naming the path.
+    // A directory where the generation file should be: the store's open fails, naming the file.
     const generationPath = join(mirror.mirrorDir, FIXTURE_GENERATION);
     await mkdir(generationPath);
     await writePointer(mirror.mirrorDir, {
@@ -455,9 +598,9 @@ describe('cold index', () => {
     vi.spyOn(logger, 'error').mockImplementation(() => {});
     try {
       const failure = await service.coverage().catch((err: unknown) => err);
-      expectPathFree(mirror, failure, generationPath);
+      expectPathFree(mirror, failure, FIXTURE_GENERATION);
       expect((failure as Error).message).toBe(
-        `The local ULS index could not be read: Failed to open mirror store at ${FIXTURE_GENERATION}`,
+        `The local ULS index could not be read: Failed to open mirror store "${FIXTURE_GENERATION}".`,
       );
     } finally {
       vi.mocked(logger.error).mockRestore();

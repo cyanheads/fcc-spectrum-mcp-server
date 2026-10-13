@@ -13,7 +13,7 @@ import { createMockContext, getEnrichment, runToolContract } from '@cyanheads/mc
 import { afterAll, beforeAll, describe, expect, it } from 'vitest';
 import { listReference } from '@/mcp-server/tools/definitions/list-reference.tool.js';
 import { LICENSE_STATUSES, RADIO_SERVICES } from '@/services/uls/codes.js';
-import { LOCK_FILE, POINTER_FILE } from '@/services/uls/schema.js';
+import { createUlsStore, LOCK_FILE, POINTER_FILE } from '@/services/uls/schema.js';
 import { initUlsIndexService } from '@/services/uls/uls-index-service.js';
 import {
   buildFixtureIndex,
@@ -38,7 +38,7 @@ function useIndex(mirrorDir: string, redactIndividuals = true) {
 }
 
 async function call(input: Record<string, unknown>) {
-  const ctx = createMockContext();
+  const ctx = createMockContext({ errors: listReference.errors });
   const result = await listReference.handler(listReference.input.parse(input), ctx);
   return { result, enrichment: getEnrichment(ctx) as { dataAsOf?: string; notice?: string } };
 }
@@ -77,6 +77,124 @@ describe('cold index', () => {
     await service.close();
   });
 
+  it('discloses an ignored coverage filter alongside cold-index guidance on both surfaces', async () => {
+    const service = useIndex(cold.mirrorDir);
+    try {
+      const result = await runToolContract(listReference, { topic: 'coverage', filter: '!!!' });
+      expect(result.isError).toBeFalsy();
+      expect(result.structuredContent).toMatchObject({
+        notice: expect.stringContaining('filter was not applied'),
+      });
+      expect(text(result)).toContain('filter was not applied');
+      expect(text(result)).toContain('has not been built yet');
+    } finally {
+      await service.close();
+    }
+  });
+
+  it.each(['!!!', '東京', '\u0301'])(
+    'rejects searchable tokenless filter %j with actionable recovery',
+    async (filter) => {
+      const service = useIndex(cold.mirrorDir);
+      try {
+        const result = await runToolContract(listReference, { topic: 'radio_services', filter });
+        expect(result.isError).toBe(true);
+        expect(result.structuredContent).toMatchObject({
+          error: {
+            code: JsonRpcErrorCode.ValidationError,
+            data: {
+              reason: 'invalid_filter',
+              recovery: { hint: expect.stringContaining('ASCII letter or digit') },
+            },
+          },
+        });
+        expect(text(result)).toContain('ASCII letter or digit');
+      } finally {
+        await service.close();
+      }
+    },
+  );
+
+  it('decodes station classes on both surfaces before the index is built', async () => {
+    const service = useIndex(cold.mirrorDir);
+    try {
+      for (const [code, label] of [
+        ['FXO', 'Operational Fixed'],
+        ['MO', 'Mobile'],
+      ] as const) {
+        const result = await runToolContract(listReference, {
+          topic: 'station_classes',
+          filter: code,
+        } as never);
+        expect(result.isError).toBeFalsy();
+        expect(result.structuredContent).toMatchObject({
+          entries: expect.arrayContaining([{ code, label }]),
+        });
+        expect(text(result)).toContain(`| ${code} | ${label} |`);
+      }
+    } finally {
+      await service.close();
+    }
+  });
+
+  it('keeps station-class token filtering, blanks, unknowns, and ordering consistent on both surfaces', async () => {
+    const service = useIndex(cold.mirrorDir);
+    try {
+      const full = await runToolContract(listReference, { topic: 'station_classes' });
+      const all = full.structuredContent as Output;
+      expect(all.entries).toHaveLength(266);
+      const codes = all.entries?.map((entry) => entry.code) ?? [];
+      expect(codes).toEqual([...codes].sort((a, b) => a.localeCompare(b)));
+      for (const entry of all.entries ?? [])
+        expect(text(full)).toContain(`| ${entry.code} | ${entry.label} |`);
+      for (const filter of ['', '  ']) {
+        const blank = await runToolContract(listReference, { topic: 'station_classes', filter });
+        expect(blank.structuredContent).toEqual(full.structuredContent);
+        expect(text(blank)).toEqual(text(full));
+      }
+      for (const filter of ['fb2 relay', 'rélay!!!FB2']) {
+        const filtered = await runToolContract(listReference, { topic: 'station_classes', filter });
+        const entries = [
+          { code: 'FB2', label: 'Mobile Relay' },
+          { code: 'FB2A', label: 'Mobile Relay - Airport Terminal Use' },
+          { code: 'FB2C', label: 'Mobile Relay - Interconnect' },
+          { code: 'FB2I', label: 'Mobile Relay - Itinerant' },
+          { code: 'FB2J', label: 'Mobil Relay - Temporary Interconnect' },
+          { code: 'FB2K', label: 'Mobile Relay - Stand-by Interconnect' },
+          { code: 'FB2L', label: 'Mobile Relay - Itinerant Interconnect' },
+          { code: 'FB2S', label: 'Mobil Relay - Stand-by' },
+          { code: 'FB2T', label: 'Mobile Relay - Temporary' },
+        ];
+        expect((filtered.structuredContent as Output).entries).toEqual(entries);
+        expect(
+          text(filtered)
+            .split('\n')
+            .filter((line) => /^\| FB2/.test(line)),
+        ).toEqual(entries.map((entry) => `| ${entry.code} | ${entry.label} |`));
+      }
+      const unknown = await runToolContract(listReference, {
+        topic: 'station_classes',
+        filter: 'ZZUNKNOWN',
+      });
+      expect(unknown.structuredContent).toMatchObject({
+        entries: [],
+        notice: expect.stringContaining('label is unavailable'),
+      });
+      expect(text(unknown)).toContain('0 entries');
+      expect(text(unknown)).toContain('unknown filed code remains valid and unchanged');
+      const invalid = await runToolContract(listReference, {
+        topic: 'station_classes',
+        filter: '!!!',
+      });
+      expect(invalid.structuredContent).toMatchObject({
+        error: { data: { reason: 'invalid_filter' } },
+      });
+      expect(text(invalid)).toContain('ASCII letter or digit');
+    } finally {
+      await service.close();
+    }
+  });
+
   it('reports coverage building while a live process holds the lock', async () => {
     const building = await makeTempMirror('list-ref-building');
     const service = useIndex(building.mirrorDir);
@@ -85,13 +203,17 @@ describe('cold index', () => {
         join(building.mirrorDir, LOCK_FILE),
         JSON.stringify({ pid: process.pid, mode: 'init', startedAt: '2026-09-29T20:00:00Z' }),
       );
-      const contract = await runToolContract(listReference, { topic: 'coverage' });
+      const contract = await runToolContract(listReference, {
+        topic: 'coverage',
+        filter: 'paging',
+      });
       expect(contract.isError).toBeFalsy();
       const structured = contract.structuredContent as Output & { notice?: string };
       expect(structured.index).toEqual({ ready: false, status: 'building' });
       expect(structured.notice).toContain('published yet (a build is running)');
       expect(text(contract)).toContain('published yet (a build is running)');
       expect(text(contract)).toContain('**Status:** building');
+      expect(text(contract)).toContain('filter was not applied');
     } finally {
       await service.close();
       await building.remove();
@@ -103,7 +225,10 @@ describe('cold index', () => {
     const service = useIndex(malformed.mirrorDir);
     try {
       await writeFile(join(malformed.mirrorDir, POINTER_FILE), '{"file": 42');
-      const contract = await runToolContract(listReference, { topic: 'coverage' });
+      const contract = await runToolContract(listReference, {
+        topic: 'coverage',
+        filter: 'paging',
+      });
       expect(contract.isError).toBeFalsy();
       const structured = contract.structuredContent as Output & { dataAsOf?: string };
       expect(structured.index).toEqual({
@@ -113,6 +238,7 @@ describe('cold index', () => {
       });
       expect(structured.dataAsOf).toBeUndefined();
       expect(text(contract)).toContain('> current.json is not a valid generation pointer');
+      expect(text(contract)).toContain('filter was not applied');
       const statuses = await call({ topic: 'license_statuses' });
       expect(statuses.result.entries).toHaveLength(Object.keys(LICENSE_STATUSES).length);
     } finally {
@@ -167,6 +293,16 @@ describe('warm index', () => {
     expect(enrichment.notice).toBeUndefined();
   });
 
+  it('discloses an unused warm coverage filter without altering readiness', async () => {
+    const result = await runToolContract(listReference, { topic: 'coverage', filter: '東京' });
+    expect(result.structuredContent).toMatchObject({
+      index: { ready: true },
+      notice: expect.stringContaining('filter was not applied'),
+    });
+    expect(text(result)).toContain('filter was not applied');
+    expect(text(result)).not.toContain('has not been built yet');
+  });
+
   it.each([
     ['paging radiotelephone', ['CD']],
     ['RADIOTELEPHONE paging', ['CD']],
@@ -193,8 +329,29 @@ describe('warm index', () => {
     const { result, enrichment } = await call({ topic: 'license_statuses', filter: 'active' });
     expect(result.entries).toHaveLength(7);
     expect(enrichment.notice).toBe(
-      'filter applies to topic "radio_services" only; all 7 license statuses are listed.',
+      'filter applies to topics "radio_services" and "station_classes" only; filter was not applied, and all 7 license statuses are listed.',
     );
+  });
+
+  it('characterizes punctuation-separated accented tokens and unsupported tokenless filters', async () => {
+    const matched = await runToolContract(listReference, {
+      topic: 'radio_services',
+      filter: 'PÂGING!!!radiotéléphone',
+    });
+    expect(matched.structuredContent).toMatchObject({
+      entries: [
+        { code: 'CD', label: 'Paging and Radiotelephone', group: 'paging', indexedRecords: 7 },
+      ],
+    });
+    expect(text(matched)).toContain('| CD | Paging and Radiotelephone |');
+    const ignored = await runToolContract(listReference, {
+      topic: 'license_statuses',
+      filter: '東京!!!',
+    });
+    expect(ignored.isError).toBeFalsy();
+    expect(ignored.structuredContent).toMatchObject({
+      notice: expect.stringContaining('all 7 license statuses are listed'),
+    });
   });
 
   it.each(['', '   '])('reads a blank filter (%j) as unset', async (filter) => {
@@ -253,6 +410,35 @@ describe('warm index', () => {
       expect(rendered).toContain(entry.label);
     }
     expect(rendered).toContain('2026-09-27T13:44:10Z');
+  });
+});
+
+describe('incomplete antenna coverage', () => {
+  let fixture: FixtureIndex;
+  let service: ReturnType<typeof useIndex>;
+  beforeAll(async () => {
+    fixture = await buildFixtureIndex();
+    const store = createUlsStore(join(fixture.mirrorDir, fixture.generation));
+    (await store.raw()).exec(
+      "INSERT INTO meta (key,value) VALUES ('antenna_coverage_incomplete','6')",
+    );
+    await store.close();
+    service = useIndex(fixture.mirrorDir);
+  });
+  afterAll(async () => {
+    await service.close();
+    await fixture.dispose();
+  });
+  it('keeps ready true and renders the marker and rebuild recovery on both surfaces', async () => {
+    const result = await runToolContract(listReference, { topic: 'coverage', filter: 'paging' });
+    expect(result.structuredContent).toMatchObject({
+      index: { ready: true, antennaCoverageIncomplete: true },
+      notice: expect.stringContaining('daily refresh restores only licenses it replaces'),
+    });
+    expect(text(result)).toContain('Antenna coverage incomplete');
+    expect(text(result)).toContain('mirror:init');
+    expect(text(result)).toContain('filter was not applied');
+    expect(text(result).match(/daily refresh restores only licenses it replaces/g)).toHaveLength(1);
   });
 });
 

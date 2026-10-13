@@ -97,7 +97,8 @@ export interface LicenseFrequency {
 
 /** An antenna at a license location, with its frequency rows. */
 export interface LicenseAntenna {
-  antennaNumber: number;
+  /** Absent for an independently retained unnumbered AN record. */
+  antennaNumber?: number;
   antennaTypeCode?: string;
   azimuthDeg?: number;
   beamwidthDeg?: number;
@@ -129,6 +130,7 @@ export interface LicenseSite {
   groundElevationM?: number;
   latitude?: number;
   locationClassCode?: string;
+  locationClassLabel?: string;
   /** Absent when the filing leaves the location type blank. */
   locationTypeCode?: string;
   locationTypeLabel?: string;
@@ -245,6 +247,7 @@ export type GetLicenseResult =
     }
   | {
       found: true;
+      antennaCoverageIncomplete?: boolean;
       /** The window's first location missing frequency rows past the cap, and its offset. */
       frequencyCutAt?: { locationNumber: number; offset: number };
       /** Frequency rows returned after the `maxFrequencies` cap. */
@@ -305,6 +308,8 @@ export interface TransmitterSite extends LicenseeFields {
   /** The site, or the center of an operating area filed with `radiusKm`. */
   latitude: number;
   licenseStatus: string;
+  locationClassCode?: string;
+  locationClassLabel?: string;
   locationNumber: number;
   /** Absent when the filing leaves the location type blank. */
   locationTypeCode?: string;
@@ -331,6 +336,8 @@ export interface FindTransmittersParams {
   cursor?: string | undefined;
   latitude: number;
   limit: number;
+  /** Filed class code; unset matches every class and unclassified sites. */
+  locationClass?: string | undefined;
   /** One ULS location type code; unset matches every type, untyped sites included. */
   locationType?: string | undefined;
   longitude: number;
@@ -352,6 +359,9 @@ export interface FrequencyAssignment extends LicenseeFields {
   kind: 'site' | 'market';
   latitude?: number;
   licenseStatus: string;
+  /** Only on assignments whose location number identifies exactly one site. */
+  locationClassCode?: string;
+  locationClassLabel?: string;
   locationNumber?: number;
   /** Site rows at a single site; absent when the filing leaves the type blank. */
   locationTypeCode?: string;
@@ -395,6 +405,8 @@ export interface SearchFrequenciesParams {
 
 /** Build state of the local index. */
 export interface IndexState {
+  /** Nonblocking data-completeness warning requiring a full rebuild. */
+  antennaCoverageIncomplete?: boolean;
   dataAsOf?: string;
   error?: string;
   generation?: string;

@@ -61,6 +61,7 @@ import {
   generationFileName,
   INDIVIDUAL_BY_DEFAULT_SERVICES,
   type IngestStage,
+  isAntennaCoverageIncomplete,
   isGenerationFile,
   isMalformedPointer,
   isRebuildRequired,
@@ -347,7 +348,7 @@ export class UlsIngester {
   }
 
   /**
-   * True when the published generation carries the rebuild-required mark, or a selected group
+   * True when the published generation requires a rebuild or has incomplete antenna coverage, or a selected group
    * is missing from it, or that group's snapshot `Last-Modified` is newer than the one
    * recorded when the generation was built.
    */
@@ -357,8 +358,8 @@ export class UlsIngester {
   ): Promise<boolean> {
     const path = join(this.mirrorDir, pointer.file);
     if (!existsSync(path)) return true;
-    const { rebuildRequired, weekly } = await readGenerationState(path);
-    if (rebuildRequired) return true;
+    const { rebuildRequired, antennaCoverageIncomplete, weekly } = await readGenerationState(path);
+    if (rebuildRequired || antennaCoverageIncomplete) return true;
     return [...remote].some(([group, head]) => {
       const row = weekly.get(weeklyZipPath(group));
       if (row?.stage !== 'complete') return true;
@@ -381,8 +382,9 @@ export class UlsIngester {
   ): Promise<string | undefined> {
     const path = join(this.mirrorDir, target);
     if (!existsSync(path)) return;
-    const { rebuildRequired, weekly } = await readGenerationState(path);
-    if (rebuildRequired) return 'a generation an earlier version of this server started';
+    const { rebuildRequired, antennaCoverageIncomplete, weekly } = await readGenerationState(path);
+    if (rebuildRequired || antennaCoverageIncomplete)
+      return 'a generation an earlier version of this server started';
     const current = new Map(
       [...remote].map(([group, head]) => [weeklyZipPath(group), head.lastModified]),
     );
@@ -763,15 +765,21 @@ function readIngestRows(db: SqliteHandle, kind: IngestFileRow['kind']): Map<stri
 
 /**
  * The weekly `ingest_files` rows of a generation file, and whether it carries the
- * rebuild-required mark, read through a short-lived connection.
+ * rebuild-required or incomplete-antenna mark, read through a short-lived connection.
  */
-async function readGenerationState(
-  path: string,
-): Promise<{ rebuildRequired: boolean; weekly: Map<string, IngestFileRow> }> {
+async function readGenerationState(path: string): Promise<{
+  rebuildRequired: boolean;
+  antennaCoverageIncomplete: boolean;
+  weekly: Map<string, IngestFileRow>;
+}> {
   const store = createUlsStore(path);
   try {
     const db = await store.raw();
-    return { rebuildRequired: isRebuildRequired(db), weekly: readIngestRows(db, 'weekly') };
+    return {
+      rebuildRequired: isRebuildRequired(db),
+      antennaCoverageIncomplete: isAntennaCoverageIncomplete(db),
+      weekly: readIngestRows(db, 'weekly'),
+    };
   } finally {
     await store.close();
   }

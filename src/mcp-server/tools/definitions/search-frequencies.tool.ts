@@ -76,7 +76,9 @@ const AssignmentSchema = z
     stationClasses: z
       .array(z.string().describe('One ULS class-of-station code.'))
       .optional()
-      .describe('Distinct station classes filed for this frequency at the site (site rows).'),
+      .describe(
+        'Distinct station classes filed for this frequency at the site (site rows); decode each with fcc_spectrum_list_reference, topic "station_classes", filter set to the code. Unknown filed codes remain unchanged.',
+      ),
     maxErpW: z
       .number()
       .optional()
@@ -90,6 +92,18 @@ const AssignmentSchema = z
       .optional()
       .describe(
         "Location number within the license (site rows); pass it as location_number to fcc_spectrum_get_license to read the location's antennas and frequencies.",
+      ),
+    locationClassCode: z
+      .string()
+      .optional()
+      .describe(
+        'Filed FCC location class, only on a single-site assignment; absent on shared-number assignments and market rows.',
+      ),
+    locationClassLabel: z
+      .string()
+      .optional()
+      .describe(
+        'FCC label of the filed class, only when known on a single-site assignment. Authorization metadata does not establish actual on-air activity.',
       ),
     locationTypeCode: z
       .string()
@@ -186,7 +200,14 @@ export const searchFrequencies = tool('fcc_spectrum_search_frequencies', {
     status: blankAsUnset(liveStatusSchema).describe(
       'A active (default), L pending legal, X term pending, or "any" for all three. Other statuses keep no frequency records.',
     ),
-    limit: z.number().int().min(1).max(200).default(50).describe('Rows per page (1–200).'),
+    limit: z
+      .number()
+      .int()
+      .min(1)
+      .default(50)
+      .describe(
+        'Positive integer rows per page; values above 200 are clamped to 200 with a notice.',
+      ),
     cursor: cursorSchema.describe(
       'nextCursor from the previous page of the same search; omit for the first page.',
     ),
@@ -287,6 +308,7 @@ export const searchFrequencies = tool('fcc_spectrum_search_frequencies', {
   ],
 
   async handler(input, ctx) {
+    const limit = Math.min(input.limit, 200);
     const index = getUlsIndexService();
     const dataAsOf = await index.dataAsOf();
     if (dataAsOf === undefined) throw ctx.fail('index_not_ready');
@@ -311,7 +333,7 @@ export const searchFrequencies = tool('fcc_spectrum_search_frequencies', {
       ...(input.market_code && { market_code: input.market_code }),
       status: input.status,
     };
-    ctx.enrich({ dataAsOf, truncated: false, shown: 0, cap: input.limit, appliedFilters });
+    ctx.enrich({ dataAsOf, truncated: false, shown: 0, cap: limit, appliedFilters });
     ctx.enrich.total(0);
 
     if (input.radio_service) {
@@ -340,7 +362,7 @@ export const searchFrequencies = tool('fcc_spectrum_search_frequencies', {
       frn: input.frn,
       marketCode: input.market_code,
       status: input.status,
-      limit: input.limit,
+      limit,
       cursor: input.cursor,
     });
     if (!page.ok) throw ctx.fail('invalid_cursor');
@@ -351,6 +373,7 @@ export const searchFrequencies = tool('fcc_spectrum_search_frequencies', {
     ctx.log.info('Frequency search', { total: page.total, lowerBound, shown: page.rows.length });
 
     const fragments: string[] = [];
+    if (input.limit > limit) fragments.push(`limit ${input.limit} was clamped to ${limit}.`);
     if (page.total === 0 && !lowerBound) {
       if (input.status === 'A') {
         fragments.push(
@@ -401,7 +424,7 @@ export const searchFrequencies = tool('fcc_spectrum_search_frequencies', {
       );
     }
     if (page.nextCursor) {
-      if (page.rows.length < input.limit) {
+      if (page.rows.length < limit) {
         fragments.push(
           'The scan stopped partway through the band to keep the call short; pass nextCursor as cursor with the same inputs to continue it.',
         );
@@ -413,7 +436,7 @@ export const searchFrequencies = tool('fcc_spectrum_search_frequencies', {
       }
       ctx.enrich.truncated({
         shown: page.rows.length,
-        cap: input.limit,
+        cap: limit,
         guidance: fragments.join(' '),
       });
     } else {
@@ -439,6 +462,10 @@ export const searchFrequencies = tool('fcc_spectrum_search_frequencies', {
         `- **Licensee:** ${licenseeText(row.licenseeName, row.licenseeRedacted)} · **Redacted:** ${yesNo(row.licenseeRedacted)} · **Lease:** ${yesNo(row.isLease)}`,
         `- **Status:** ${row.licenseStatus} · **Service:** ${row.radioServiceCode} (${inline(row.radioServiceLabel)})`,
       );
+      if (row.locationClassCode)
+        lines.push(
+          `- **Location class:** ${inline(row.locationClassCode)}${row.locationClassLabel ? ` (${row.locationClassLabel})` : ''}`,
+        );
       if (
         row.locationNumber !== undefined ||
         row.latitude !== undefined ||

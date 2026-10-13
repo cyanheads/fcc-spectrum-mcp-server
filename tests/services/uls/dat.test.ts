@@ -273,6 +273,42 @@ describe('parseCountsFile', () => {
 });
 
 describe('record decoders', () => {
+  it('preserves valid zero on only one coordinate axis', () => {
+    for (const [lat, lon] of [
+      [0, 10],
+      [10, 0],
+    ]) {
+      expect(
+        decodeLo(lo({ usi: 1, number: 1, lat: [lat!, 0, 0, 'N'], lon: [lon!, 0, 0, 'E'] })),
+      ).toMatchObject({ latitude: lat, longitude: lon });
+    }
+  });
+
+  it.each([
+    ['N', 'E'],
+    ['N', 'W'],
+    ['S', 'E'],
+    ['S', 'W'],
+  ] as const)('drops the all-zero coordinate placeholder %s/%s', (north, east) => {
+    expect(
+      decodeLo(lo({ usi: 1, number: 1, state: 'NY', lat: [0, 0, 0, north], lon: [0, 0, 0, east] })),
+    ).toMatchObject({
+      latitude: null,
+      longitude: null,
+      state: 'NY',
+      coordinatesDms: `0-0-0 ${north} 0-0-0 ${east}`,
+    });
+  });
+
+  it('keeps unnumbered AN records but rejects malformed nonblank numbers', () => {
+    expect(decodeAn(record('AN', { 2: 1, 8: 2, 10: 'R', 14: 'SuperQuad CRS4' }))).toMatchObject({
+      antennaNumber: null,
+      locationNumber: 2,
+      antennaTypeCode: 'R',
+      model: 'SuperQuad CRS4',
+    });
+    expect(decodeAn(record('AN', { 2: 1, 7: 'bad', 8: 2 }))).toBeNull();
+  });
   it('decodes HD with ISO dates and nulls for blanks', () => {
     expect(
       decodeHd(

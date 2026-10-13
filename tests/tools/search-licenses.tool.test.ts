@@ -179,7 +179,6 @@ describe('warm index', () => {
 
     it.each([
       ['limit 0', { callsign: 'KZZ901', limit: 0 }],
-      ['limit 101', { callsign: 'KZZ901', limit: 101 }],
       ['a prefix-portable callsign', { callsign: 'VE3/N0CALL' }],
       ['a prefix-portable callsign with a 4-character base', { callsign: 'KL7/AZ0Z' }],
       ['an 11-digit FRN', { frn: '12345678901' }],
@@ -265,6 +264,22 @@ describe('warm index', () => {
   });
 
   describe('paging', () => {
+    it.each([101, 1000000])(
+      'clamps requested limit %i and composes empty-result guidance',
+      async (requested) => {
+        for (const input of [{ radio_service: 'CD', status: 'any' }, { callsign: 'ZZZZZZ' }]) {
+          const baseline = page(await run({ ...input, limit: 100 }));
+          const result = await run({ ...input, limit: requested });
+          const actual = page(result);
+          const { notice: _baselineNotice, ...expected } = baseline;
+          const { notice: _actualNotice, ...bounded } = actual;
+          expect(bounded).toEqual(expected);
+          expect(actual.notice).toContain(`limit ${requested} was clamped to 100`);
+          expect(contractText(result)).toContain(`limit ${requested} was clamped to 100`);
+          if (baseline.notice) expect(actual.notice).toContain(baseline.notice);
+        }
+      },
+    );
     it('discloses truncation and follows the cursor to the last page', async () => {
       const first = await run({ radio_service: 'CD', status: 'any', limit: 3 });
       const one = page(first);

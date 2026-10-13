@@ -66,6 +66,12 @@ export const marketCodeSchema = z.preprocess(
   z.string().regex(/^(?:[A-Z]{3}\d{3}|[A-Z]\d{5}|[A-Z]{2}\d{4}|NW)$/),
 );
 
+/** One filed FCC location class, case-insensitive. */
+export const locationClassSchema = z.preprocess(
+  normalizedString((raw) => raw.trim().toUpperCase()),
+  z.enum(['C', 'L', 'P', 'R', 'T']),
+);
+
 /** Unique system identifier as a decimal string without leading zeros. */
 export const usiSchema = z.preprocess(
   normalizedString((raw) => raw.trim()),

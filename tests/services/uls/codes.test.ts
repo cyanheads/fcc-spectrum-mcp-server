@@ -17,6 +17,7 @@ import {
   RADIO_SERVICES,
   SERVICE_GROUPS,
   STATE_NAME_TO_CODE,
+  STATION_CLASSES,
   stateNameKey,
   toEntries,
   USPS_CODES,
@@ -43,6 +44,20 @@ describe('RADIO_SERVICES', () => {
 });
 
 describe('small code tables', () => {
+  it('retains all 266 FCC station classes and exact source labels', () => {
+    expect(Object.keys(STATION_CLASSES)).toHaveLength(266);
+    expect(STATION_CLASSES.FB2).toBe('Mobile Relay');
+    expect(STATION_CLASSES.FXO).toBe('Operational Fixed');
+    expect(STATION_CLASSES.MO).toBe('Mobile');
+    expect(STATION_CLASSES.FB2J).toBe('Mobil Relay - Temporary Interconnect');
+    expect(STATION_CLASSES.FX3T).toBe('Secondary Fixed  - Temporary');
+    expect(STATION_CLASSES.WDXT).toBe('Radiolocation Weather Radar - Temporary');
+    expect(codeLabel(STATION_CLASSES, 'ZZUNKNOWN')).toBeUndefined();
+    const entries = toEntries(STATION_CLASSES);
+    expect(entries.map((entry) => entry.code)).toEqual(
+      [...Object.keys(STATION_CLASSES)].sort((a, b) => a.localeCompare(b)),
+    );
+  });
   it('cover the documented status, location, antenna, applicant, and operator codes', () => {
     expect(Object.keys(LICENSE_STATUSES).sort()).toEqual(['A', 'C', 'E', 'L', 'P', 'T', 'X']);
     expect(LOCATION_TYPES.F).toBe('Fixed');

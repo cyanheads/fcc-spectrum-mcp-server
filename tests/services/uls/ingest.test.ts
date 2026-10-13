@@ -672,6 +672,47 @@ describe('resume rule', () => {
 });
 
 describe('rebuild triggers and naming', () => {
+  it('rebuilds unchanged weekly snapshots when antenna coverage is incomplete, including a completed retired target', async () => {
+    const mirror = await tempMirror();
+    const client = new FakeIngestClient().withWeekly(['paging']);
+    const ingester = fixtureIngester(mirror, { client, groups: ['paging'] });
+    const first = await ingester.rebuild();
+    await readDb(join(mirror.mirrorDir, first.generation), (db) =>
+      db.exec("INSERT INTO meta (key,value) VALUES ('antenna_coverage_incomplete','6')"),
+    );
+    const service = new UlsIndexService({
+      mirrorDir: mirror.mirrorDir,
+      services: ['paging'],
+      redactIndividuals: true,
+      pointerCheckMs: 0,
+    });
+    try {
+      expect(await service.dataAsOf()).toBeDefined();
+      expect((await service.coverage()).index).toMatchObject({
+        ready: true,
+        antennaCoverageIncomplete: true,
+      });
+      client.withDaily({ 'l_pg_mon.zip': DAILY_PG_MON });
+      await ingester.refresh();
+      expect((await service.coverage()).index).toMatchObject({
+        ready: true,
+        antennaCoverageIncomplete: true,
+      });
+      const second = await ingester.rebuild();
+      expect(second.status).toBe('rebuilt');
+      expect(second.generation).not.toBe(first.generation);
+      expect((await service.coverage()).index).not.toHaveProperty('antennaCoverageIncomplete');
+      await readDb(join(mirror.mirrorDir, second.generation), (db) =>
+        db.exec("INSERT INTO meta (key,value) VALUES ('antenna_coverage_incomplete','6')"),
+      );
+      const third = await ingester.rebuild();
+      expect(third).toMatchObject({ status: 'rebuilt', generation: first.generation });
+      expect((await service.coverage()).index).not.toHaveProperty('antennaCoverageIncomplete');
+      expect((await ingester.rebuild()).status).toBe('skipped');
+    } finally {
+      await service.close();
+    }
+  });
   it('skips when every snapshot Last-Modified matches the published generation', async () => {
     const mirror = await tempMirror();
     const client = new FakeIngestClient().withWeekly(['paging']);

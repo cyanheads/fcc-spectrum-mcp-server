@@ -32,7 +32,7 @@ import {
   successOf,
   useIndex,
 } from '../fixtures/tool-harness.js';
-import { AREA_SITES_WEEKLY, QUIRKS_WEEKLY } from '../fixtures/uls-fixtures.js';
+import { AREA_SITES_WEEKLY, DATA_QUALITY_WEEKLY, QUIRKS_WEEKLY } from '../fixtures/uls-fixtures.js';
 import {
   buildFixtureIndex,
   type FixtureIndex,
@@ -66,6 +66,67 @@ const run = (input: Record<string, unknown>) => runToolContract(findTransmitters
 const page = (result: ContractResult) => successOf<Page>(result);
 const siteIds = (sites: readonly Site[]) =>
   sites.map((site) => `${site.usi}:${site.locationNumber}`);
+
+describe('filed location classes', () => {
+  let fixture: FixtureIndex;
+  beforeAll(async () => {
+    fixture = await buildFixtureIndex({
+      groups: ['paging'],
+      weekly: { paging: DATA_QUALITY_WEEKLY },
+    });
+  });
+  beforeEach(async () => {
+    await useIndex(fixture.mirrorDir, { services: ['paging'] });
+  });
+  afterAll(async () => {
+    await releaseIndex();
+    await fixture.dispose();
+  });
+
+  it('normalizes the filter and renders each selected class with all cursor pages', async () => {
+    let cursor: string | undefined;
+    const locations: number[] = [];
+    do {
+      const result = await run({
+        latitude: 47,
+        longitude: -122,
+        location_class: ' t ',
+        limit: 1,
+        cursor,
+      });
+      const data = page(result);
+      expect(data.appliedFilters.location_class).toBe('T');
+      expect(data.totalCount).toBe(2);
+      expect(data.sites[0]).toMatchObject({
+        locationClassCode: 'T',
+        locationClassLabel: 'Transmit Location',
+      });
+      expect(contractText(result)).toContain('T (Transmit Location)');
+      expectCarries(formattedText(findTransmitters.format!(data)), data.sites);
+      locations.push(...data.sites.map((site) => site.locationNumber));
+      cursor = data.nextCursor;
+    } while (cursor);
+    expect(locations).toEqual([1, 2]);
+  });
+
+  it('keeps blank and unset populations and gives zero-hit class recovery', async () => {
+    const base = { latitude: 47, longitude: -122 };
+    expect(page(await run({ ...base, location_class: ' ' })).sites).toEqual(
+      page(await run(base)).sites,
+    );
+    const empty = await run({ ...base, location_class: 'C' });
+    expect(page(empty)).toMatchObject({ sites: [], totalCount: 0, truncated: false });
+    expect(contractText(empty)).toContain('drop location_class');
+    expect(errorOf(await run({ ...base, location_class: 'Z' })).code).toBe(
+      JsonRpcErrorCode.InvalidParams,
+    );
+    expectDeclaredError(
+      findTransmitters,
+      await run({ ...base, location_class: 'T', cursor: 'bad' }),
+      'invalid_cursor',
+    );
+  });
+});
 
 describe('index not available', () => {
   let cold: TempMirror;
@@ -236,10 +297,8 @@ describe('warm index', () => {
       ['radius_km 0.05', { ...SEATTLE, radius_km: 0.05 }],
       ['radius_km 100.5', { ...SEATTLE, radius_km: 100.5 }],
       ['limit 0', { ...SEATTLE, limit: 0 }],
-      ['limit 101', { ...SEATTLE, limit: 101 }],
       ['a fractional limit', { ...SEATTLE, limit: 2.5 }],
       ['max_frequencies_per_site 0', { ...SEATTLE, max_frequencies_per_site: 0 }],
-      ['max_frequencies_per_site 51', { ...SEATTLE, max_frequencies_per_site: 51 }],
       ['status C, which keeps no site records', { ...SEATTLE, status: 'C' }],
       ['unit Hz', { ...SEATTLE, frequency_low: 152, unit: 'Hz' }],
       ['frequency 0', { ...SEATTLE, frequency_low: 0 }],
@@ -370,6 +429,30 @@ describe('warm index', () => {
   });
 
   describe('paging', () => {
+    it.each([
+      [101, 51],
+      [1000000, 1000000],
+    ])(
+      'composes dual clamps (%i, %i) with empty and complete pages',
+      async (limit, max_frequencies_per_site) => {
+        for (const center of [SEATTLE, { latitude: 0, longitude: 0 }]) {
+          const baseline = page(await run({ ...center, limit: 100, max_frequencies_per_site: 50 }));
+          const result = await run({ ...center, limit, max_frequencies_per_site });
+          const actual = page(result);
+          const { notice: _baselineNotice, ...expected } = baseline;
+          const { notice: _actualNotice, ...bounded } = actual;
+          expect(bounded).toEqual(expected);
+          for (const fragment of [
+            `limit ${limit} was clamped to 100`,
+            `max_frequencies_per_site ${max_frequencies_per_site} was clamped to 50`,
+          ]) {
+            expect(actual.notice).toContain(fragment);
+            expect(contractText(result)).toContain(fragment);
+          }
+          if (baseline.notice) expect(actual.notice).toContain(baseline.notice);
+        }
+      },
+    );
     it('discloses truncation and follows the cursor through three pages', async () => {
       const input = { ...SEATTLE, radius_km: 50, limit: 1 };
       const first = await run(input);
@@ -438,7 +521,7 @@ describe('warm index', () => {
       const result = page(await run(PORTLAND));
       expect(result).toMatchObject({ totalCount: 0, shown: 0, sites: [] });
       expect(result.notice).toBe(
-        `No transmitter site within 5 km matches these filters; raise radius_km (max 100) or pass status "any". ${MARKET_HINT}`,
+        `No FCC-licensed site within 5 km matches these filters; raise radius_km (max 100) or pass status "any". ${MARKET_HINT}`,
       );
     });
 
@@ -453,7 +536,7 @@ describe('warm index', () => {
     it('offers no options when the radius is at its maximum and status is "any"', async () => {
       const result = page(await run({ latitude: 0, longitude: 0, radius_km: 100, status: 'any' }));
       expect(result.notice).toBe(
-        `No transmitter site within 100 km matches these filters. ${MARKET_HINT}`,
+        `No FCC-licensed site within 100 km matches these filters. ${MARKET_HINT}`,
       );
     });
 
@@ -462,14 +545,14 @@ describe('warm index', () => {
         await run({ ...SEATTLE, frequency_low: 500, frequency_high: 510, radio_service: 'CD' }),
       );
       expect(result.notice).toBe(
-        `No transmitter site within 5 km is authorized on 500–510 MHz under these filters; raise radius_km (max 100), widen the band (lower frequency_low or raise frequency_high), drop radio_service, pass status "any", or call fcc_spectrum_search_frequencies to search by state. ${MARKET_HINT}`,
+        `No FCC-licensed site within 5 km is authorized on 500–510 MHz under these filters; raise radius_km (max 100), widen the band (lower frequency_low or raise frequency_high), drop radio_service, pass status "any", or call fcc_spectrum_search_frequencies to search by state. ${MARKET_HINT}`,
       );
     });
 
     it('suggests frequency_high for a single-frequency search with nothing on it', async () => {
       const result = page(await run({ ...SEATTLE, frequency_low: 500, status: 'any' }));
       expect(result.notice).toBe(
-        `No transmitter site within 5 km is authorized on 500 MHz under these filters; raise radius_km (max 100), widen the band with frequency_high, or call fcc_spectrum_search_frequencies to search by state. ${MARKET_HINT}`,
+        `No FCC-licensed site within 5 km is authorized on 500 MHz under these filters; raise radius_km (max 100), widen the band with frequency_high, or call fcc_spectrum_search_frequencies to search by state. ${MARKET_HINT}`,
       );
     });
   });
@@ -792,7 +875,7 @@ describe('operating areas', () => {
     expect(structured).toMatchObject({ totalCount: 0, sites: [] });
     expect(structured.appliedFilters).toMatchObject({ location_type: '6' });
     expect(structured.notice).toBe(
-      `No transmitter site within 5 km matches these filters; raise radius_km (max 100), drop location_type, or pass status "any". ${MARKET_HINT}`,
+      `No FCC-licensed site within 5 km matches these filters; raise radius_km (max 100), drop location_type, or pass status "any". ${MARKET_HINT}`,
     );
     expect(contractText(result)).toContain(`> ${structured.notice}`);
 
@@ -800,7 +883,7 @@ describe('operating areas', () => {
       await run({ ...CENTER, location_type: '6', radius_km: 100, status: 'any' }),
     );
     expect(widest.notice).toBe(
-      `No transmitter site within 100 km matches these filters; drop location_type. ${MARKET_HINT}`,
+      `No FCC-licensed site within 100 km matches these filters; drop location_type. ${MARKET_HINT}`,
     );
   });
 });
@@ -847,7 +930,7 @@ describe('format()', () => {
     expect(rendered).not.toContain('\r');
     const rows = rendered.split('\n');
     for (const line of [
-      '## Transmitter sites (1 on this page)',
+      '## FCC-licensed sites (1 on this page)',
       '### 1.5 km · KZZ 077 · USI 77 · location 1',
       '- **Licensee:** Acme Radio Co · **Redacted:** no · **Lease:** yes',
       '- **Status:** A · **Service:** CD (Paging and Radiotelephone) · **Location type:** F (Fixed)',
@@ -911,6 +994,6 @@ describe('format()', () => {
 
   it('says so when no site matched', () => {
     const rendered = formattedText(findTransmitters.format?.({ sites: [] }));
-    expect(rendered).toBe('## Transmitter sites (0 on this page)\n\nNo sites matched.');
+    expect(rendered).toBe('## FCC-licensed sites (0 on this page)\n\nNo sites matched.');
   });
 });

@@ -2,9 +2,9 @@
 
 **Server:** fcc-spectrum-mcp-server
 **Version:** 0.1.2
-**Framework:** [@cyanheads/mcp-ts-core](https://www.npmjs.com/package/@cyanheads/mcp-ts-core) `^0.13.10`
+**Framework:** [@cyanheads/mcp-ts-core](https://www.npmjs.com/package/@cyanheads/mcp-ts-core) `^0.13.15`
 **Engines:** Bun ≥1.4.0, Node ≥24.0.0
-**MCP SDK:** `@modelcontextprotocol/server` ^2.1.0
+**MCP SDK:** `@modelcontextprotocol/server` ^2.3.1
 **Zod:** ^4.6.5
 
 > **Read the framework docs first:** `node_modules/@cyanheads/mcp-ts-core/CLAUDE.md` contains the full API reference — builders, Context, error codes, exports, patterns. This file covers server-specific conventions only.
@@ -73,7 +73,7 @@ export const searchLicenses = tool('fcc_spectrum_search_licenses', {
     callsign: blankAsUnset(callsignSchema.optional()).describe(
       'Exact callsign or lease ID, e.g. "KNKA123" or "L000012345". Case, spaces, and one trailing portable suffix ("/4") are normalized. …',
     ),
-    limit: z.number().int().min(1).max(100).default(25).describe('Records per page (1–100).'),
+    limit: z.number().int().min(1).default(25).describe('Positive integer records per page; values above 100 are clamped to 100 with a notice.'),
     cursor: cursorSchema.describe('nextCursor from the previous page of the same search; omit for the first page.'),
     // … licensee, frn, radio_service, status, state
   }),
@@ -102,19 +102,20 @@ export const searchLicenses = tool('fcc_spectrum_search_licenses', {
     const index = getUlsIndexService();
     const dataAsOf = await index.dataAsOf();
     if (dataAsOf === undefined) throw ctx.fail('index_not_ready');
+    const limit = Math.min(input.limit, 100);
 
     // Enrichment defaults go in first, so a failure or an empty page still carries them.
-    ctx.enrich({ dataAsOf, truncated: false, shown: 0, cap: input.limit, appliedFilters });
+    ctx.enrich({ dataAsOf, truncated: false, shown: 0, cap: limit, appliedFilters });
     ctx.enrich.total(0);
     // … criteria and radio-service checks (`throw ctx.fail('no_criteria')`)
 
-    const page = await index.searchLicenses({ callsign: input.callsign, /* … */ limit: input.limit, cursor: input.cursor });
+    const page = await index.searchLicenses({ callsign: input.callsign, /* … */ limit, cursor: input.cursor });
     if (!page.ok) throw ctx.fail('invalid_cursor');
 
     ctx.enrich.total(page.total);
     ctx.enrich({ shown: page.rows.length });
     if (page.nextCursor) {
-      ctx.enrich.truncated({ shown: page.rows.length, cap: input.limit, guidance: fragments.join(' ') });
+      ctx.enrich.truncated({ shown: page.rows.length, cap: limit, guidance: fragments.join(' ') });
     } else if (fragments.length) {
       ctx.enrich.notice(fragments.join(' '));
     }
@@ -485,7 +486,7 @@ security: false                            # optional — true ONLY for a source
 
 ## Publishing
 
-**Every release goes through a release PR, straight-through** — `git-wrapup`'s "Release PR mode", mode `straight-through`. One run: `git-wrapup` lands the commit stack on `release/<version>`, pushes it, and opens the PR (title = the release commit subject, body = the changelog entry plus a gates section); `release-and-publish` then fast-forwards `main` locally with `git merge --ff-only`, creates the tag on `main`'s tip, pushes `main` and the tag, deletes the branch, and publishes. A caller's brief may run a given release as `gated` instead — a `release-pr-review` pass on the open PR before `release-and-publish`. **Never merge through the GitHub UI or `gh pr merge`**: squash and rebase-merge are disabled in the repo settings because both rewrite the stack (rebase-merge also strips the SSH signatures), and a merge commit breaks the linear history.
+**Every release goes through a release PR, straight-through** — `git-wrapup`'s "Release PR mode", mode `straight-through`. One run: `git-wrapup` lands the commit stack on `release/<version>`, pushes it, and opens the PR (title = the release commit subject, body = the release digest: theme line, `## Changes`, `## Gates`, changelog link last); `release-and-publish` then fast-forwards `main` locally with `git merge --ff-only`, creates the tag on `main`'s tip, pushes `main` and the tag, deletes the branch, and publishes. A caller's brief may run a given release as `gated` instead — a `release-pr-review` pass on the open PR before `release-and-publish`. **Never merge through the GitHub UI or `gh pr merge`**: squash and rebase-merge are disabled in the repo settings because both rewrite the stack (rebase-merge also strips the SSH signatures), and a merge commit breaks the linear history.
 
 ---
 

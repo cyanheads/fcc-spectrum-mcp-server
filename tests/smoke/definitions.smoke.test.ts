@@ -35,7 +35,7 @@ describe('registered definition smoke test', () => {
   });
 
   it('decodes a vocabulary topic and reports a cold index', async () => {
-    const ctx = createMockContext();
+    const ctx = createMockContext({ errors: listReference.errors });
     const statuses = await listReference.handler(
       listReference.input.parse({ topic: 'license_statuses' }),
       ctx,
@@ -43,7 +43,7 @@ describe('registered definition smoke test', () => {
     expect(statuses).toEqual(expect.schemaMatching(listReference.output));
     expect(statuses.entries?.find((entry) => entry.code === 'A')?.label).toBe('Active');
 
-    const coverageCtx = createMockContext();
+    const coverageCtx = createMockContext({ errors: listReference.errors });
     const coverage = await listReference.handler(
       listReference.input.parse({ topic: 'coverage', filter: '' }),
       coverageCtx,

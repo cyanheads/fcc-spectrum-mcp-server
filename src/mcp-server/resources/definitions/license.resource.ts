@@ -7,7 +7,11 @@
 import { resource, z } from '@cyanheads/mcp-ts-core';
 import { JsonRpcErrorCode } from '@cyanheads/mcp-ts-core/errors';
 import { callsignSchema } from '@/mcp-server/tools/input-schemas.js';
-import { getUlsIndexService, LICENSE_PAGE } from '@/services/uls/uls-index-service.js';
+import {
+  ANTENNA_COVERAGE_NOTICE,
+  getUlsIndexService,
+  LICENSE_PAGE,
+} from '@/services/uls/uls-index-service.js';
 
 /** Frequency rows returned, matching `fcc_spectrum_get_license`'s default `max_frequencies`. */
 const MAX_FREQUENCIES = 100;
@@ -81,6 +85,7 @@ export const licenseResource = resource('fcc-spectrum://license/{callsign}', {
     const call = `call fcc_spectrum_get_license with usi "${license.usi}"`;
     const cut = result.frequencyCutAt;
     const notice = [
+      result.antennaCoverageIncomplete && ANTENNA_COVERAGE_NOTICE,
       result.nextLocationOffset !== undefined &&
         `Lists ${locations.length} of ${result.locationTotal} locations; ${call} and location_offset ${result.nextLocationOffset} for the rest.`,
       result.windowFrequencyTotal > result.frequenciesShown &&

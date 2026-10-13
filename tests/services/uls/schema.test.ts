@@ -497,6 +497,68 @@ describe('acquireIngestLock and releaseIngestLock', () => {
 });
 
 describe('createUlsStore', () => {
+  it('migrates populated schema 5 in place and retains the completeness marker on reopen', async () => {
+    const path = join(dir, 'prior.db');
+    const old = createUlsStore(path);
+    const db = await old.raw();
+    const sql = db
+      .prepare<{ sql: string }>("SELECT sql FROM sqlite_master WHERE name = 'antennas'")
+      .get()!.sql;
+    db.exec(`DROP INDEX antennas_key; ALTER TABLE antennas RENAME TO old_antennas;
+      ${sql.replace('antenna_number INTEGER', 'antenna_number INTEGER NOT NULL')};
+      DROP TABLE old_antennas;
+      CREATE INDEX antennas_key ON antennas (usi, location_number, antenna_number);
+      INSERT INTO licenses (usi, callsign, license_status, radio_service_code) VALUES (1, 'KZZ1', 'A', 'IG');
+      INSERT INTO antennas (rowid, usi, location_number, antenna_number, model) VALUES (17, 1, 1, 2, 'KEPT'), (42, 1, 1, 2, 'KEPT');
+      INSERT INTO locations (usi, location_number, lat, lon, coord_dms, state, site_state, state_derived) VALUES
+        (1, 1, 0, 0, '0-0-0 N 0-0-0 W', 'NY', 'NY', 0),
+        (1, 2, 0, 0, '0-0-0 N 0-0-0 E', NULL, 'WA', 1),
+        (1, 3, 0, 10, NULL, NULL, NULL, 0);
+      UPDATE schema_version SET version = 5;`);
+    await old.close();
+    for (let pass = 0; pass < 2; pass++) {
+      const migrated = createUlsStore(path);
+      const handle = await migrated.raw();
+      expect(
+        handle.prepare('SELECT rowid, antenna_number, model FROM antennas ORDER BY rowid').all(),
+      ).toEqual([
+        { rowid: 17, antenna_number: 2, model: 'KEPT' },
+        { rowid: 42, antenna_number: 2, model: 'KEPT' },
+      ]);
+      expect(
+        handle
+          .prepare(
+            'SELECT lat, lon, state, site_state, state_derived, coord_dms FROM locations ORDER BY location_number',
+          )
+          .all(),
+      ).toEqual([
+        {
+          lat: null,
+          lon: null,
+          state: 'NY',
+          site_state: 'NY',
+          state_derived: 0,
+          coord_dms: '0-0-0 N 0-0-0 W',
+        },
+        {
+          lat: null,
+          lon: null,
+          state: null,
+          site_state: null,
+          state_derived: 0,
+          coord_dms: '0-0-0 N 0-0-0 E',
+        },
+        { lat: 0, lon: 10, state: null, site_state: null, state_derived: 0, coord_dms: null },
+      ]);
+      expect(
+        handle.prepare("SELECT value FROM meta WHERE key = 'antenna_coverage_incomplete'").get(),
+      ).toEqual({ value: '6' });
+      expect(
+        handle.prepare("SELECT value FROM meta WHERE key = 'rebuild_required'").get(),
+      ).toBeFalsy();
+      await migrated.close();
+    }
+  });
   it('creates the licenses table, its FTS index, and every auxiliary table', async () => {
     const store = createUlsStore(join(dir, 'gen.db'));
     try {
@@ -687,7 +749,7 @@ describe('createUlsStore', () => {
       const db = await store.raw();
       expect(db.prepare<{ n: number }>('SELECT count(*) AS n FROM licenses').get()?.n).toBe(0);
       expect(db.prepare<{ version: number }>('SELECT version FROM schema_version').get()).toEqual({
-        version: 5,
+        version: 7,
       });
       expect(
         db
@@ -720,7 +782,7 @@ describe('createUlsStore', () => {
     try {
       const db = await upgraded.raw();
       expect(db.prepare<{ version: number }>('SELECT version FROM schema_version').get()).toEqual({
-        version: 5,
+        version: 7,
       });
       expect(db.prepare('SELECT 1 FROM meta').get()).toBeFalsy();
       const plan = db

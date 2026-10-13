@@ -121,7 +121,14 @@ export const searchLicenses = tool('fcc_spectrum_search_licenses', {
     state: blankAsUnset(stateSchema.optional()).describe(
       "Licensee mailing state: a two-letter USPS code (incl. DC, PR, VI, GU, AS, MP) or a full state name. This is the licensee's address, not the site location.",
     ),
-    limit: z.number().int().min(1).max(100).default(25).describe('Records per page (1–100).'),
+    limit: z
+      .number()
+      .int()
+      .min(1)
+      .default(25)
+      .describe(
+        'Positive integer records per page; values above 100 are clamped to 100 with a notice.',
+      ),
     cursor: cursorSchema.describe(
       'nextCursor from the previous page of the same search; omit for the first page.',
     ),
@@ -201,6 +208,7 @@ export const searchLicenses = tool('fcc_spectrum_search_licenses', {
   ],
 
   async handler(input, ctx) {
+    const limit = Math.min(input.limit, 100);
     const index = getUlsIndexService();
     const dataAsOf = await index.dataAsOf();
     if (dataAsOf === undefined) throw ctx.fail('index_not_ready');
@@ -214,7 +222,7 @@ export const searchLicenses = tool('fcc_spectrum_search_licenses', {
       status: input.status,
       ...(input.state && { state: input.state }),
     };
-    ctx.enrich({ dataAsOf, truncated: false, shown: 0, cap: input.limit, appliedFilters });
+    ctx.enrich({ dataAsOf, truncated: false, shown: 0, cap: limit, appliedFilters });
     ctx.enrich.total(0);
 
     if (
@@ -252,7 +260,7 @@ export const searchLicenses = tool('fcc_spectrum_search_licenses', {
       radioService: input.radio_service,
       status: input.status,
       state: input.state,
-      limit: input.limit,
+      limit,
       cursor: input.cursor,
     });
     if (!page.ok) throw ctx.fail('invalid_cursor');
@@ -262,6 +270,7 @@ export const searchLicenses = tool('fcc_spectrum_search_licenses', {
     ctx.log.info('License search', { total: page.total, shown: page.rows.length });
 
     const fragments: string[] = [];
+    if (input.limit > limit) fragments.push(`limit ${input.limit} was clamped to ${limit}.`);
     if (page.total === 0) {
       if (input.status === 'A') {
         fragments.push(
@@ -309,7 +318,7 @@ export const searchLicenses = tool('fcc_spectrum_search_licenses', {
       );
       ctx.enrich.truncated({
         shown: page.rows.length,
-        cap: input.limit,
+        cap: limit,
         guidance: fragments.join(' '),
       });
     } else if (fragments.length) {

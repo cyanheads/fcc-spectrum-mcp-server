@@ -18,7 +18,11 @@ import {
 } from '@/mcp-server/tools/format-helpers.js';
 import { blankAsUnset, callsignSchema, usiSchema } from '@/mcp-server/tools/input-schemas.js';
 import { PAL_BAND_MHZ } from '@/services/uls/codes.js';
-import { getUlsIndexService, LICENSE_PAGE } from '@/services/uls/uls-index-service.js';
+import {
+  ANTENNA_COVERAGE_NOTICE,
+  getUlsIndexService,
+  LICENSE_PAGE,
+} from '@/services/uls/uls-index-service.js';
 
 const FrequencySchema = z
   .object({
@@ -33,7 +37,9 @@ const FrequencySchema = z
     stationClass: z
       .string()
       .optional()
-      .describe('ULS class-of-station code, as filed (e.g. FB2, FXO).'),
+      .describe(
+        'ULS class-of-station code, as filed (e.g. FB2, FXO); decode with fcc_spectrum_list_reference, topic "station_classes", filter set to this code. Unknown filed codes remain unchanged.',
+      ),
     powerOutputW: z.number().optional().describe('Transmitter output power, watts.'),
     erpW: z.number().optional().describe('Effective radiated power, watts.'),
     eirpDbm: z.number().optional().describe('Effective isotropic radiated power, dBm.'),
@@ -49,7 +55,12 @@ const FrequencySchema = z
 
 const AntennaSchema = z
   .object({
-    antennaNumber: z.number().describe('Antenna number within the location.'),
+    antennaNumber: z
+      .number()
+      .optional()
+      .describe(
+        'Filed antenna number within the location; absent for an independently retained unnumbered AN record, which has no associated frequency rows.',
+      ),
     antennaTypeCode: z
       .string()
       .optional()
@@ -88,6 +99,12 @@ const SiteSchema = z
       .describe('ULS location type code (F fixed, M mobile, …); absent when not filed.'),
     locationTypeLabel: z.string().optional().describe('Label of the location type code.'),
     locationClassCode: z.string().optional().describe('ULS location class code, as filed.'),
+    locationClassLabel: z
+      .string()
+      .optional()
+      .describe(
+        'FCC label of the filed location class; absent for an unknown code. This is authorization metadata, not actual on-air activity.',
+      ),
     latitude: z
       .number()
       .optional()
@@ -305,10 +322,9 @@ export const getLicense = tool('fcc_spectrum_get_license', {
       .number()
       .int()
       .min(1)
-      .max(1000)
       .default(100)
       .describe(
-        'Most frequency rows to return across the locations this call lists (1–1000); rows beyond it are dropped from the last locations first. Large microwave and land-mobile licenses exceed the default.',
+        'Positive integer frequency-row budget across the locations this call lists; values above 1000 are clamped to 1000 with a notice. Rows beyond it are dropped from the last locations first. Large microwave and land-mobile licenses exceed the default.',
       ),
     location_offset: z
       .number()
@@ -450,10 +466,15 @@ export const getLicense = tool('fcc_spectrum_get_license', {
   ],
 
   async handler(input, ctx) {
+    const maxFrequencies = Math.min(input.max_frequencies, 1000);
+    const clampNotice =
+      input.max_frequencies > maxFrequencies
+        ? `max_frequencies ${input.max_frequencies} was clamped to ${maxFrequencies}.`
+        : undefined;
     const index = getUlsIndexService();
     const dataAsOf = await index.dataAsOf();
     if (dataAsOf === undefined) throw ctx.fail('index_not_ready');
-    ctx.enrich({ dataAsOf, truncated: false, shown: 0, cap: input.max_frequencies });
+    ctx.enrich({ dataAsOf, truncated: false, shown: 0, cap: maxFrequencies });
 
     if (input.callsign !== undefined && input.usi !== undefined) {
       throw ctx.fail('identifier_required', 'Both callsign and usi were given; pass only one.');
@@ -479,10 +500,11 @@ export const getLicense = tool('fcc_spectrum_get_license', {
       ...(requested !== undefined
         ? { locationNumber: requested }
         : { locationOffset: input.location_offset }),
-      maxFrequencies: input.max_frequencies,
+      maxFrequencies,
       leaseOffset: input.lease_offset,
     });
     if (!result.found) {
+      if (clampNotice) ctx.enrich.notice(clampNotice);
       return input.callsign
         ? {
             found: false,
@@ -510,7 +532,7 @@ export const getLicense = tool('fcc_spectrum_get_license', {
       );
     }
     if (result.windowFrequencyTotal > result.frequenciesShown) {
-      const belowCeiling = input.max_frequencies < 1000;
+      const belowCeiling = maxFrequencies < 1000;
       const cut = result.frequencyCutAt;
       const remedy =
         cut && cut.offset > locationOffset
@@ -541,13 +563,19 @@ export const getLicense = tool('fcc_spectrum_get_license', {
         license.leases.length === 0 &&
         `lease_offset ${input.lease_offset} is past the last lease; this record has ${license.leaseCount}.`,
     ];
-    const notice = [unfiledStart, ...omitted, ...pastEnd]
+    const notice = [
+      clampNotice,
+      result.antennaCoverageIncomplete && ANTENNA_COVERAGE_NOTICE,
+      unfiledStart,
+      ...omitted,
+      ...pastEnd,
+    ]
       .filter((fragment): fragment is string => Boolean(fragment))
       .join(' ');
     if (omitted.length) {
       ctx.enrich.truncated({
         shown: result.frequenciesShown,
-        cap: input.max_frequencies,
+        cap: maxFrequencies,
         guidance: notice,
       });
     } else if (notice) {
@@ -714,7 +742,7 @@ function siteLines(heading: string, site: z.infer<typeof SiteSchema>): string[] 
   const lines = [
     '',
     heading,
-    `**Type:** ${site.locationTypeCode ?? 'not filed'}${site.locationTypeLabel ? ` (${site.locationTypeLabel})` : ''}${part('Class', site.locationClassCode)} · **Coordinates:** ${coordinates}${part('Filed DMS', site.coordinatesDms && inline(site.coordinatesDms))}`,
+    `**Type:** ${site.locationTypeCode ?? 'not filed'}${site.locationTypeLabel ? ` (${site.locationTypeLabel})` : ''}${part('Class', site.locationClassCode && `${inline(site.locationClassCode)}${site.locationClassLabel ? ` (${site.locationClassLabel})` : ''}`)} · **Coordinates:** ${coordinates}${part('Filed DMS', site.coordinatesDms && inline(site.coordinatesDms))}`,
   ];
   if (place || site.stateFromCoordinates !== undefined) {
     lines.push(`**Place:** ${place || 'not filed'}${stateSourceText(site.stateFromCoordinates)}`);
@@ -745,9 +773,13 @@ function locationLines(location: z.infer<typeof LocationSchema>): string[] {
   }
 
   for (const antenna of antennas) {
+    const heading =
+      antenna.antennaNumber === undefined
+        ? 'Antenna (number not filed)'
+        : `Antenna ${antenna.antennaNumber}`;
     lines.push(
       '',
-      `**Antenna ${antenna.antennaNumber}**${part('Type', antenna.antennaTypeCode)}${part('Height to tip m', antenna.heightToTipM)}${part('Height to center m', antenna.heightToCenterM)}${part('HAAT m', antenna.haatM)}${part('Azimuth °', antenna.azimuthDeg)}${part('Gain dBi', antenna.gainDbi)}${part('Beamwidth °', antenna.beamwidthDeg)}${part('Polarization', antenna.polarization)}${part('Make', antenna.make && inline(antenna.make))}${part('Model', antenna.model && inline(antenna.model))}${part('Filed records', antenna.recordCount && `${antenna.recordCount} (fields that differ between them are omitted)`)}`,
+      `**${heading}**${part('Type', antenna.antennaTypeCode)}${part('Height to tip m', antenna.heightToTipM)}${part('Height to center m', antenna.heightToCenterM)}${part('HAAT m', antenna.haatM)}${part('Azimuth °', antenna.azimuthDeg)}${part('Gain dBi', antenna.gainDbi)}${part('Beamwidth °', antenna.beamwidthDeg)}${part('Polarization', antenna.polarization)}${part('Make', antenna.make && inline(antenna.make))}${part('Model', antenna.model && inline(antenna.model))}${part('Filed records', antenna.recordCount && `${antenna.recordCount} (fields that differ between them are omitted)`)}`,
     );
     if (!antenna.frequencies.length) continue;
     lines.push(

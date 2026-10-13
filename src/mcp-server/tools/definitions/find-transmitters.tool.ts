@@ -1,5 +1,5 @@
 /**
- * @fileoverview `fcc_spectrum_find_transmitters` — licensed transmitter sites within a
+ * @fileoverview `fcc_spectrum_find_transmitters` — FCC-licensed sites within a
  * radius of a coordinate, nearest first, each with the frequencies authorized there.
  * @module mcp-server/tools/definitions/find-transmitters
  */
@@ -23,6 +23,7 @@ import {
   frequencySchema,
   latitudeSchema,
   liveStatusSchema,
+  locationClassSchema,
   locationTypeSchema,
   longitudeSchema,
   radioServiceSchema,
@@ -44,7 +45,7 @@ const SiteFrequencySchema = z
     stationClasses: z
       .array(z.string().describe('One ULS class-of-station code, e.g. "FB2".'))
       .describe(
-        'Distinct station classes filed for this frequency across antennas and modulation steps.',
+        'Distinct station classes filed for this frequency across antennas and modulation steps; decode each with fcc_spectrum_list_reference, topic "station_classes", filter set to the code. Unknown filed codes remain unchanged.',
       ),
     maxErpW: z.number().optional().describe('Highest effective radiated power filed, watts.'),
     maxEirpDbm: z
@@ -91,6 +92,18 @@ const SiteSchema = z
       .string()
       .optional()
       .describe('Label of the location type code, e.g. "Mobile"; absent when no type is filed.'),
+    locationClassCode: z
+      .string()
+      .optional()
+      .describe(
+        'Filed FCC location class: C centerpoint, L area description, P passive repeater, R receive, T transmit; absent when not filed.',
+      ),
+    locationClassLabel: z
+      .string()
+      .optional()
+      .describe(
+        'FCC label of the filed class; absent for an unknown code. Authorization metadata does not establish actual on-air activity.',
+      ),
     distanceKm: z
       .number()
       .describe(
@@ -141,12 +154,12 @@ const SiteSchema = z
     frequenciesShown: z.number().describe('Frequencies listed, after max_frequencies_per_site.'),
     frequencies: z.array(SiteFrequencySchema).describe('Frequencies at the site, ascending.'),
   })
-  .describe('One transmitter site.');
+  .describe('One FCC-licensed site with its filed location role.');
 
 export const findTransmitters = tool('fcc_spectrum_find_transmitters', {
-  title: 'Find FCC-licensed transmitters near a point',
+  title: 'Find FCC-licensed sites near a point',
   description:
-    'Find FCC-licensed transmitter sites within a radius of a coordinate, nearest first, each with its callsign, licensee, distance, coordinates, location type, ground elevation, structure height, and the frequencies authorized there. Filter by frequency or band, radio service, location type, and live status (active by default). Coordinates are decimal degrees or DMS strings. Mobile and temporary-fixed operating areas are filed as a center and a radius of operation: they are returned at their center with radiusKm, and match when the center lies within radius_km. Locations filed without coordinates are not returned, and market-area licenses without site records are found with fcc_spectrum_search_frequencies.',
+    'Find FCC-licensed sites within a radius of a coordinate, nearest first, each with its callsign, licensee, distance, coordinates, filed location type and class, ground elevation, structure height, and authorized frequencies. Filter by frequency or band, radio service, location type, location class, and live status (active by default). Unset location_class keeps all filed roles, including receive and passive locations; filed classes describe authorization, not actual on-air activity. Coordinates are decimal degrees or DMS strings. Mobile and temporary-fixed operating areas are returned at their center with radiusKm and match when the center lies within radius_km. Locations without valid coordinates are omitted; market-area licenses without site records are found with fcc_spectrum_search_frequencies.',
   annotations: { readOnlyHint: true, idempotentHint: true, openWorldHint: false },
   input: z.object({
     latitude: latitudeSchema.describe(
@@ -169,23 +182,38 @@ export const findTransmitters = tool('fcc_spectrum_find_transmitters', {
     location_type: blankAsUnset(locationTypeSchema.optional()).describe(
       'One ULS location type code, case-insensitive: "F" keeps fixed sites only, "M" mobile and "T" temporary-fixed operating areas; see fcc_spectrum_list_reference topic "location_types". Omit for every type.',
     ),
+    location_class: blankAsUnset(locationClassSchema.optional()).describe(
+      'One filed FCC location class, case-insensitive: C Centerpoint, L IQ/QQ Area of Operation Desc, P Passive Repeater Location, R Receive Location, T Transmit Location. Omit for every class; filed classes do not establish actual on-air activity.',
+    ),
     status: blankAsUnset(liveStatusSchema).describe(
       'A active (default), L pending legal, X term pending, or "any" for all three. Other statuses keep no site records.',
     ),
-    limit: z.number().int().min(1).max(100).default(25).describe('Sites per page (1–100).'),
+    limit: z
+      .number()
+      .int()
+      .min(1)
+      .default(25)
+      .describe(
+        'Positive integer sites per page; values above 100 are clamped to 100 with a notice.',
+      ),
     max_frequencies_per_site: z
       .number()
       .int()
       .min(1)
-      .max(50)
       .default(10)
-      .describe('Most frequencies listed per site (1–50); frequencyCount carries the full count.'),
+      .describe(
+        'Positive integer frequency budget per site; values above 50 are clamped to 50 with a notice. frequencyCount carries the full count.',
+      ),
     cursor: cursorSchema.describe(
       'nextCursor from the previous page of the same search; omit for the first page.',
     ),
   }),
   output: z.object({
-    sites: z.array(SiteSchema).describe('Transmitter sites, nearest first.'),
+    sites: z
+      .array(SiteSchema)
+      .describe(
+        'FCC-licensed sites, nearest first; filed classes can include transmit, receive, and passive roles.',
+      ),
     nextCursor: z
       .string()
       .optional()
@@ -212,6 +240,7 @@ export const findTransmitters = tool('fcc_spectrum_find_transmitters', {
         frequency_high_mhz: z.number().optional().describe('Band upper edge, converted to MHz.'),
         radio_service: z.string().optional().describe('Radio service code filter.'),
         location_type: z.string().optional().describe('Location type code filter.'),
+        location_class: z.string().optional().describe('Filed location class filter.'),
         status: z.string().describe('Status filter, default included.'),
         max_frequencies_per_site: z.number().describe('Per-site frequency cap applied.'),
       })
@@ -269,6 +298,8 @@ export const findTransmitters = tool('fcc_spectrum_find_transmitters', {
   ],
 
   async handler(input, ctx) {
+    const limit = Math.min(input.limit, 100);
+    const maxFrequenciesPerSite = Math.min(input.max_frequencies_per_site, 50);
     const index = getUlsIndexService();
     const dataAsOf = await index.dataAsOf();
     if (dataAsOf === undefined) throw ctx.fail('index_not_ready');
@@ -281,14 +312,15 @@ export const findTransmitters = tool('fcc_spectrum_find_transmitters', {
       }),
       ...(input.radio_service && { radio_service: input.radio_service }),
       ...(input.location_type && { location_type: input.location_type }),
+      ...(input.location_class && { location_class: input.location_class }),
       status: input.status,
-      max_frequencies_per_site: input.max_frequencies_per_site,
+      max_frequencies_per_site: maxFrequenciesPerSite,
     };
     ctx.enrich({
       dataAsOf,
       truncated: false,
       shown: 0,
-      cap: input.limit,
+      cap: limit,
       searchCenter: {
         latitude: input.latitude,
         longitude: input.longitude,
@@ -332,9 +364,10 @@ export const findTransmitters = tool('fcc_spectrum_find_transmitters', {
       band: band && { lowMhz: band.lowMhz, highMhz: band.highMhz },
       radioService: input.radio_service,
       locationType: input.location_type,
+      locationClass: input.location_class,
       status: input.status,
-      limit: input.limit,
-      maxFrequenciesPerSite: input.max_frequencies_per_site,
+      limit,
+      maxFrequenciesPerSite,
       cursor: input.cursor,
     });
     if (!page.ok) throw ctx.fail('invalid_cursor');
@@ -344,6 +377,11 @@ export const findTransmitters = tool('fcc_spectrum_find_transmitters', {
     ctx.log.info('Transmitter search', { total: page.total, shown: page.rows.length });
 
     const fragments: string[] = [];
+    if (input.limit > limit) fragments.push(`limit ${input.limit} was clamped to ${limit}.`);
+    if (input.max_frequencies_per_site > maxFrequenciesPerSite)
+      fragments.push(
+        `max_frequencies_per_site ${input.max_frequencies_per_site} was clamped to ${maxFrequenciesPerSite}.`,
+      );
     if (page.total === 0) {
       const widen = orList([
         input.radius_km < 100 && 'raise radius_km (max 100)',
@@ -353,11 +391,12 @@ export const findTransmitters = tool('fcc_spectrum_find_transmitters', {
             : 'widen the band (lower frequency_low or raise frequency_high)'),
         input.radio_service && 'drop radio_service',
         input.location_type && 'drop location_type',
+        input.location_class && 'drop location_class',
         input.status !== 'any' && 'pass status "any"',
         band && 'call fcc_spectrum_search_frequencies to search by state',
       ]);
       fragments.push(
-        `No transmitter site within ${input.radius_km} km ${band ? `is authorized on ${bandText(band.lowMhz, band.highMhz)} under` : 'matches'} these filters${widen ? `; ${widen}` : ''}.`,
+        `No FCC-licensed site within ${input.radius_km} km ${band ? `is authorized on ${bandText(band.lowMhz, band.highMhz)} under` : 'matches'} these filters${widen ? `; ${widen}` : ''}.`,
         'Market-area licenses (PCS, AWS, 700 MHz, 3.7 GHz) usually have no site records; call fcc_spectrum_search_frequencies with kind "market".',
       );
     }
@@ -367,7 +406,7 @@ export const findTransmitters = tool('fcc_spectrum_find_transmitters', {
       );
       ctx.enrich.truncated({
         shown: page.rows.length,
-        cap: input.limit,
+        cap: limit,
         guidance: fragments.join(' '),
       });
     } else if (fragments.length) {
@@ -378,7 +417,7 @@ export const findTransmitters = tool('fcc_spectrum_find_transmitters', {
   },
 
   format: (result) => {
-    const lines: string[] = [`## Transmitter sites (${result.sites.length} on this page)`];
+    const lines: string[] = [`## FCC-licensed sites (${result.sites.length} on this page)`];
     for (const site of result.sites) {
       const place = [site.county && inline(site.county), site.state].filter(Boolean).join(', ');
       lines.push(
@@ -388,6 +427,10 @@ export const findTransmitters = tool('fcc_spectrum_find_transmitters', {
         `- **Status:** ${site.licenseStatus} · **Service:** ${site.radioServiceCode} (${inline(site.radioServiceLabel)})${site.locationTypeCode ? ` · **Location type:** ${site.locationTypeCode}${site.locationTypeLabel ? ` (${site.locationTypeLabel})` : ''}` : ''}`,
         `- **Coordinates:** ${site.latitude}, ${site.longitude}${site.radiusKm !== undefined ? ` · **Radius of operation:** ${site.radiusKm} km` : ''}${site.groundElevationM !== undefined ? ` · **Ground elevation:** ${site.groundElevationM} m` : ''}${site.overallHeightM !== undefined ? ` · **Overall height:** ${site.overallHeightM} m` : ''}${site.asrNumber ? ` · **ASR:** ${site.asrNumber}` : ''}`,
       );
+      if (site.locationClassCode)
+        lines.push(
+          `- **Location class:** ${inline(site.locationClassCode)}${site.locationClassLabel ? ` (${site.locationClassLabel})` : ''}`,
+        );
       if (place) {
         lines.push(`- **Place:** ${place}${stateSourceText(site.stateFromCoordinates)}`);
       }

@@ -177,7 +177,7 @@ export function lo(v: {
 /** AN — antenna. */
 export function an(v: {
   usi: number;
-  antenna: number;
+  antenna: number | null;
   location: number;
   type?: string;
   heightToTip?: number;
@@ -1655,6 +1655,89 @@ export const BAND_CLASS_WEEKLY: FixtureFile = {
  * number has one antenna and its own frequency: 451.0125, 456.0125, 457.5, 452.5, 453.5, and
  * 458.5 MHz.
  */
+/** Filed classes, missing antenna numbers, and coordinate placeholders. */
+export const DATA_QUALITY_WEEKLY = dataQualityWeekly(101);
+
+/** The same filed records with a chosen independent unnumbered-antenna count. */
+export function dataQualityWeekly(unnumbered: number): FixtureFile {
+  return {
+    countsCreated: PAGING_WEEKLY.countsCreated,
+    lastModified: PAGING_WEEKLY.lastModified,
+    zip: buildZip([
+      {
+        name: 'counts',
+        data: countsFile('Sun Sep 27 09:38:53 EDT 2026', {
+          HD: 1,
+          LO: 8,
+          AN: unnumbered + 3,
+          FR: 6,
+        }),
+      },
+      {
+        name: 'HD.dat',
+        data: datFile([hd({ usi: 5401, callsign: 'KZZ541', status: 'A', service: 'IG' })]),
+      },
+      {
+        name: 'LO.dat',
+        data: datFile([
+          ...['T', 'R', 'P', 'Z', undefined].map((locationClass, i) =>
+            lo({
+              usi: 5401,
+              number: i + 1,
+              type: 'F',
+              ...(locationClass && { locationClass }),
+              lat: [47, 0, 0, 'N'],
+              lon: [122, 0, 0, 'W'],
+            }),
+          ),
+          lo({
+            usi: 5401,
+            number: 2,
+            type: 'M',
+            locationClass: 'T',
+            lat: [47, 0, 0, 'N'],
+            lon: [122, 0, 0, 'W'],
+          }),
+          lo({
+            usi: 5401,
+            number: 6,
+            locationClass: 'T',
+            state: 'NY',
+            lat: [0, 0, 0, 'N'],
+            lon: [0, 0, 0, 'W'],
+          }),
+          lo({ usi: 5401, number: 7, state: 'WA' }),
+        ]),
+      },
+      {
+        name: 'AN.dat',
+        data: datFile([
+          an({ usi: 5401, location: 1, antenna: 1, make: 'AGREED', model: 'A' }),
+          an({ usi: 5401, location: 1, antenna: 1, make: 'AGREED', model: 'B' }),
+          ...Array.from({ length: unnumbered }, (_, i) =>
+            an({
+              usi: 5401,
+              location: 2,
+              antenna: null,
+              type: 'R',
+              model: i < 2 ? 'DUPLICATE' : `MODEL${i}`,
+            }),
+          ),
+          an({ usi: 5401, location: 3, antenna: null, type: 'P' }),
+        ]),
+      },
+      {
+        name: 'FR.dat',
+        data: datFile(
+          Array.from({ length: 6 }, (_, i) =>
+            fr({ usi: 5401, location: i + 1, antenna: 1, seq: 1, frequency: 152 + i }),
+          ),
+        ),
+      },
+    ]),
+  };
+}
+
 export const AREA_SITES_WEEKLY: FixtureFile = {
   countsCreated: PAGING_WEEKLY.countsCreated,
   lastModified: PAGING_WEEKLY.lastModified,

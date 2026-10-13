@@ -20,7 +20,7 @@ import {
 export const MIRROR_NAME = 'fcc-uls';
 
 /** Current store schema version; bump it and add a migration on any schema change. */
-const SCHEMA_VERSION = 5;
+const SCHEMA_VERSION = 7;
 
 /** License statuses whose records keep sites, antennas, frequencies, and market blocks. */
 export const LIVE_STATUSES = ['A', 'L', 'X'] as const;
@@ -113,7 +113,7 @@ CREATE INDEX IF NOT EXISTS locations_site_state ON locations (site_state);
 CREATE TABLE IF NOT EXISTS antennas (
   usi INTEGER NOT NULL,
   location_number INTEGER NOT NULL,
-  antenna_number INTEGER NOT NULL,
+  antenna_number INTEGER,
   antenna_type TEXT,
   height_to_tip_m REAL,
   height_to_center_m REAL,
@@ -197,6 +197,8 @@ export const META_KEYS = {
    * recomputed in place; such a generation is never served or refreshed, only replaced.
    */
   rebuildRequired: 'rebuild_required',
+  /** Discarded unnumbered AN records require a full rebuild; ordinary reads remain available. */
+  antennaCoverageIncomplete: 'antenna_coverage_incomplete',
 } as const;
 
 /** Per-group counts kept in `meta` under {@link META_KEYS.groupStats}. */
@@ -319,6 +321,37 @@ function addMarketCodeIndex(handle: SqliteHandle): void {
   );
 }
 
+/** Schema 6: retain nullable filed antenna numbers while preserving existing row order. */
+function allowUnnumberedAntennas(handle: SqliteHandle): void {
+  const required = handle
+    .prepare<{ required: number }>(
+      "SELECT [notnull] AS required FROM pragma_table_info('antennas') WHERE name = 'antenna_number'",
+    )
+    .get()?.required;
+  if (!required) return;
+  handle.exec(`DROP INDEX antennas_key;
+    ALTER TABLE antennas RENAME TO antennas_numbered;
+    ${AUX_DDL}
+    INSERT INTO antennas (rowid, usi, location_number, antenna_number, antenna_type, height_to_tip_m, height_to_center_m, make, model, polarization, beamwidth_deg, gain_dbi, azimuth_deg, haat_m)
+      SELECT rowid, * FROM antennas_numbered ORDER BY rowid;
+    DROP TABLE antennas_numbered;
+    INSERT OR REPLACE INTO meta (key, value) SELECT '${META_KEYS.antennaCoverageIncomplete}', '6' WHERE EXISTS (SELECT 1 FROM licenses);`);
+}
+
+/** Schema 7: invalidate zero coordinate placeholders, retaining filed state and DMS. */
+function repairZeroCoordinates(handle: SqliteHandle): void {
+  handle.exec(`UPDATE locations SET lat = NULL, lon = NULL,
+    site_state = CASE WHEN state_derived = 1 THEN state ELSE site_state END,
+    state_derived = 0 WHERE lat = 0 AND lon = 0;`);
+}
+
+/** True until a full rebuild has restored AN rows discarded by earlier decoders. */
+export function isAntennaCoverageIncomplete(handle: SqliteHandle): boolean {
+  return Boolean(
+    handle.prepare('SELECT 1 FROM meta WHERE key = ?').get(META_KEYS.antennaCoverageIncomplete),
+  );
+}
+
 /** True when the generation behind `handle` carries the {@link markRebuildRequired} mark. */
 export function isRebuildRequired(handle: SqliteHandle): boolean {
   return Boolean(handle.prepare('SELECT 1 FROM meta WHERE key = ?').get(META_KEYS.rebuildRequired));
@@ -345,6 +378,8 @@ export function createUlsStore(path: string): MirrorStore {
       { version: 3, up: addBandClasses },
       { version: 4, up: markRebuildRequired },
       { version: 5, up: addMarketCodeIndex },
+      { version: 6, up: allowUnnumberedAntennas },
+      { version: 7, up: repairZeroCoordinates },
     ],
   });
 }

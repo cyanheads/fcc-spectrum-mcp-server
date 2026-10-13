@@ -17,6 +17,7 @@ import { logger, requestContextService } from '@cyanheads/mcp-ts-core/utils';
 import {
   codeLabel,
   LICENSE_STATUSES,
+  LOCATION_CLASSES,
   LOCATION_TYPES,
   OPERATOR_CLASSES,
   RADIO_SERVICES,
@@ -31,6 +32,7 @@ import {
   type GenerationPointer,
   type GroupStats,
   generationStamp,
+  isAntennaCoverageIncomplete,
   isGenerationFile,
   isMalformedPointer,
   isProcessAlive,
@@ -120,6 +122,10 @@ const KM_PER_DEGREE = (Math.PI * EARTH_RADIUS_KM) / 180;
  */
 export const LICENSE_PAGE = { sites: 50, antennas: 100, leases: 100 } as const;
 
+/** Recovery for data discarded by earlier antenna decoders. */
+export const ANTENNA_COVERAGE_NOTICE =
+  'Antenna coverage is incomplete: this generation discarded AN records without antenna numbers. An operator must run mirror:init for a complete weekly rebuild; daily refresh restores only licenses it replaces.';
+
 /** Callsign-prefix candidates offered on a miss. */
 const MAX_CANDIDATES = 5;
 
@@ -193,7 +199,7 @@ interface LocationRow {
 }
 
 interface AntennaRow {
-  antenna_number: number;
+  antenna_number: number | null;
   antenna_type: string | null;
   azimuth_deg: number | null;
   beamwidth_deg: number | null;
@@ -308,6 +314,7 @@ interface SidePage {
 }
 
 type SiteAssignmentRow = LicenseHeadRow & {
+  location_class: string | null;
   bandwidth: number | null;
   classes: string | null;
   county: string | null;
@@ -586,6 +593,16 @@ function locationType(
   };
 }
 
+/** Filed class with the FCC label when known; unknown codes pass through unchanged. */
+function locationClass(
+  code: string | null,
+): Pick<LicenseSite, 'locationClassCode' | 'locationClassLabel'> {
+  return {
+    ...opt('locationClassCode', code),
+    ...opt('locationClassLabel', code && codeLabel(LOCATION_CLASSES, code)),
+  };
+}
+
 /**
  * One LO row's site fields: the street address and site name only when redaction leaves them
  * visible, and the ASR value only when it is a registration number.
@@ -593,7 +610,7 @@ function locationType(
 function siteFields(lo: LocationRow, nameAndAddressVisible: boolean): LicenseSite {
   return {
     ...locationType(lo.location_type),
-    ...opt('locationClassCode', lo.location_class),
+    ...locationClass(lo.location_class),
     ...opt('latitude', lo.lat),
     ...opt('longitude', lo.lon),
     ...opt('coordinatesDms', lo.coord_dms),
@@ -684,6 +701,7 @@ export class UlsIndexService {
       const state = await generation.store.readState();
       Object.assign(index, {
         ready: true,
+        ...(isAntennaCoverageIncomplete(db) && { antennaCoverageIncomplete: true }),
         status: 'ready',
         generation: generation.file,
         lastFullBuild: generation.publishedAt,
@@ -961,6 +979,7 @@ export class UlsIndexService {
     const { license, nextLeaseOffset } = this.licenseDetail(db, row, params.leaseOffset ?? 0);
     return {
       found: true,
+      ...(isAntennaCoverageIncomplete(db) && { antennaCoverageIncomplete: true }),
       license,
       technicalRetained,
       locations,
@@ -1001,12 +1020,12 @@ export class UlsIndexService {
   ) {
     const summary = new Map<
       number,
-      { antennas: Set<number>; frequencies: number; sites: number }
+      { antennas: Set<number>; unnumbered: number; frequencies: number; sites: number }
     >();
     const entry = (number: number) => {
       let counts = summary.get(number);
       if (!counts) {
-        counts = { antennas: new Set(), frequencies: 0, sites: 0 };
+        counts = { antennas: new Set(), unnumbered: 0, frequencies: 0, sites: 0 };
         summary.set(number, counts);
       }
       return counts;
@@ -1019,11 +1038,12 @@ export class UlsIndexService {
       entry(n).sites = count;
     }
     for (const { n, a } of db
-      .prepare<{ a: number; n: number }>(
+      .prepare<{ a: number | null; n: number }>(
         'SELECT location_number AS n, antenna_number AS a FROM antennas WHERE usi = ?',
       )
       .all(usi)) {
-      entry(n).antennas.add(a);
+      if (a === null) entry(n).unnumbered++;
+      else entry(n).antennas.add(a);
     }
     for (const { n, a, count } of db
       .prepare<{ a: number; count: number; n: number }>(
@@ -1050,14 +1070,14 @@ export class UlsIndexService {
     for (const [number, counts] of ordered.slice(offset)) {
       const over =
         sites + counts.sites > LICENSE_PAGE.sites ||
-        antennas + counts.antennas.size > LICENSE_PAGE.antennas;
+        antennas + counts.antennas.size + counts.unnumbered > LICENSE_PAGE.antennas;
       if (listed.length > 0 && over) break;
       if (!cutAt && frequencies + counts.frequencies > maxFrequencies) {
         cutAt = { locationNumber: number, offset: offset + listed.length };
       }
       listed.push(number);
       sites += counts.sites;
-      antennas += counts.antennas.size;
+      antennas += counts.antennas.size + counts.unnumbered;
       frequencies += counts.frequencies;
     }
     const end = offset + listed.length;
@@ -1192,8 +1212,8 @@ export class UlsIndexService {
    * kept under a bare antenna or location entry rather than dropped, and every listed number
    * gets an entry, so a number filed only on frequency rows the cap drops is still listed, with
    * no antennas. A location number filed at several sites lists them in `sites`; AN and FR rows
-   * carry only the number, so its antennas stay on the entry, each merged across the AN records
-   * filed for it (a field is kept only when every record agrees on it).
+   * carry only the number, so its antennas stay on the entry. Numbered antennas merge AN records
+   * filed for them (a field is kept only when every record agrees); unnumbered rows stay independent.
    */
   private licenseLocations(
     db: SqliteHandle,
@@ -1216,7 +1236,12 @@ export class UlsIndexService {
       }
       return entry;
     };
-    const antenna = (locationNumber: number, antennaNumber: number) => {
+    const antenna = (locationNumber: number, antennaNumber: number | null) => {
+      if (antennaNumber === null) {
+        const entry: LicenseAntenna = { frequencies: [] };
+        location(locationNumber).antennas.push(entry);
+        return entry;
+      }
       const key = `${locationNumber}:${antennaNumber}`;
       let entry = antennas.get(key);
       if (!entry) {
@@ -1251,7 +1276,7 @@ export class UlsIndexService {
     const filed = Map.groupBy(
       db
         .prepare<AntennaRow>(
-          `SELECT * FROM antennas WHERE ${inRange} ORDER BY location_number, antenna_number`,
+          `SELECT * FROM antennas WHERE ${inRange} ORDER BY location_number, antenna_number, rowid`,
         )
         .all(...rangeArgs),
       (an) => antenna(an.location_number, an.antenna_number),
@@ -1297,20 +1322,21 @@ export class UlsIndexService {
     }
     for (const number of listed) location(number);
     const sorted = [...locations.values()].sort((a, b) => a.locationNumber - b.locationNumber);
-    for (const entry of sorted) entry.antennas.sort((a, b) => a.antennaNumber - b.antennaNumber);
+    for (const entry of sorted)
+      entry.antennas.sort((a, b) => (a.antennaNumber ?? Infinity) - (b.antennaNumber ?? Infinity));
     return { locations: sorted, shown: frequencies.length };
   }
 
   // --- find_transmitters ----------------------------------------------------------------
 
   /**
-   * Transmitter sites within `radiusKm` of a point, nearest first: a bounding-box query on
+   * FCC-licensed sites within `radiusKm` of a point, nearest first: a bounding-box query on
    * `locations(lat, lon)`, then haversine distance in JS, keyset-paginated on
    * `(distance, usi, location_number, site_seq)`. A mobile or temporary-fixed area is filed as
    * a center and a radius of operation, so it is a site at its center, matched and ranked by
    * the center's distance. With a band, only sites authorized on an overlapping frequency
-   * match, and each site lists only its overlapping frequencies; with a location type, only
-   * sites of that type match. Frequencies are filed against a location number, so every site
+   * match, and each site lists only its overlapping frequencies; with a location type or class, only
+   * sites of that type or class match. Frequencies are filed against a location number, so every site
    * sharing one lists the number's frequencies and carries `sitesSharingNumber`.
    */
   async findTransmitters(params: FindTransmittersParams): Promise<PageResult<TransmitterSite>> {
@@ -1336,6 +1362,10 @@ export class UlsIndexService {
     if (params.locationType) {
       where.push('lo.location_type = ?');
       args.push(params.locationType);
+    }
+    if (params.locationClass) {
+      where.push('lo.location_class = ?');
+      args.push(params.locationClass);
     }
     const overlap = params.band && this.overlapArgs(params.band);
     if (overlap) {
@@ -1399,6 +1429,7 @@ export class UlsIndexService {
           ...this.siteHead(site),
           locationNumber: site.location_number,
           ...locationType(site.location_type),
+          ...locationClass(site.location_class),
           distanceKm: Math.round(candidate.distance * 1000) / 1000,
           latitude: candidate.lat,
           longitude: candidate.lon,
@@ -1771,7 +1802,7 @@ export class UlsIndexService {
         f.upper_mhz AS upper, max(f.bandwidth_mhz) AS bandwidth,
         group_concat(f.class_station, '|') AS classes, max(f.erp_w) AS max_erp,
         group_concat(f.emissions, ',') AS emissions,
-        lo.lat, lo.lon, lo.location_type, lo.radius_km, lo.county, lo.site_state, lo.state_derived,
+        lo.lat, lo.lon, lo.location_type, lo.location_class, lo.radius_km, lo.county, lo.site_state, lo.state_derived,
         (SELECT count(*) FROM locations s
          WHERE s.usi = f.usi AND s.location_number = f.location_number) AS sites`,
       group: 'GROUP BY f.frequency_mhz, f.usi, f.location_number, f.upper_mhz',
@@ -1792,6 +1823,7 @@ export class UlsIndexService {
             ? { sitesSharingNumber: row.sites }
             : {
                 ...locationType(row.location_type),
+                ...locationClass(row.location_class),
                 ...opt('latitude', row.lat),
                 ...opt('longitude', row.lon),
                 ...opt('radiusKm', row.radius_km),
@@ -1945,8 +1977,8 @@ export class UlsIndexService {
   /**
    * A failure reading the index as callers see it: a `ServiceUnavailable` whose message has
    * the mirror path taken out, carrying neither the original's `data` (a store open error
-   * puts the path there) nor it as `cause` (the framework forwards a cause's message to the
-   * client as `rootCause`). The original, path included, goes to the operator log.
+   * may carry private details) nor it as `cause`. The original, path included, goes to the
+   * operator log; framework-generated root-cause details stay off the wire.
    */
   private unreadable(err: unknown): McpError {
     const original = err instanceof Error ? err : new Error(String(err));

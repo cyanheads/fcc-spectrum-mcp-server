@@ -16,10 +16,11 @@ import { createMockContext, runToolContract } from '@cyanheads/mcp-ts-core/testi
 import { afterAll, beforeAll, beforeEach, describe, expect, it } from 'vitest';
 import { licenseResource } from '@/mcp-server/resources/definitions/license.resource.js';
 import { getLicense } from '@/mcp-server/tools/definitions/get-license.tool.js';
-import { POINTER_FILE, writePointer } from '@/services/uls/schema.js';
+import { createUlsStore, POINTER_FILE, writePointer } from '@/services/uls/schema.js';
 import type { GetLicenseResult } from '@/services/uls/types.js';
 import { releaseIndex, successOf, useIndex } from '../fixtures/tool-harness.js';
 import {
+  dataQualityWeekly,
   INDIVIDUAL_SITES_WEEKLY,
   QUIRKS_WEEKLY,
   sprawlingPagingWeekly,
@@ -77,6 +78,57 @@ function expectReason(error: McpError, reason: string): void {
   expect(error.code).toBe(entry?.code);
   expect(error.data?.reason).toBe(reason);
 }
+
+describe('unnumbered antenna and coordinate fields', () => {
+  let fixture: FixtureIndex;
+  beforeAll(async () => {
+    fixture = await buildFixtureIndex({
+      groups: ['paging'],
+      weekly: { paging: dataQualityWeekly(3) },
+    });
+  });
+  beforeEach(async () => {
+    await useIndex(fixture.mirrorDir, { services: ['paging'] });
+  });
+  afterAll(async () => {
+    await releaseIndex();
+    await fixture.dispose();
+  });
+  it('preserves class labels in JSON and matches the tool first window', async () => {
+    const result = await read('KZZ541');
+    expect(result.locations[0]).toMatchObject({
+      locationClassCode: 'T',
+      locationClassLabel: 'Transmit Location',
+    });
+    const tool = successOf<ToolOutput>(
+      await runToolContract(getLicense, { callsign: 'KZZ541' } as never),
+    );
+    expect(result.locations).toEqual(tool.locations);
+    expect(result.nextLocationOffset).toBeUndefined();
+    const unnumbered = result.locations[1]!.antennas.filter(
+      (antenna) => antenna.antennaNumber === undefined,
+    );
+    expect(unnumbered).toHaveLength(3);
+    expect(unnumbered).toEqual([
+      { antennaTypeCode: 'R', model: 'DUPLICATE', frequencies: [] },
+      { antennaTypeCode: 'R', model: 'DUPLICATE', frequencies: [] },
+      { antennaTypeCode: 'R', model: 'MODEL2', frequencies: [] },
+    ]);
+    expect(result.locations[5]).toMatchObject({ state: 'NY', coordinatesDms: '0-0-0 N 0-0-0 W' });
+    expect(result.locations[5]).not.toHaveProperty('latitude');
+    expect(result.locations[5]).not.toHaveProperty('longitude');
+  });
+  it('discloses incomplete antenna coverage in its JSON notice', async () => {
+    const store = createUlsStore(join(fixture.mirrorDir, fixture.generation));
+    (await store.raw()).exec(
+      "INSERT INTO meta (key,value) VALUES ('antenna_coverage_incomplete','6')",
+    );
+    await store.close();
+    expect(await read('KZZ541')).toMatchObject({
+      notice: expect.stringContaining('Antenna coverage is incomplete'),
+    });
+  });
+});
 
 describe('definition', () => {
   it('is a JSON resource with a public one-hour cache hint and no list()', () => {

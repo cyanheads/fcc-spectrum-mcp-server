@@ -1,7 +1,7 @@
 {
   "name": "fcc-spectrum-mcp-server",
   "version": "0.1.2",
-  "description": "Search FCC radio licenses, find nearby transmitter sites, and see who is licensed on a frequency.",
+  "description": "Search FCC radio licenses, find nearby licensed sites, and see who is licensed on a frequency.",
   "author": {
     "name": "cyanheads",
     "email": "casey@caseyjhand.com",
@@ -14,8 +14,8 @@
   "mcpServers": "./.codex-plugin/mcp.json",
   "interface": {
     "displayName": "fcc-spectrum-mcp-server",
-    "shortDescription": "Search FCC radio licenses, find nearby transmitter sites, and see who is licensed on a frequency.",
-    "longDescription": "US radio spectrum licensing from the FCC Universal Licensing System (ULS), answered from a local SQLite index the operator builds once from the FCC's public weekly bulk files and keeps current with the daily ones. Look up a callsign, licensee, or FCC Registration Number; read a license's sites, antennas, frequencies, power, and emission designators; find licensed transmitter sites within a radius of a point; and see who is authorized on a frequency or band, market-area spectrum blocks included. The default index covers land mobile, microwave, cellular and market-area wireless, paging, coast stations, BRS/EBS, and amateur licenses, plus spectrum leases; GMRS, ship, and aircraft licenses are opt-in. Broadcast stations and satellite earth stations are not included. Keyless, with no call to the FCC at request time. Individual licensees are redacted by default, and contact details are never ingested.",
+    "shortDescription": "Search FCC radio licenses, find nearby licensed sites, and see who is licensed on a frequency.",
+    "longDescription": "US radio spectrum licensing from the FCC Universal Licensing System (ULS), answered from a local SQLite index the operator builds once from the FCC's public weekly bulk files and keeps current with the daily ones. Look up a callsign, licensee, or FCC Registration Number; read a license's sites, antennas, frequencies, power, and emission designators; find licensed sites within a radius of a point; and see who is authorized on a frequency or band, market-area spectrum blocks included. The default index covers land mobile, microwave, cellular and market-area wireless, paging, coast stations, BRS/EBS, and amateur licenses, plus spectrum leases; GMRS, ship, and aircraft licenses are opt-in. Broadcast stations and satellite earth stations are not included. Keyless, with no call to the FCC at request time. Individual licensees are redacted by default, and contact details are never ingested.",
     "developerName": "cyanheads",
     "category": "data",
     "capabilities": ["Read"],

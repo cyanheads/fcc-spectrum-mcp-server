@@ -1,11 +1,12 @@
 /**
- * @fileoverview `fcc_spectrum_list_reference` — decode ULS vocabulary (radio services,
+ * @fileoverview `fcc_spectrum_list_reference` — decode ULS vocabulary (radio services, station classes,
  * license statuses, location and antenna types, applicant types, amateur operator
  * classes) and report index coverage. Works before the index is built.
  * @module mcp-server/tools/definitions/list-reference
  */
 
 import { tool, z } from '@cyanheads/mcp-ts-core';
+import { JsonRpcErrorCode } from '@cyanheads/mcp-ts-core/errors';
 import { cell, yesNo } from '@/mcp-server/tools/format-helpers.js';
 import { blankAsUnset, caseFolded } from '@/mcp-server/tools/input-schemas.js';
 import {
@@ -15,12 +16,14 @@ import {
   LOCATION_TYPES,
   OPERATOR_CLASSES,
   RADIO_SERVICES,
+  STATION_CLASSES,
   toEntries,
 } from '@/services/uls/codes.js';
-import { getUlsIndexService } from '@/services/uls/uls-index-service.js';
+import { ANTENNA_COVERAGE_NOTICE, getUlsIndexService } from '@/services/uls/uls-index-service.js';
 
 const TOPICS = [
   'radio_services',
+  'station_classes',
   'license_statuses',
   'location_types',
   'antenna_types',
@@ -36,6 +39,7 @@ const VOCABULARY: Record<
   { title: string; table: Readonly<Record<string, string>> }
 > = {
   radio_services: { title: 'Radio services', table: RADIO_SERVICES },
+  station_classes: { title: 'Station classes', table: STATION_CLASSES },
   license_statuses: { title: 'License statuses', table: LICENSE_STATUSES },
   location_types: { title: 'Location types', table: LOCATION_TYPES },
   antenna_types: { title: 'Antenna types', table: ANTENNA_TYPES },
@@ -71,6 +75,12 @@ const IndexStateSchema = z
     ready: z
       .boolean()
       .describe('True when a completed index generation is published and searches work.'),
+    antennaCoverageIncomplete: z
+      .boolean()
+      .optional()
+      .describe(
+        'True when earlier decoding discarded unnumbered antenna records; searches remain available, but a complete weekly rebuild is needed.',
+      ),
     status: z
       .enum(['none', 'building', 'ready'])
       .describe(
@@ -142,14 +152,14 @@ const normalizeForMatch = (text: string) =>
 export const listReference = tool('fcc_spectrum_list_reference', {
   title: 'List FCC ULS reference codes and coverage',
   description:
-    'Decode FCC ULS codes used by the other tools — radio service codes, license statuses, location types, antenna types, applicant types, amateur operator classes — or report coverage: which service groups this index holds, record counts, and when each was last updated. Works before the index is built.',
+    'Decode FCC ULS codes used by the other tools — radio service codes, station classes, license statuses, location types, antenna types, applicant types, amateur operator classes — or report coverage: which service groups this index holds, record counts, and when each was last updated. Works before the index is built. Station classes describe licensed categories, not actual on-air activity.',
   annotations: { readOnlyHint: true, idempotentHint: true, openWorldHint: false },
   input: z.object({
     topic: caseFolded(z.enum(TOPICS)).describe(
-      'What to list: a code vocabulary (radio_services, license_statuses, location_types, antenna_types, applicant_types, operator_classes) or coverage, the index build state and loaded service groups.',
+      'What to list: a code vocabulary (radio_services, station_classes, license_statuses, location_types, antenna_types, applicant_types, operator_classes) or coverage, the index build state and loaded service groups.',
     ),
     filter: blankAsUnset(z.string().max(200).optional()).describe(
-      'Radio services only: keep entries whose code and label contain every word given, in any order (e.g. "700 public safety"). Case- and accent-insensitive.',
+      'radio_services and station_classes only: keep entries whose code and label contain every token given, in any order (e.g. "700 public safety" or "FB2"). Case- and accent-insensitive; punctuation separates tokens. A nonblank filter must normalize to at least one ASCII letter or digit; blank means unset. Other topics disclose that filter was not applied.',
     ),
   }),
   output: z.object({
@@ -187,6 +197,17 @@ export const listReference = tool('fcc_spectrum_list_reference', {
       ),
   },
 
+  errors: [
+    {
+      reason: 'invalid_filter',
+      code: JsonRpcErrorCode.ValidationError,
+      when: 'A nonblank filter on radio_services or station_classes normalizes to no searchable tokens.',
+      retryable: false,
+      recovery:
+        'Include at least one ASCII letter or digit after accent folding, or omit filter to list every code.',
+    },
+  ],
+
   async handler(input, ctx) {
     const index = getUlsIndexService();
     const dataAsOf = await index.dataAsOf();
@@ -194,11 +215,18 @@ export const listReference = tool('fcc_spectrum_list_reference', {
 
     if (input.topic === 'coverage') {
       const coverage = await index.coverage();
+      const notices: string[] = [];
+      if (input.filter)
+        notices.push(
+          'filter applies to topics "radio_services" and "station_classes" only; filter was not applied to coverage.',
+        );
+      if (coverage.index.antennaCoverageIncomplete) notices.push(ANTENNA_COVERAGE_NOTICE);
       if (!coverage.index.ready) {
-        ctx.enrich.notice(
+        notices.push(
           `The local ULS index has not been ${coverage.index.status === 'building' ? 'published yet (a build is running)' : 'built yet'}, so the search tools cannot answer; an operator must run the mirror:init script once. Configured service groups: ${index.services.join(', ')}.`,
         );
       }
+      if (notices.length) ctx.enrich.notice(notices.join(' '));
       return { topic: input.topic, ...coverage };
     }
 
@@ -218,21 +246,22 @@ export const listReference = tool('fcc_spectrum_list_reference', {
           })
       : table;
     if (!input.filter) return { topic: input.topic, entries: all };
-    if (input.topic !== 'radio_services') {
+    if (input.topic !== 'radio_services' && input.topic !== 'station_classes') {
       ctx.enrich.notice(
-        `filter applies to topic "radio_services" only; all ${all.length} ${VOCABULARY[input.topic].title.toLowerCase()} are listed.`,
+        `filter applies to topics "radio_services" and "station_classes" only; filter was not applied, and all ${all.length} ${VOCABULARY[input.topic].title.toLowerCase()} are listed.`,
       );
       return { topic: input.topic, entries: all };
     }
 
     const tokens = normalizeForMatch(input.filter).split(/\s+/).filter(Boolean);
+    if (tokens.length === 0) throw ctx.fail('invalid_filter');
     const entries = all.filter((entry) => {
       const haystack = normalizeForMatch(`${entry.code} ${entry.label}`);
       return tokens.every((token) => haystack.includes(token));
     });
     if (entries.length === 0) {
       ctx.enrich.notice(
-        `No radio service code or label contains every word of ${JSON.stringify(input.filter)}; drop a word, or call without filter to list all ${all.length} codes.`,
+        `No ${input.topic === 'radio_services' ? 'radio service' : 'station class'} code or label contains every word of ${JSON.stringify(input.filter)}; drop a word, or call without filter to list all ${all.length} codes.${input.topic === 'station_classes' ? ' A label is unavailable in the bundled FCC table; an unknown filed code remains valid and unchanged.' : ''}`,
       );
     }
     return { topic: input.topic, entries };
@@ -271,6 +300,7 @@ export const listReference = tool('fcc_spectrum_list_reference', {
       if (index.lastFullBuild) lines.push(`**Last full build:** ${index.lastFullBuild}`);
       if (index.lastDailyApplied) lines.push(`**Last daily applied:** ${index.lastDailyApplied}`);
       if (index.dataAsOf) lines.push(`**Data as of:** ${index.dataAsOf}`);
+      if (index.antennaCoverageIncomplete) lines.push('**Antenna coverage incomplete:** Yes.');
       if (index.error) {
         lines.push('**Last error:**', ...index.error.split(/\r?\n/).map((line) => `> ${line}`));
       }

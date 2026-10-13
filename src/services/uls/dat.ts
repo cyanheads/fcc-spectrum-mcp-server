@@ -376,7 +376,8 @@ export function decodeLo(line: string): LoRecord | null {
   if (!f || usi === null || locationNumber === null) return null;
   const lat = coordinateFields(f, 20, 'latitude');
   const lon = coordinateFields(f, 24, 'longitude');
-  const located = lat.decimal !== null && lon.decimal !== null;
+  const located =
+    lat.decimal !== null && lon.decimal !== null && !(lat.decimal === 0 && lon.decimal === 0);
   const dms = [lat.dms, lon.dms].filter((part) => part !== null).join(' ');
   return {
     usi,
@@ -402,7 +403,7 @@ export function decodeLo(line: string): LoRecord | null {
 
 /** AN — antenna. */
 export interface AnRecord {
-  antennaNumber: number;
+  antennaNumber: number | null;
   antennaTypeCode: string | null;
   azimuthDeg: number | null;
   beamwidthDeg: number | null;
@@ -423,7 +424,13 @@ export function decodeAn(line: string): AnRecord | null {
   const usi = f && numberField(f, 2);
   const antennaNumber = f && numberField(f, 7);
   const locationNumber = f && numberField(f, 8);
-  if (!f || usi === null || antennaNumber === null || locationNumber === null) return null;
+  if (
+    !f ||
+    usi === null ||
+    locationNumber === null ||
+    (antennaNumber === null && textField(f, 7) !== null)
+  )
+    return null;
   return {
     usi,
     antennaNumber,

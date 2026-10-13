@@ -32,6 +32,7 @@ import {
 } from '../fixtures/tool-harness.js';
 import {
   AREA_SITES_WEEKLY,
+  DATA_QUALITY_WEEKLY,
   MARKET_CODES_WEEKLY,
   MARKET_STATES_WEEKLY,
   QUIRKS_WEEKLY,
@@ -92,6 +93,65 @@ const rowIds = (rows: readonly Assignment[]) =>
       ? `m${row.usi}@${row.frequencyMhz}`
       : `s${row.usi}:${row.locationNumber}@${row.frequencyMhz}`,
   );
+
+describe('filed location classes', () => {
+  let fixture: FixtureIndex;
+  beforeAll(async () => {
+    fixture = await buildFixtureIndex({
+      groups: ['paging'],
+      weekly: { paging: DATA_QUALITY_WEEKLY },
+    });
+  });
+  beforeEach(async () => {
+    await useIndex(fixture.mirrorDir, { services: ['paging'] });
+  });
+  afterAll(async () => {
+    await releaseIndex();
+    await fixture.dispose();
+  });
+  it('renders single-site classes and omits shared-number classes and zero-pair decimals on every page', async () => {
+    let cursor: string | undefined;
+    const rows: Assignment[] = [];
+    do {
+      const result = await run({
+        frequency_low: 152,
+        frequency_high: 157,
+        kind: 'site',
+        limit: 1,
+        cursor,
+      });
+      const data = page(result);
+      expect(data.totalCount).toBe(6);
+      expectCarries(formattedText(searchFrequencies.format!(data)), data.assignments);
+      const classLines = contractText(result)
+        .split('\n')
+        .filter((line) => line.startsWith('- **Location class:**'));
+      const location = data.assignments[0]!.locationNumber;
+      expect(classLines).toEqual(
+        location === 1 || location === 6
+          ? ['- **Location class:** T (Transmit Location)']
+          : location === 3
+            ? ['- **Location class:** P (Passive Repeater Location)']
+            : location === 4
+              ? ['- **Location class:** Z']
+              : [],
+      );
+      rows.push(...data.assignments);
+      cursor = data.nextCursor;
+    } while (cursor);
+    expect(rows[0]).toMatchObject({
+      locationClassCode: 'T',
+      locationClassLabel: 'Transmit Location',
+    });
+    expect(rows[1]).not.toHaveProperty('locationClassCode');
+    expect(rows[1]).not.toHaveProperty('locationClassLabel');
+    expect(rows[3]).toMatchObject({ locationClassCode: 'Z' });
+    expect(rows[3]).not.toHaveProperty('locationClassLabel');
+    expect(rows[5]).toMatchObject({ state: 'NY' });
+    expect(rows[5]).not.toHaveProperty('latitude');
+    expect(rows[5]).not.toHaveProperty('longitude');
+  });
+});
 
 describe('index not available', () => {
   let cold: TempMirror;
@@ -260,7 +320,6 @@ describe('warm index', () => {
       ['a 201-character licensee', { ...BRS, licensee: 'x'.repeat(201) }],
       ['a licensee with no letter or digit', { ...BRS, licensee: '!!!' }],
       ['limit 0', { ...BRS, limit: 0 }],
-      ['limit 201', { ...BRS, limit: 201 }],
       ['a fractional limit', { ...BRS, limit: 1.5 }],
       ['status E, which keeps no frequency records', { ...BRS, status: 'E' }],
       ['unit Hz', { ...BRS, unit: 'Hz' }],
@@ -384,6 +443,22 @@ describe('warm index', () => {
   });
 
   describe('paging', () => {
+    it.each([201, 1000000])(
+      'clamps requested limit %i on populated and empty pages',
+      async (requested) => {
+        for (const input of [BRS, { frequency_low: 300000 }]) {
+          const baseline = page(await run({ ...input, limit: 200 }));
+          const result = await run({ ...input, limit: requested });
+          const actual = page(result);
+          const { notice: _baselineNotice, ...expected } = baseline;
+          const { notice: _actualNotice, ...bounded } = actual;
+          expect(bounded).toEqual(expected);
+          expect(actual.notice).toContain(`limit ${requested} was clamped to 200`);
+          expect(contractText(result)).toContain(`limit ${requested} was clamped to 200`);
+          if (baseline.notice) expect(actual.notice).toContain(baseline.notice);
+        }
+      },
+    );
     it('discloses truncation and follows the cursor through three pages in frequency order', async () => {
       const input = { ...BRS, limit: 2 };
       const first = await run(input);

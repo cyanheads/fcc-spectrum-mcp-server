@@ -117,9 +117,7 @@ describe('createApp() options', () => {
     ['true', 'true'],
   ])('states the redaction policy in the instructions when redaction is %s', async (_l, value) => {
     const { options } = await loadIndex({ FCC_SPECTRUM_REDACT_INDIVIDUALS: value });
-    expect(options.instructions).toContain(
-      `every response carries dataAsOf. ${REDACTION_SENTENCE}`,
-    );
+    expect(options.instructions).toContain(REDACTION_SENTENCE);
     expect(options.instructions?.match(/redacted/g)).toHaveLength(1);
   });
 
@@ -129,10 +127,24 @@ describe('createApp() options', () => {
       const { options } = await loadIndex({ FCC_SPECTRUM_REDACT_INDIVIDUALS: value });
       expect(options.instructions).not.toContain('redacted');
       expect(options.instructions).toContain(
-        'every response carries dataAsOf. Licensee names, addresses, site names, and market names are registry data',
+        'Licensee names, addresses, site names, and market names are registry data',
       );
     },
   );
+
+  it('names station-class lookup and bounded output budgets in the server instructions', async () => {
+    const { options } = await loadIndex();
+    expect(options.instructions).toContain(
+      'station classes with topic "station_classes" and filter set to the filed code',
+    );
+    expect(options.instructions).toContain(
+      'Output budgets above the server ceilings clamp with requested/effective notices',
+    );
+    expect(options.instructions).toContain('clamping alone does not imply truncation');
+    expect(options.instructions).toContain(
+      'vocabulary references also work before the index is built',
+    );
+  });
 });
 
 describe('setup()', () => {

@@ -19,7 +19,7 @@ import { runToolContract } from '@cyanheads/mcp-ts-core/testing';
 import { afterAll, beforeAll, beforeEach, describe, expect, it } from 'vitest';
 import { getLicense } from '@/mcp-server/tools/definitions/get-license.tool.js';
 import { ANTENNA_TYPES } from '@/services/uls/codes.js';
-import { POINTER_FILE, writePointer } from '@/services/uls/schema.js';
+import { createUlsStore, POINTER_FILE, writePointer } from '@/services/uls/schema.js';
 import {
   type ContractResult,
   contractText,
@@ -32,6 +32,7 @@ import {
   useIndex,
 } from '../fixtures/tool-harness.js';
 import {
+  DATA_QUALITY_WEEKLY,
   INDIVIDUAL_SITES_WEEKLY,
   QUIRKS_WEEKLY,
   sprawlingPagingWeekly,
@@ -72,6 +73,61 @@ const rowsPerLocation = (locations: readonly Location[] | undefined) =>
   (locations ?? []).map(
     (location) => location.antennas.flatMap((antenna) => antenna.frequencies).length,
   );
+
+describe('independent unnumbered antennas', () => {
+  let fixture: FixtureIndex;
+  beforeAll(async () => {
+    fixture = await buildFixtureIndex({
+      groups: ['paging'],
+      weekly: { paging: DATA_QUALITY_WEEKLY },
+    });
+  });
+  beforeEach(async () => {
+    await useIndex(fixture.mirrorDir, { services: ['paging'] });
+  });
+  afterAll(async () => {
+    await releaseIndex();
+    await fixture.dispose();
+  });
+
+  it('renders absent numbers, shared classes and continuation without fabricated frequency associations', async () => {
+    const result = await run({ callsign: 'KZZ541', location_number: 2, max_frequencies: 1 });
+    const data = successOf<Output>(result);
+    expect(data.nextLocationOffset).toBe(2);
+    const entries = data.locations![0]!.antennas.filter(
+      (entry) => entry.antennaNumber === undefined,
+    );
+    expect(entries).toHaveLength(101);
+    expect(entries.every((entry) => entry.frequencies.length === 0)).toBe(true);
+    expect(contractText(result)).toContain('Antenna (number not filed)');
+    expect(contractText(result)).not.toContain('Antenna undefined');
+    expect(contractText(result)).toContain('R (Receive Location)');
+    expectCarries(formattedText(getLicense.format!(data)), data.locations);
+    const zero = successOf<Output>(await run({ callsign: 'KZZ541', location_number: 6 }));
+    expect(zero.locations![0]).not.toHaveProperty('latitude');
+    expect(zero.locations![0]).toMatchObject({ state: 'NY', coordinatesDms: '0-0-0 N 0-0-0 W' });
+    expect(contractText(await run({ callsign: 'KZZ541', location_number: 6 }))).toContain(
+      'not valid as filed',
+    );
+    expect(
+      successOf<Output>(await run({ callsign: 'KZZ541', location_offset: 99 })).locations,
+    ).toEqual([]);
+  });
+
+  it('discloses incomplete migrated antenna coverage while keeping detail readable', async () => {
+    const store = createUlsStore(join(fixture.mirrorDir, fixture.generation));
+    (await store.raw()).exec(
+      "INSERT INTO meta (key,value) VALUES ('antenna_coverage_incomplete','6')",
+    );
+    await store.close();
+    const result = await run({ callsign: 'KZZ541' });
+    expect(successOf<Output>(result).found).toBe(true);
+    expect(result.structuredContent).toMatchObject({
+      notice: expect.stringContaining('Antenna coverage is incomplete'),
+    });
+    expect(contractText(result)).toContain('daily refresh restores only licenses it replaces');
+  });
+});
 
 describe('index not available', () => {
   let cold: TempMirror;
@@ -172,7 +228,6 @@ describe('warm index', () => {
 
     it.each([
       ['max_frequencies 0', { usi: '1001', max_frequencies: 0 }],
-      ['max_frequencies 1001', { usi: '1001', max_frequencies: 1001 }],
       ['a fractional max_frequencies', { usi: '1001', max_frequencies: 2.5 }],
       ['usi 0', { usi: '0' }],
       ['a usi with a leading zero', { usi: '01001' }],
@@ -303,6 +358,28 @@ describe('warm index', () => {
   });
 
   describe('max_frequencies', () => {
+    it.each([1001, 1000000])(
+      'clamps requested max_frequencies %i without marking complete records truncated',
+      async (requested) => {
+        for (const input of [
+          { usi: '1001' },
+          { usi: '999999' },
+          { usi: '1001', location_offset: 999, lease_offset: 999 },
+        ]) {
+          const baseline = hit(await run({ ...input, max_frequencies: 1000 }));
+          const result = await run({ ...input, max_frequencies: requested });
+          const actual = hit(result);
+          const { notice: _baselineNotice, ...expected } = baseline;
+          const { notice: _actualNotice, ...bounded } = actual;
+          expect(bounded).toEqual(expected);
+          expect(actual.notice).toContain(`max_frequencies ${requested} was clamped to 1000`);
+          expect(contractText(result)).toContain(
+            `max_frequencies ${requested} was clamped to 1000`,
+          );
+          if (baseline.notice) expect(actual.notice).toContain(baseline.notice);
+        }
+      },
+    );
     it('drops rows past the cap from the last location first and discloses it', async () => {
       const result = await run({ usi: '1001', max_frequencies: 2 });
       const structured = hit(result);
@@ -606,6 +683,19 @@ describe('the 1000-row ceiling', () => {
     expect(structured).toMatchObject({ truncated: true, shown: 100, cap: 100 });
     expect(structured.notice?.startsWith(CAP_NOTICE(100, 1001))).toBe(true);
   });
+
+  it.each([1001, 1000000])(
+    'clamps %i across nested frequency rows and preserves cap guidance',
+    async (requested) => {
+      const baseline = hit(await run({ usi: '4001', max_frequencies: 1000 }));
+      const result = await run({ usi: '4001', max_frequencies: requested });
+      const actual = hit(result);
+      expect(actual.locations).toEqual(baseline.locations);
+      expect(actual).toMatchObject({ shown: 1000, cap: 1000, truncated: true });
+      expect(actual.notice).toContain(baseline.notice);
+      expect(contractText(result)).toContain(`max_frequencies ${requested} was clamped to 1000`);
+    },
+  );
 });
 
 /** Sites a page lists: a number filed at several sites counts each of them. */
@@ -1273,6 +1363,37 @@ describe('format()', () => {
     );
     expect(rendered).not.toContain('\r');
     expect(rendered.split('\n')).toContain('- KZZ 901 · USI 1001 · status A');
+  });
+
+  it('escapes a raw unknown location class while preserving structured data', async () => {
+    const fixture = await buildFixtureIndex({
+      groups: ['paging'],
+      weekly: { paging: DATA_QUALITY_WEEKLY },
+    });
+    const rawCode = '[unknown](https://example.com)';
+    const store = createUlsStore(join(fixture.mirrorDir, fixture.generation));
+    try {
+      (await store.raw())
+        .prepare('UPDATE locations SET location_class = ? WHERE usi = 5401 AND location_number = 1')
+        .run(rawCode);
+    } finally {
+      await store.close();
+    }
+    try {
+      await useIndex(fixture.mirrorDir, { services: ['paging'] });
+      const result = await run({ callsign: 'KZZ541', location_number: 1 });
+      const data = successOf<Output>(result);
+      expect(data.locations![0]?.locationClassCode).toBe(rawCode);
+      expect(data.locations![0]).not.toHaveProperty('locationClassLabel');
+      const rendered = contractText(result);
+      expect(rendered.split('\n')).toContain(
+        '**Type:** F (Fixed) · **Class:** \\[unknown\\](https://example.com) · **Coordinates:** 47, -122 · **Filed DMS:** 47-0-0 N 122-0-0 W',
+      );
+      expect(rendered).not.toContain(rawCode);
+    } finally {
+      await releaseIndex();
+      await fixture.dispose();
+    }
   });
 
   it('escapes | and \\ in the transmitter, class, and emissions cells of the frequency table', () => {
