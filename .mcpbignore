@@ -9,7 +9,11 @@
 /.claude/
 /.agents/
 /framework-skills/
-/docs/idea.md
+/.cache/
+/src/
+/docs/
+/.github/
+/.vscode/
 /logs/
 /coverage/
 /tests/

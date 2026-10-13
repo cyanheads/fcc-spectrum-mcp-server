@@ -1,6 +1,6 @@
 # fcc-spectrum-mcp-server - Directory Structure
 
-Generated on: 2026-10-02 05:14:02
+Generated on: 2026-10-13 12:37:46
 
 ```text
 fcc-spectrum-mcp-server/
@@ -136,6 +136,7 @@ fcc-spectrum-mcp-server/
 │   ├── lint-mcp.ts
 │   ├── lint-packaging.ts
 │   ├── list-skills.ts
+│   ├── prune-musl-packages.ts
 │   ├── release-github.ts
 │   └── tree.ts
 ├── src/
