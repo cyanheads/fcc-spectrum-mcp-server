@@ -29,9 +29,7 @@
 
 ## Overview
 
-US radio spectrum licensing from the FCC Universal Licensing System (ULS), served from a local SQLite index of the FCC's weekly and daily bulk files. Look up a callsign, licensee, FCC Registration Number (FRN), or market code; read a license's sites, antennas, frequencies, power, and emission designators; find FCC-licensed sites near a point with their filed roles and authorized frequencies; and see who is authorized on a frequency or band, market-area spectrum blocks included. No API key, and no call to the FCC at request time. Runs as a stdio process, a local Streamable HTTP server, or the public hosted endpoint above.
-
-The default index covers land mobile (private, commercial, and broadcast auxiliary), microwave, cellular, market-area wireless, paging, coast stations, broadband radio (BRS/EBS), and amateur licenses, plus spectrum leases. GMRS, ship, and aircraft licenses are opt-in. Broadcast stations (AM/FM/TV) and satellite earth stations are separate FCC systems and are not included.
+US radio spectrum licensing from the FCC's Universal Licensing System, searchable offline. Look up a callsign, licensee, or market; read a license's sites, antennas, and frequencies; find transmitters near a point; and see who's authorized on any frequency or band. Covers land mobile, microwave, cellular, paging, amateur, and more; broadcast stations and satellite earth stations aren't included. No API key required.
 
 ### Tools
 
@@ -64,10 +62,9 @@ Also reachable via `fcc_spectrum_get_license`.
 ### `fcc_spectrum_get_license` <sub>tool</sub>
 
 - Exactly one of `callsign` or `usi` (`identifier_required` otherwise); a callsign shared by several records returns the active one, else the most recent, and lists the others in `otherCallsignRecords`
-- Pages large records: up to 50 sites, 100 antennas, 100 leases, and `max_frequencies` frequency rows (positive integer, default 100, capped at 1000) per call; a location larger than the site or antenna budget is listed whole, alone. `nextLocationOffset` and `nextLeaseOffset` feed `location_offset` and `lease_offset` on the next call
-- `location_number` starts the locations at a site's `locationNumber` from `fcc_spectrum_find_transmitters` or `fcc_spectrum_search_frequencies`, or at the next filed number when the record has no such location; with a nonzero `location_offset` it fails (`location_start_conflict`)
+- Pages large records: up to 50 sites, 100 antennas, 100 leases, and `max_frequencies` frequency rows (positive integer, default 100, capped at 1000) per call; `nextLocationOffset` and `nextLeaseOffset` feed `location_offset` and `lease_offset` on the next call
+- `location_number` starts the locations at a site's `locationNumber` from `fcc_spectrum_find_transmitters` or `fcc_spectrum_search_frequencies`; combined with a nonzero `location_offset` it fails (`location_start_conflict`)
 - A miss returns `found: false` with `guidance` and up to 5 callsign-prefix `candidates`, not an error; `technicalRetained: false` marks a record whose status keeps no sites or frequencies
-- An unnumbered AN filing remains a distinct antenna, with `antennaNumber` omitted and no frequency association. Exact duplicate unnumbered rows remain separate and count toward the antenna budget; numbered records still merge agreeing fields.
 
 ---
 
@@ -75,8 +72,7 @@ Also reachable via `fcc_spectrum_get_license`.
 
 - `latitude` / `longitude` as decimal degrees or DMS strings, `radius_km` 0.1–100 (default 5); optional `frequency_low` / `frequency_high` in `unit` (`kHz`, `MHz` default, `GHz`), `radio_service`, `location_type` (one ULS location type code, case-insensitive: `F` keeps fixed sites only, `M` mobile and `T` temporary-fixed areas), and `status` (`A` default, `L`, `X`, or `any` for all three)
 - Sites nearest first, positive integer `limit` (default 25, capped at 100) with cursor paging; each site lists up to `max_frequencies_per_site` frequencies (positive integer, default 10, capped at 50), with `frequencyCount` carrying the full count
-- Each site carries `locationTypeCode` and `locationTypeLabel` when a type is filed, and `radiusKm` when a radius is; a mobile or temporary-fixed operating area is returned at its filed center, and `distanceKm` measures to that center
-- Each site carries its filed `locationClassCode` and, when known, FCC `locationClassLabel`. Optional `location_class` selects one case-insensitive FCC class: C Centerpoint, L IQ/QQ Area of Operation Desc, P Passive Repeater Location, R Receive Location, or T Transmit Location. Blank or omitted keeps every class. This describes authorization, not actual on-air activity.
+- Each site carries `locationTypeCode`, `locationTypeLabel`, `radiusKm`, `locationClassCode`, and `locationClassLabel` when filed; a mobile or temporary-fixed area is returned at its filed center, and `distanceKm` measures to that center. `location_class` (case-insensitive `C`, `L`, `P`, `R`, or `T`) keeps one FCC class; results describe authorization, not actual on-air activity
 - Typed errors: `invalid_frequency_range`, `unknown_radio_service`, `service_not_indexed`, `invalid_cursor`, `index_not_ready`
 
 ---
@@ -85,9 +81,7 @@ Also reachable via `fcc_spectrum_get_license`.
 
 - `frequency_low` required, `frequency_high` optional, in `unit`; a site assignment matches when its occupied band (widened by its emission bandwidth) overlaps the query, a market block when its filed edges do; `kind` is `site`, `market`, or `both` (default)
 - Narrow by `state`, `radio_service`, `licensee`, `frn`, `market_code`, and `status` (`A` default, `L`, `X`, `any`); positive integer `limit` (default 50, capped at 200) with cursor paging, frequency ascending; each row's `kind` says whether it is a site assignment or a market block
-- `market_code` and `frn` test the license, so they filter site rows and market rows alike: cellular `CMA` licenses file sites, not blocks. With `state`, both apply. An `frn` search returns individual licensees redacted
-- A site row at a single site carries its `locationTypeCode`, `locationTypeLabel`, and, when filed, `radiusKm`; a row under a location number several sites share carries none of them, as it carries no coordinates
-- Single-site assignments also carry filed `locationClassCode` and its known FCC `locationClassLabel`; shared-number assignments and market blocks omit both.
+- `market_code` and `frn` filter site rows and market rows alike; an `frn` search returns individual licensees redacted. Single-site rows carry `locationTypeCode`, `locationTypeLabel`, `radiusKm`, `locationClassCode`, and `locationClassLabel` when filed; shared-number rows and market blocks omit them
 - Typed errors: `invalid_frequency_range`, `unknown_radio_service`, `service_not_indexed`, `invalid_cursor`, `index_not_ready`
 
 ---
@@ -95,10 +89,9 @@ Also reachable via `fcc_spectrum_get_license`.
 ### `fcc_spectrum_list_reference` <sub>tool</sub>
 
 - `topic`: `radio_services`, `station_classes`, `license_statuses`, `location_types`, `antenna_types`, `applicant_types`, `operator_classes`, or `coverage`; `filter` narrows radio services and station classes to entries containing every token in their code and label, with case/accent folding and punctuation separating tokens
-- A nonblank searchable filter must normalize to an ASCII letter or digit (`invalid_filter` otherwise); blank means unset. Other topics, including coverage, disclose that the filter was not applied alongside readiness or rebuild guidance.
-- Decode a filed station class with `{"topic":"station_classes","filter":"FXO"}`: `FXO` is Operational Fixed, `FB2` is Mobile Relay, and `MO` is Mobile. The bundled 266-code table preserves FCC labels from `uls_code_definitions_20240718.txt` (July 18, 2024), obtained from the [archived FCC file](https://web.archive.org/web/20250701000000id_/https://www.fcc.gov/sites/default/files/uls_code_definitions_20240718.txt). A missing mapping returns no entries and label-unavailable guidance; filed codes stay unchanged. These are licensed categories, not actual on-air activity.
-- `coverage` reports `index.status` (`none`, `building`, `ready`), per-group record, site, and frequency counts with snapshot times, and whether redaction is on; it works before the index is built
-- Older generations that discarded unnumbered antennas remain readable after migration, with `index.antennaCoverageIncomplete: true` and a notice on coverage, detail, and the license resource. Run `bun run mirror:init` to rebuild even when weekly snapshots are unchanged; the warning clears only on a complete rebuilt generation. Daily refresh repairs only replaced licenses.
+- A searchable `filter` must contain an ASCII letter or digit (`invalid_filter` otherwise); blank means unset. Other topics ignore the filter and say so
+- Decode a station class with `{"topic":"station_classes","filter":"FXO"}` (`FXO` is Operational Fixed, `FB2` Mobile Relay, `MO` Mobile). Labels come from a bundled 266-code table of the FCC's `uls_code_definitions_20240718.txt` ([archived copy](https://web.archive.org/web/20250701000000id_/https://www.fcc.gov/sites/default/files/uls_code_definitions_20240718.txt)); an unmapped code returns no entries. These are licensed categories, not actual on-air activity
+- `coverage` reports `index.status` (`none`, `building`, `ready`), per-group record, site, and frequency counts with snapshot times, and whether redaction is on; it works before the index is built. `index.antennaCoverageIncomplete: true` marks an older index that dropped unnumbered antennas; `bun run mirror:init` rebuilds it
 
 ---
 
@@ -114,7 +107,6 @@ Built on [`@cyanheads/mcp-ts-core`](https://github.com/cyanheads/mcp-ts-core): s
 FCC ULS-specific:
 
 - Keyless and local at request time — every query reads the SQLite index; network access is needed only to build and refresh it
-- Index generations — a weekly rebuild writes a new file beside the one being served, and the server switches to it within a minute; the daily refresh and a schema upgrade update the served file in place, each change in one transaction
 - Occupied-band frequency matching — each assignment's band is widened by the bandwidth parsed from its emission designators, so a query near a wide channel's edge still finds it
 - Spectrum leases are first-class records — `isLease` marks them, the licensee shown is the lessee, and lease links are listed in both directions
 - Site state is derived from coordinates when the filing leaves it blank (common for microwave and BRS/EBS), and flagged `stateFromCoordinates`
@@ -123,10 +115,8 @@ FCC ULS-specific:
 Agent-friendly output:
 
 - Freshness and filter echo — every data response carries `dataAsOf`, and search tools echo `appliedFilters`
-- Truncation disclosure — `truncated`, `shown`, `cap`, and `totalCount` plus a `notice` naming the next call, so a partial page is never read as the whole
-- Excessive output budgets clamp to the existing ceilings with a notice naming requested and effective values; `cap` and nearby `appliedFilters.max_frequencies_per_site` report the effective values. Clamping alone does not mark a complete result truncated. Zero, negative, fractional, nonnumeric, and nonfinite budgets remain invalid; frequency, radius, and selector bounds are unchanged.
-- Absent stays absent — fields ULS leaves blank are omitted, and coordinates that fail validation are kept as DMS text (`coordinatesDms`)
-- All-zero filed coordinate pairs are placeholders: decimal coordinates are omitted, while filed DMS and state remain. A zero on only one axis remains valid. Existing stored placeholders are repaired in place without requiring a rebuild.
+- Truncation disclosure — `truncated`, `shown`, `cap`, and `totalCount` plus a `notice` naming the next call, so a partial page is never read as the whole; output budgets above a ceiling clamp to it with a notice naming requested and effective values
+- Absent stays absent — fields ULS leaves blank are omitted, coordinates that fail validation are kept as DMS text (`coordinatesDms`), and all-zero placeholder coordinates are dropped
 - Discriminated output — `found`, `kind`, `isLease`, `licenseeRedacted`, and `technicalRetained` let callers branch on data, not string parsing
 
 ## Getting started
@@ -282,9 +272,9 @@ FCC_SPECTRUM_MIRROR_DIR=/path/to/fcc-uls bun run mirror:init
 
 | Variable | Description | Default |
 |:---|:---|:---|
-| `FCC_SPECTRUM_MIRROR_DIR` | Directory holding the index generations, `current.json`, the ingest lock, and temporary zips. Use an absolute path; a relative one resolves against the working directory. | `.mirror/fcc-uls` |
+| `FCC_SPECTRUM_MIRROR_DIR` | Directory holding the index and its build files. Use an absolute path. | `.mirror/fcc-uls` |
 | `FCC_SPECTRUM_SERVICES` | Comma-separated weekly service groups to index, case-insensitive. Opt-in: `gmrs`, `ship`, `aircr`. An unknown name fails startup and lists the valid set. | `LMpriv,LMcomm,LMbcast,micro,cell,market,paging,coast,mdsitfs,amat` |
-| `FCC_SPECTRUM_REDACT_INDIVIDUALS` | Redact individual licensees and trustee names, and exclude individuals from name search. Only `false`, `0`, `no`, or `off` disables it; unset, empty, or anything else keeps it on. | `true` |
+| `FCC_SPECTRUM_REDACT_INDIVIDUALS` | Redact individual licensees and trustee names and exclude individuals from name search. Only `false`, `0`, `no`, or `off` disables it. | `true` |
 | `FCC_SPECTRUM_BASE_URL` | ULS bulk file host root, read only when building or refreshing the index. | `https://data.fcc.gov/download/pub/uls` |
 | `MCP_TRANSPORT_TYPE` | Transport: `stdio` or `http`. | `stdio` |
 | `MCP_SESSION_MODE` | Session mode: `auto` (resolves to stateful), `stateful`, or `stateless`. | `stateless` |
@@ -331,7 +321,7 @@ Licensee mailing street addresses, ZIP codes, PO boxes, attention lines, phone n
 
 ## Known limitations
 
-- **Dense-band frequency searches return partial pages.** Over a crowded band (all of 150–174 MHz, or the whole spectrum), `fcc_spectrum_search_frequencies` stops each call short. A page can hold fewer rows than `limit` and still carry `nextCursor`, and `totalCount` is then a lower bound (`totalIsLowerBound: true`). A sparse filter across a wide band can return several empty pages before its first rows; a `state`, `radio_service`, `licensee`, `frn`, or `market_code` filter narrow enough keeps the exact count.
+- **Dense-band frequency searches return partial pages.** Over a crowded band (all of 150–174 MHz, or the whole spectrum), a page can hold fewer rows than `limit` and still carry `nextCursor`, and `totalCount` is then a lower bound (`totalIsLowerBound: true`). Narrow with `state`, `radio_service`, `licensee`, `frn`, or `market_code` to keep the exact count.
 - **Sites, frequencies, and market blocks are kept only for live licenses** (`A` active, `L` pending legal, `X` term pending). Expired, cancelled, and terminated records keep their licensee, status, dates, and lease links.
 - **Market blocks match by state, not by county.** `state` matches a market block when the FCC's market-area definitions place its market in that state (a multi-state market matches each of its states), when its market name carries the state code, or when its license files a site there; nothing maps a county or a coordinate to the markets covering it. Nationwide and Gulf of Mexico markets match no state, and Tribal land (`TL`) and MVDDS (`MVD`) markets with no state code in the name are skipped; `market_code` without `state` reaches any of them.
 - **Radius search matches an operating area by its center.** ULS files mobile and temporary-fixed locations as a center and a radius of operation. `fcc_spectrum_find_transmitters` returns such an area at its center, with `radiusKm`, when the center lies within `radius_km`; it does not match an area because the search point falls inside it. Locations filed without coordinates, as most mobile, temporary, itinerant, and control-station locations are, are not returned.
