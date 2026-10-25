@@ -109,9 +109,11 @@ describe('parseCoordinateText', () => {
       `1${run}2${run}X`,
       `1 2 3${run}"${run}Q`,
     ]) {
-      const started = performance.now();
+      // Thread CPU time, in microseconds: a wall-clock bound fails under machine load.
+      const started = process.threadCpuUsage();
       expect(parseCoordinateText(text, 'latitude')).toBeUndefined();
-      expect(performance.now() - started).toBeLessThan(10);
+      const { user, system } = process.threadCpuUsage(started);
+      expect(user + system).toBeLessThan(10_000);
     }
   });
 });

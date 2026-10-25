@@ -249,11 +249,13 @@ describe('latitudeSchema and longitudeSchema', () => {
   it('reject coordinate text over 48 characters at once, however it is spaced', () => {
     const run = ' '.repeat(5000);
     for (const schema of [latitudeSchema, longitudeSchema]) {
-      const started = performance.now();
+      // Thread CPU time, in microseconds: a wall-clock bound fails under machine load.
+      const started = process.threadCpuUsage();
       expect(schema.safeParse(`1 2 3${run}"${run}Q`).success).toBe(false);
       expect(schema.safeParse(`1${run}2${run}X`).success).toBe(false);
       expect(schema.safeParse(`47.6${'0'.repeat(45)}`).success).toBe(false);
-      expect(performance.now() - started).toBeLessThan(10);
+      const { user, system } = process.threadCpuUsage(started);
+      expect(user + system).toBeLessThan(10_000);
     }
   });
 });
