@@ -7,7 +7,7 @@
 
 <div align="center">
 
-[![Version](https://img.shields.io/badge/Version-0.2.0-blue.svg?style=flat-square)](./CHANGELOG.md) [![License](https://img.shields.io/badge/License-Apache%202.0-orange.svg?style=flat-square)](./LICENSE) [![Docker](https://img.shields.io/badge/Docker-ghcr.io-2496ED?style=flat-square&logo=docker&logoColor=white)](https://github.com/users/cyanheads/packages/container/package/fcc-spectrum-mcp-server) [![MCP SDK](https://img.shields.io/badge/MCP%20SDK-^2.3.1-green.svg?style=flat-square)](https://modelcontextprotocol.io/) [![npm](https://img.shields.io/npm/v/%40cyanheads%2Ffcc-spectrum-mcp-server?style=flat-square&logo=npm&logoColor=white)](https://www.npmjs.com/package/@cyanheads/fcc-spectrum-mcp-server) [![TypeScript](https://img.shields.io/badge/TypeScript-^7.0.2-3178C6.svg?style=flat-square)](https://www.typescriptlang.org/) [![Bun](https://img.shields.io/badge/Bun-v1.4.3-blueviolet.svg?style=flat-square)](https://bun.sh/)
+[![Version](https://img.shields.io/badge/Version-0.2.0-blue.svg?style=flat-square)](./CHANGELOG.md) [![License](https://img.shields.io/badge/License-Apache%202.0-orange.svg?style=flat-square)](./LICENSE) [![Docker](https://img.shields.io/badge/Docker-ghcr.io-2496ED?style=flat-square&logo=docker&logoColor=white)](https://github.com/users/cyanheads/packages/container/package/fcc-spectrum-mcp-server) [![MCP SDK](https://img.shields.io/badge/MCP%20SDK-^2.3.1-green.svg?style=flat-square)](https://modelcontextprotocol.io/) [![npm](https://img.shields.io/npm/v/%40cyanheads%2Ffcc-spectrum-mcp-server?style=flat-square&logo=npm&logoColor=white)](https://www.npmjs.com/package/@cyanheads/fcc-spectrum-mcp-server) [![TypeScript](https://img.shields.io/badge/TypeScript-^7.0.2-3178C6.svg?style=flat-square)](https://www.typescriptlang.org/) [![Bun](https://img.shields.io/badge/Bun-v1.4.4-blueviolet.svg?style=flat-square)](https://bun.sh/)
 
 </div>
 
@@ -29,14 +29,14 @@
 
 ## Overview
 
-US radio spectrum licensing from the FCC's Universal Licensing System, searchable offline. Look up a callsign, licensee, or market; read a license's sites, antennas, and frequencies; find transmitters near a point; and see who's authorized on any frequency or band. Covers land mobile, microwave, cellular, paging, amateur, and more; broadcast stations and satellite earth stations aren't included. No API key required.
+US radio spectrum licensing from the FCC's Universal Licensing System, searchable offline. Look up a callsign, licensee, or market; read a license's sites, antennas, frequencies, and microwave paths; find transmitters near a point; and see who's authorized on any frequency or band. Covers land mobile, microwave, cellular, paging, amateur, and more; broadcast stations and satellite earth stations aren't included. No API key required.
 
 ### Tools
 
 | Tool | Description |
 |:---|:---|
 | `fcc_spectrum_search_licenses` | Search licenses and spectrum leases by callsign, licensee name, FRN, market code, radio service, status, or licensee state. |
-| `fcc_spectrum_get_license` | Read one license or lease in full by callsign or USI: licensee, status and dates, locations, antennas, frequencies with emissions, market blocks, and lease links. |
+| `fcc_spectrum_get_license` | Read one license or lease in full by callsign or USI: licensee, status and dates, locations, antennas, frequencies with emissions, microwave paths, market blocks, and lease links. |
 | `fcc_spectrum_find_transmitters` | Find FCC-licensed sites within a radius of a coordinate, nearest first, with their filed roles and authorized frequencies. |
 | `fcc_spectrum_search_frequencies` | Find site assignments and market-area spectrum blocks whose occupied band overlaps a frequency or band. |
 | `fcc_spectrum_list_reference` | Decode ULS codes (radio services, station classes, statuses, location and antenna types, applicant types, operator classes) and report index coverage and freshness. |
@@ -62,7 +62,8 @@ Also reachable via `fcc_spectrum_get_license`.
 ### `fcc_spectrum_get_license` <sub>tool</sub>
 
 - Exactly one of `callsign` or `usi` (`identifier_required` otherwise); a callsign shared by several records returns the active one, else the most recent, and lists the others in `otherCallsignRecords`
-- Pages large records: up to 50 sites, 100 antennas, 100 leases, and `max_frequencies` frequency rows (positive integer, default 100, capped at 1000) per call; `nextLocationOffset` and `nextLeaseOffset` feed `location_offset` and `lease_offset` on the next call
+- Pages large records: whole locations up to 50 sites, 100 antennas, and 100 microwave paths (a location larger than that is listed alone), up to 100 leases, and `max_frequencies` frequency rows (positive integer, default 100, capped at 1000) per call; `nextLocationOffset` and `nextLeaseOffset` feed `location_offset` and `lease_offset` on the next call
+- Microwave paths (FCC PA records) are listed in `paths` under the antenna that transmits them: path number, type, passive flag, and receiving callsign as filed, and a `receive` end with its location and antenna numbers, coordinates when the license files exactly one valid site under the receive number, `siteCount` when it files none or several, and `antennaFiled: false` when no antenna record matches. `pathTotal` counts the record's paths across all locations (absent on an index built before paths were indexed, until `mirror:init` rebuilds it), and when more locations follow, the notice reports the paths listed against it
 - `location_number` starts the locations at a site's `locationNumber` from `fcc_spectrum_find_transmitters` or `fcc_spectrum_search_frequencies`; combined with a nonzero `location_offset` it fails (`location_start_conflict`)
 - A miss returns `found: false` with `guidance` and up to 5 callsign-prefix `candidates`, not an error; `technicalRetained: false` marks a record whose status keeps no sites or frequencies
 
@@ -91,13 +92,13 @@ Also reachable via `fcc_spectrum_get_license`.
 - `topic`: `radio_services`, `station_classes`, `license_statuses`, `location_types`, `antenna_types`, `applicant_types`, `operator_classes`, or `coverage`; `filter` narrows radio services and station classes to entries containing every token in their code and label, with case/accent folding and punctuation separating tokens
 - A searchable `filter` must contain an ASCII letter or digit (`invalid_filter` otherwise); blank means unset. Other topics ignore the filter and say so
 - Decode a station class with `{"topic":"station_classes","filter":"FXO"}` (`FXO` is Operational Fixed, `FB2` Mobile Relay, `MO` Mobile). Labels come from a bundled 266-code table of the FCC's `uls_code_definitions_20240718.txt` ([archived copy](https://web.archive.org/web/20250701000000id_/https://www.fcc.gov/sites/default/files/uls_code_definitions_20240718.txt)); an unmapped code returns no entries. These are licensed categories, not actual on-air activity
-- `coverage` reports `index.status` (`none`, `building`, `ready`), per-group record, site, and frequency counts with snapshot times, and whether redaction is on; it works before the index is built. `index.antennaCoverageIncomplete: true` marks an older index that dropped unnumbered antennas; `bun run mirror:init` rebuilds it
+- `coverage` reports `index.status` (`none`, `building`, `ready`), per-group record, site, and frequency counts with snapshot times, and whether redaction is on; it works before the index is built. `index.antennaCoverageIncomplete: true` marks an older index that dropped unnumbered antennas, and `index.pathCoverageIncomplete: true` one built before microwave paths were indexed; `bun run mirror:init` rebuilds either
 
 ---
 
 ### `fcc-spectrum://license/{callsign}` <sub>resource</sub>
 
-- The first page of `fcc_spectrum_get_license` (up to 100 frequency rows) as `application/json`, with `dataAsOf`, totals, and a `notice` naming the tool call that reads the rest; cached 1 hour
+- The first page of `fcc_spectrum_get_license` (up to 100 frequency rows, with its microwave paths) as `application/json`, with `dataAsOf`, totals, and a `notice` naming the tool call that reads the rest; cached 1 hour
 - Typed errors: `index_not_ready`, `license_not_found`
 
 ## Features
@@ -123,18 +124,40 @@ Agent-friendly output:
 
 ### Public Hosted Instance
 
-A public instance is available at `https://fcc-spectrum.caseyjhand.com/mcp` — no installation required. Point any MCP client at it via Streamable HTTP:
+A public instance is available at `https://fcc-spectrum.caseyjhand.com/mcp` — no installation required. It serves Streamable HTTP; each client takes its own config shape.
+
+For Claude Code:
+
+```sh
+claude mcp add --transport http fcc-spectrum-mcp-server https://fcc-spectrum.caseyjhand.com/mcp
+```
+
+For Cline (`cline_mcp_settings.json`):
 
 ```json
 {
   "mcpServers": {
     "fcc-spectrum-mcp-server": {
-      "type": "streamable-http",
+      "type": "streamableHttp",
       "url": "https://fcc-spectrum.caseyjhand.com/mcp"
     }
   }
 }
 ```
+
+For Cursor (`mcp.json`):
+
+```json
+{
+  "mcpServers": {
+    "fcc-spectrum-mcp-server": {
+      "url": "https://fcc-spectrum.caseyjhand.com/mcp"
+    }
+  }
+}
+```
+
+Claude Desktop adds remote servers under Settings → Connectors.
 
 The hosted index is rebuilt weekly and refreshed daily from the FCC bulk files, with individual licensees redacted.
 
@@ -212,7 +235,7 @@ MCP_TRANSPORT_TYPE=http MCP_HTTP_PORT=3010 FCC_SPECTRUM_MIRROR_DIR=/path/to/fcc-
 
 The index is built from the FCC's public ULS bulk files at `data.fcc.gov` — weekly full snapshots per service group, plus daily incrementals. On the default groups a build downloads about 1.1 GB of zips, one at a time; a measured build produced 3,270,502 license records and an index of about 1.8 GB in about 3 minutes.
 
-Build it once from a source checkout (see [Installation](#installation)) or the Docker image:
+Build it once from a source checkout after `bun run build` (see [Installation](#installation)), from an installed package, or with the Docker image:
 
 ```sh
 # Download the weekly snapshots and build the index (resumable; skips when nothing is newer)
@@ -224,6 +247,8 @@ FCC_SPECTRUM_MIRROR_DIR=/path/to/fcc-uls bun run mirror:verify
 # Apply the daily incrementals published since the last build
 FCC_SPECTRUM_MIRROR_DIR=/path/to/fcc-uls bun run mirror:refresh
 ```
+
+Each `mirror:*` script runs a compiled entry under `dist/cli/` on Bun. From an npm install, run the scripts from the package directory, or call an entry directly: `FCC_SPECTRUM_MIRROR_DIR=/path/to/fcc-uls bun node_modules/@cyanheads/fcc-spectrum-mcp-server/dist/cli/mirror-init.js` (likewise `mirror-verify.js` and `mirror-refresh.js`).
 
 With Docker, run the same commands against the volume: `docker run --rm -v fcc-uls:/usr/src/app/.mirror ghcr.io/cyanheads/fcc-spectrum-mcp-server:latest bun run mirror:init`.
 
@@ -262,7 +287,13 @@ cd fcc-spectrum-mcp-server
 bun install
 ```
 
-4. **Build the index** (see [First-run setup](#first-run-setup)):
+4. **Build the server**, which also compiles the `mirror:*` entries:
+
+```sh
+bun run build
+```
+
+5. **Build the index** (see [First-run setup](#first-run-setup)):
 
 ```sh
 FCC_SPECTRUM_MIRROR_DIR=/path/to/fcc-uls bun run mirror:init
@@ -382,7 +413,7 @@ The image defaults to HTTP transport with stateless sessions, includes the `mirr
 | `src/mcp-server/tools` | Tool definitions (`*.tool.ts`), shared input schemas, and format helpers. |
 | `src/mcp-server/resources` | Resource definitions (`*.resource.ts`). |
 | `src/services/uls` | ULS service — bulk client, record parsers, ingester, index generations, read path with redaction, and the ingest schedule with the job process it spawns. |
-| `scripts/fcc-mirror-*.ts` | Index lifecycle CLI — `mirror:init`, `mirror:refresh`, `mirror:verify`. |
+| `src/cli` | Index lifecycle CLI — `mirror:init`, `mirror:refresh`, `mirror:verify` — compiled to `dist/cli/`. |
 | `tests/` | Unit and integration tests mirroring `src/`, with fixture ULS records. |
 
 ## Development guide

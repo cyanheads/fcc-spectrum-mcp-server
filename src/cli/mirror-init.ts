@@ -3,10 +3,10 @@
  * selected service group's weekly snapshot into a fresh index generation and publishes it
  * through `current.json`. Skips when the published generation already holds every
  * selected snapshot; resumes from the last completed step after an interruption.
- * @module scripts/fcc-mirror-init
+ * @module cli/mirror-init
  */
 
-import { runScript } from './_mirror-context.js';
+import { runScript } from './mirror-context.js';
 
 await runScript(async ({ config, ingester, logger, signal }) => {
   logger.info?.('Starting weekly rebuild', {

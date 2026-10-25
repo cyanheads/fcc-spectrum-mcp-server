@@ -4,12 +4,12 @@
  * file with the lines the ingester read (a mismatch means a zip entry was not streamed in
  * full) and the licenses indexed with those loaded at build time. Exits non-zero on any
  * failure. Before daily files are applied, the license counts must match exactly.
- * @module scripts/fcc-mirror-verify
+ * @module cli/mirror-verify
  */
 
 import { join } from 'node:path';
 import { createUlsStore, type RecordStats, readPointer } from '@/services/uls/schema.js';
-import { runScript } from './_mirror-context.js';
+import { runScript } from './mirror-context.js';
 
 interface IngestFile {
   counts_created: string;
@@ -67,12 +67,18 @@ await runScript(async ({ config, logger }) => {
     }
 
     const tables = Object.fromEntries(
-      ['licenses', 'lease_links', 'locations', 'antennas', 'frequencies', 'market_blocks'].map(
-        (table) => [
-          table,
-          db.prepare<{ n: number }>(`SELECT count(*) AS n FROM ${table}`).get()?.n ?? 0,
-        ],
-      ),
+      [
+        'licenses',
+        'lease_links',
+        'locations',
+        'antennas',
+        'frequencies',
+        'market_blocks',
+        'paths',
+      ].map((table) => [
+        table,
+        db.prepare<{ n: number }>(`SELECT count(*) AS n FROM ${table}`).get()?.n ?? 0,
+      ]),
     );
     console.log(
       JSON.stringify(

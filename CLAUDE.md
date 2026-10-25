@@ -2,10 +2,10 @@
 
 **Server:** fcc-spectrum-mcp-server
 **Version:** 0.2.0
-**Framework:** [@cyanheads/mcp-ts-core](https://www.npmjs.com/package/@cyanheads/mcp-ts-core) `^0.13.15`
+**Framework:** [@cyanheads/mcp-ts-core](https://www.npmjs.com/package/@cyanheads/mcp-ts-core) `^0.13.16`
 **Engines:** Bun ≥1.4.0, Node ≥24.0.0
 **MCP SDK:** `@modelcontextprotocol/server` ^2.3.1
-**Zod:** ^4.6.5
+**Zod:** ^4.6.7
 
 > **Read the framework docs first:** `node_modules/@cyanheads/mcp-ts-core/CLAUDE.md` contains the full API reference — builders, Context, error codes, exports, patterns. This file covers server-specific conventions only.
 
@@ -340,11 +340,12 @@ src/
         list-reference.tool.ts          # fcc_spectrum_list_reference
     resources/definitions/
       license.resource.ts               # fcc-spectrum://license/{callsign}
+  cli/                                  # mirror:* entries, compiled to dist/cli/ and run on Bun
+    mirror-init.ts                      # mirror:init — weekly rebuild, out-of-band
+    mirror-refresh.ts                   # mirror:refresh — daily refresh
+    mirror-verify.ts                    # mirror:verify — integrity and count check
+    mirror-context.ts                   # shared setup for the three mirror commands
 scripts/
-  fcc-mirror-init.ts                    # mirror:init — weekly rebuild, out-of-band
-  fcc-mirror-refresh.ts                 # mirror:refresh — daily refresh
-  fcc-mirror-verify.ts                  # mirror:verify — integrity and count check
-  _mirror-context.ts                    # shared setup for the three mirror scripts
   build-state-boundaries.ts             # regenerate us-states.json (run by hand)
   build-market-states.ts                # regenerate market-states.json from FCC sources (run by hand; --check)
 ```
@@ -426,8 +427,8 @@ When you complete a skill's checklist, check the boxes and add a completion time
 | `bun run audit:refresh` | Delete `bun.lock` and reinstall. Last resort after `audit:fix`, `bun update <name>`, and `bun dedupe` — re-resolves every ranged dep (the framework pin included) and rewrites the lockfile as `lockfileVersion: 2` |
 | `bun run lint:mcp` | Run the MCP definition linter standalone (rule catalog: `api-linter` skill) |
 | `bun run lint:packaging` | Packaging surface checks — `server.json`/`manifest.json` env-var parity (run by devcheck) |
-| `bun run mirror:init` | Weekly rebuild of the ULS index into a new generation (skips when the published one already holds every selected group). The one-time operator step |
-| `bun run mirror:refresh` | Apply daily files newer than the index checkpoint (stdio deployments run it from cron) |
+| `bun run mirror:init` | Weekly rebuild of the ULS index into a new generation (skips when the published one already holds every selected group). The one-time operator step. Each `mirror:*` script runs its compiled `dist/cli/` entry, so build first |
+| `bun run mirror:refresh` | Apply daily files newer than the index checkpoint, skipping those of groups the index does not hold (stdio deployments run it from cron) |
 | `bun run mirror:verify` | SQLite integrity check plus per-snapshot line-count comparison of the published index |
 | `bun run release:github` | Publish the GitHub Release (`.mcpb` bundle) — a `release-and-publish` step |
 | `bun run publish-mcp` | Publish to the MCP Registry — a `release-and-publish` step |

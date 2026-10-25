@@ -633,6 +633,38 @@ export const DEFAULT_SERVICE_GROUPS: readonly ServiceGroup[] = [
 ];
 
 /**
+ * Daily incremental file code (`daily/l_<code>_<day>.zip`) → the weekly group whose
+ * transactions it carries. The FCC titles each daily section after its weekly group, and every
+ * sampled daily file holds only that group's radio service codes. `rb` has no weekly group, so
+ * it is absent here, as is any code the FCC adds later; `frc` is never indexed.
+ */
+export const DAILY_CODE_GROUPS: ReadonlyMap<string, ServiceGroup | 'frc'> = new Map([
+  ['ac', 'aircr'],
+  ['am', 'amat'],
+  ['cg', 'coast'],
+  ['cl', 'cell'],
+  ['fc', 'frc'],
+  ['gm', 'gmrs'],
+  ['lb', 'LMbcast'],
+  ['lc', 'LMcomm'],
+  ['lp', 'LMpriv'],
+  ['mi', 'mdsitfs'],
+  ['mk', 'market'],
+  ['mw', 'micro'],
+  ['pg', 'paging'],
+  ['sh', 'ship'],
+]);
+
+/**
+ * The lower-cased file code of a daily incremental name (`l_pg_mon.zip` → `pg`), or `undefined`
+ * for a name not of the form `l_<code>_<day>.zip`.
+ */
+export function dailyFileCode(fileName: string): string | undefined {
+  const [prefix, code, day, ...rest] = fileName.toLowerCase().split('_');
+  return prefix === 'l' && code && day?.endsWith('.zip') && rest.length === 0 ? code : undefined;
+}
+
+/**
  * The label `table` gives a code as filed, or `undefined` when the table has no entry of its
  * own for it. Codes come from upstream records, so a code named like an object member
  * (`constructor`, `toString`) must not read through to the prototype.

@@ -11,6 +11,7 @@ import {
   ANTENNA_COVERAGE_NOTICE,
   getUlsIndexService,
   LICENSE_PAGE,
+  PATH_COVERAGE_NOTICE,
 } from '@/services/uls/uls-index-service.js';
 
 /** Frequency rows returned, matching `fcc_spectrum_get_license`'s default `max_frequencies`. */
@@ -33,7 +34,7 @@ function percentDecoded(value: unknown): unknown {
 export const licenseResource = resource('fcc-spectrum://license/{callsign}', {
   name: 'fcc_spectrum_license',
   title: 'FCC ULS license by callsign',
-  description: `One FCC ULS license or spectrum lease by callsign, as JSON: the first page fcc_spectrum_get_license returns (licensee, status and dates, whole locations up to ${LICENSE_PAGE.sites} sites and ${LICENSE_PAGE.antennas} antennas with up to ${MAX_FREQUENCIES} frequency rows, market blocks, lease links with up to ${LICENSE_PAGE.leases} leases), plus dataAsOf, the location, site, and frequency-row counts, and a notice naming the fcc_spectrum_get_license call that reads whatever the page leaves out. A callsign shared by several records resolves to the active one, else the most recent.`,
+  description: `One FCC ULS license or spectrum lease by callsign, as JSON: the first page fcc_spectrum_get_license returns (licensee, status and dates, whole locations up to ${LICENSE_PAGE.sites} sites, ${LICENSE_PAGE.antennas} antennas, and ${LICENSE_PAGE.paths} microwave paths with up to ${MAX_FREQUENCIES} frequency rows, market blocks, lease links with up to ${LICENSE_PAGE.leases} leases), plus dataAsOf, the location, site, path, and frequency-row counts, and a notice naming the fcc_spectrum_get_license call that reads whatever the page leaves out. A callsign shared by several records resolves to the active one, else the most recent.`,
   mimeType: 'application/json',
   params: z.object({
     callsign: z
@@ -86,8 +87,9 @@ export const licenseResource = resource('fcc-spectrum://license/{callsign}', {
     const cut = result.frequencyCutAt;
     const notice = [
       result.antennaCoverageIncomplete && ANTENNA_COVERAGE_NOTICE,
+      result.pathCoverageIncomplete && PATH_COVERAGE_NOTICE,
       result.nextLocationOffset !== undefined &&
-        `Lists ${locations.length} of ${result.locationTotal} locations; ${call} and location_offset ${result.nextLocationOffset} for the rest.`,
+        `Lists ${locations.length} of ${result.locationTotal} locations${result.pathTotal > 0 ? ` and ${result.pathsShown} of ${result.pathTotal} paths` : ''}; ${call} and location_offset ${result.nextLocationOffset} for the rest.`,
       result.windowFrequencyTotal > result.frequenciesShown &&
         `Lists ${result.frequenciesShown} of ${result.windowFrequencyTotal} frequency rows at these locations; ${call} and a higher max_frequencies (up to 1000)${cut && cut.offset > 0 ? ` or location_offset ${cut.offset}` : ''} for the rest.`,
       result.nextLeaseOffset !== undefined &&
@@ -102,6 +104,7 @@ export const licenseResource = resource('fcc-spectrum://license/{callsign}', {
       locations,
       locationTotal: result.locationTotal,
       siteTotal: result.siteTotal,
+      ...(!result.pathCoverageIncomplete && { pathTotal: result.pathTotal }),
       ...(result.nextLocationOffset !== undefined && {
         nextLocationOffset: result.nextLocationOffset,
       }),

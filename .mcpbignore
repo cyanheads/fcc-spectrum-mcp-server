@@ -17,12 +17,7 @@
 /logs/
 /coverage/
 /tests/
-# Dev scripts stay out; the mirror CLI ships, as in package.json files[].
-/scripts/*
-!/scripts/_mirror-context.ts
-!/scripts/fcc-mirror-init.ts
-!/scripts/fcc-mirror-refresh.ts
-!/scripts/fcc-mirror-verify.ts
+/scripts/
 /Dockerfile
 /bun.lock
 /bunfig.toml

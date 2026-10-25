@@ -25,10 +25,12 @@ import {
   generationStamp,
   isGenerationFile,
   isMalformedPointer,
+  isPathCoverageIncomplete,
   isProcessAlive,
   LEASE_CALLSIGN,
   LICENSE_COLUMNS,
   LOCK_FILE,
+  META_KEYS,
   POINTER_FILE,
   RECLAIM_FILE,
   readIngestLock,
@@ -576,6 +578,7 @@ describe('createUlsStore', () => {
         'antennas',
         'frequencies',
         'market_blocks',
+        'paths',
         'service_codes',
         'ingest_files',
         'meta',
@@ -623,6 +626,7 @@ describe('createUlsStore', () => {
         'frequencies_band',
         'market_blocks_usi',
         'market_blocks_band',
+        'paths_key',
       ]) {
         expect(indexes, index).toContain(index);
       }
@@ -749,7 +753,7 @@ describe('createUlsStore', () => {
       const db = await store.raw();
       expect(db.prepare<{ n: number }>('SELECT count(*) AS n FROM licenses').get()?.n).toBe(0);
       expect(db.prepare<{ version: number }>('SELECT version FROM schema_version').get()).toEqual({
-        version: 7,
+        version: 8,
       });
       expect(
         db
@@ -782,9 +786,12 @@ describe('createUlsStore', () => {
     try {
       const db = await upgraded.raw();
       expect(db.prepare<{ version: number }>('SELECT version FROM schema_version').get()).toEqual({
-        version: 7,
+        version: 8,
       });
-      expect(db.prepare('SELECT 1 FROM meta').get()).toBeFalsy();
+      // Schema 8 marks the populated generation's paths incomplete; nothing asks for a rebuild.
+      expect(db.prepare('SELECT key FROM meta').all()).toEqual([
+        { key: 'path_coverage_incomplete' },
+      ]);
       const plan = db
         .prepare<{ detail: string }>(
           "EXPLAIN QUERY PLAN SELECT usi FROM licenses WHERE market_code = 'PEA016'",
@@ -804,6 +811,95 @@ describe('createUlsStore', () => {
     } finally {
       await upgraded.close();
     }
+  });
+
+  describe('schema 8: microwave paths', () => {
+    /** A generation in the schema 7 layout (no paths table), holding `licenses` rows. */
+    async function schema7(path: string, licenses: number): Promise<void> {
+      const v7 = createUlsStore(path);
+      try {
+        const db = await v7.raw();
+        db.exec('DROP INDEX paths_key; DROP TABLE paths; UPDATE schema_version SET version = 7;');
+        for (let usi = 1; usi <= licenses; usi++) {
+          db.prepare(
+            "INSERT INTO licenses (usi, callsign, license_status, radio_service_code) VALUES (?, ?, 'A', 'MG')",
+          ).run(usi, `KZZ${usi}`);
+        }
+      } finally {
+        await v7.close();
+      }
+    }
+
+    it('adds the paths table to a populated generation and marks its path coverage incomplete, on every reopen', async () => {
+      const path = join(dir, 'gen.db');
+      await schema7(path, 2);
+      for (let pass = 0; pass < 2; pass++) {
+        const store = createUlsStore(path);
+        try {
+          const db = await store.raw();
+          expect(db.prepare('SELECT version FROM schema_version').get()).toEqual({ version: 8 });
+          expect(
+            db.prepare("SELECT name FROM pragma_table_info('paths') ORDER BY cid").all(),
+          ).toEqual(
+            [
+              'usi',
+              'location_number',
+              'antenna_number',
+              'path_number',
+              'receive_location_number',
+              'receive_antenna_number',
+              'path_type',
+              'passive_receiver',
+              'receiver_callsign',
+            ].map((name) => ({ name })),
+          );
+          expect(db.prepare('SELECT key, value FROM meta').all()).toEqual([
+            { key: META_KEYS.pathCoverageIncomplete, value: '8' },
+          ]);
+          expect(isPathCoverageIncomplete(db)).toBe(true);
+          expect(db.prepare('SELECT count(*) AS n FROM licenses').get()).toEqual({ n: 2 });
+        } finally {
+          await store.close();
+        }
+      }
+    });
+
+    it('marks neither a new generation nor an empty one', async () => {
+      const empty = join(dir, 'empty.db');
+      await schema7(empty, 0);
+      for (const path of [empty, join(dir, 'new.db')]) {
+        const store = createUlsStore(path);
+        try {
+          const db = await store.raw();
+          expect(db.prepare('SELECT version FROM schema_version').get()).toEqual({ version: 8 });
+          expect(db.prepare('SELECT count(*) AS n FROM meta').get()).toEqual({ n: 0 });
+          expect(isPathCoverageIncomplete(db)).toBe(false);
+        } finally {
+          await store.close();
+        }
+      }
+    });
+
+    it('reads and deletes one license’s paths through the (usi, location_number) index', async () => {
+      const store = createUlsStore(join(dir, 'gen.db'));
+      try {
+        const db = await store.raw();
+        const plan = (sql: string) =>
+          db
+            .prepare<{ detail: string }>(`EXPLAIN QUERY PLAN ${sql}`)
+            .all()
+            .map((row) => row.detail)
+            .join(' ');
+        expect(plan('SELECT * FROM paths WHERE usi = 1 AND location_number = 2')).toMatch(
+          /SEARCH paths USING (?:COVERING )?INDEX paths_key \(usi=\? AND location_number=\?\)/,
+        );
+        expect(plan('DELETE FROM paths WHERE usi IN (SELECT 1)')).toMatch(
+          /SEARCH paths USING (?:COVERING )?INDEX paths_key \(usi=\?\)/,
+        );
+      } finally {
+        await store.close();
+      }
+    });
   });
 
   it('opens nothing until first use', async () => {

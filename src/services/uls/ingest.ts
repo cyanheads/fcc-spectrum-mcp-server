@@ -31,7 +31,7 @@ import {
   type UlsRemoteFile,
   weeklyZipPath,
 } from './bulk-client.js';
-import { type ServiceGroup, USPS_STATES } from './codes.js';
+import { DAILY_CODE_GROUPS, dailyFileCode, type ServiceGroup, USPS_STATES } from './codes.js';
 import {
   type CountsFile,
   decodeAm,
@@ -44,6 +44,7 @@ import {
   decodeLo,
   decodeMf,
   decodeMk,
+  decodePa,
   emissionBandwidthMhz,
   MAX_FRACTIONAL_BANDWIDTH,
   parseCountsFile,
@@ -64,6 +65,7 @@ import {
   isAntennaCoverageIncomplete,
   isGenerationFile,
   isMalformedPointer,
+  isPathCoverageIncomplete,
   isRebuildRequired,
   LEASE_CALLSIGN,
   LIVE_STATUSES,
@@ -241,7 +243,9 @@ export class UlsIngester {
   /**
    * Daily refresh of the published generation: applies every `daily/l_*.zip` whose
    * `Last-Modified` is newer than the checkpoint and not yet applied, oldest first, each in
-   * one transaction. Stops at the first failure with the checkpoint at the last applied file.
+   * one transaction. A file whose code belongs to a weekly group the generation does not hold
+   * is skipped before its HEAD ({@link DAILY_CODE_GROUPS}); an unmapped code always applies.
+   * Stops at the first failure with the checkpoint at the last applied file.
    * A generation carrying the rebuild-required mark is never refreshed: that fails with a
    * conflict carrying `reason: rebuild_required`.
    */
@@ -348,9 +352,9 @@ export class UlsIngester {
   }
 
   /**
-   * True when the published generation requires a rebuild or has incomplete antenna coverage, or a selected group
-   * is missing from it, or that group's snapshot `Last-Modified` is newer than the one
-   * recorded when the generation was built.
+   * True when the published generation requires a rebuild or has incomplete antenna or path
+   * coverage, or a selected group is missing from it, or that group's snapshot `Last-Modified`
+   * is newer than the one recorded when the generation was built.
    */
   private async needsRebuild(
     pointer: GenerationPointer,
@@ -358,8 +362,8 @@ export class UlsIngester {
   ): Promise<boolean> {
     const path = join(this.mirrorDir, pointer.file);
     if (!existsSync(path)) return true;
-    const { rebuildRequired, antennaCoverageIncomplete, weekly } = await readGenerationState(path);
-    if (rebuildRequired || antennaCoverageIncomplete) return true;
+    const { rebuildRequired, coverageIncomplete, weekly } = await readGenerationState(path);
+    if (rebuildRequired || coverageIncomplete) return true;
     return [...remote].some(([group, head]) => {
       const row = weekly.get(weeklyZipPath(group));
       if (row?.stage !== 'complete') return true;
@@ -382,8 +386,8 @@ export class UlsIngester {
   ): Promise<string | undefined> {
     const path = join(this.mirrorDir, target);
     if (!existsSync(path)) return;
-    const { rebuildRequired, antennaCoverageIncomplete, weekly } = await readGenerationState(path);
-    if (rebuildRequired || antennaCoverageIncomplete)
+    const { rebuildRequired, coverageIncomplete, weekly } = await readGenerationState(path);
+    if (rebuildRequired || coverageIncomplete)
       return 'a generation an earlier version of this server started';
     const current = new Map(
       [...remote].map(([group, head]) => [weeklyZipPath(group), head.lastModified]),
@@ -542,6 +546,7 @@ export class UlsIngester {
         liveLicenses: live.size,
         sites: stats.LO?.kept ?? 0,
         frequencies: stats.FR?.kept ?? 0,
+        paths: stats.PA?.kept ?? 0,
       });
     } finally {
       await archive.close();
@@ -583,9 +588,23 @@ export class UlsIngester {
     const db = await store.raw();
     configureIngestConnection(db);
     const recorded = readIngestRows(db, 'daily');
+    // The generation's own groups, not the configured ones: a group deselected since the
+    // build is still served until the next rebuild, so its dailies still apply.
+    const held = new Set(
+      [...readIngestRows(db, 'weekly').values()].map((row) => row.service_group),
+    );
 
     const pending: UlsRemoteFile[] = [];
+    const skippedCodes = new Set<string>();
+    let skipped = 0;
     for (const name of await this.client.listDailyFiles(ctx.signal)) {
+      const code = dailyFileCode(name);
+      const group = code === undefined ? undefined : DAILY_CODE_GROUPS.get(code);
+      if (code !== undefined && group !== undefined && !held.has(group)) {
+        skipped++;
+        skippedCodes.add(code);
+        continue;
+      }
       const path = dailyZipPath(name);
       const head = await this.client.head(path, ctx.signal);
       if (!head || head.lastModified <= checkpoint) continue;
@@ -595,7 +614,12 @@ export class UlsIngester {
     pending.sort(
       (a, b) => a.lastModified.localeCompare(b.lastModified) || a.path.localeCompare(b.path),
     );
-    this.logger.info?.('Daily files to apply', { count: pending.length, checkpoint });
+    this.logger.info?.('Daily files to apply', {
+      count: pending.length,
+      checkpoint,
+      skipped,
+      skippedCodes: [...skippedCodes].sort(),
+    });
 
     for (const file of pending) {
       const counts = await this.applyDaily(db, file, ctx.signal);
@@ -637,7 +661,14 @@ export class UlsIngester {
       Object.assign(stats, await stageTechnical(db, archive, live, signal));
 
       db.transaction(() => {
-        for (const table of ['locations', 'antennas', 'frequencies', 'market_blocks', 'licenses']) {
+        for (const table of [
+          'locations',
+          'antennas',
+          'frequencies',
+          'market_blocks',
+          'paths',
+          'licenses',
+        ]) {
           db.exec(`DELETE FROM ${table} WHERE usi IN (SELECT usi FROM temp.apply)`);
         }
         db.exec('DELETE FROM lease_links WHERE lease_usi IN (SELECT usi FROM temp.apply)');
@@ -765,11 +796,12 @@ function readIngestRows(db: SqliteHandle, kind: IngestFileRow['kind']): Map<stri
 
 /**
  * The weekly `ingest_files` rows of a generation file, and whether it carries the
- * rebuild-required or incomplete-antenna mark, read through a short-lived connection.
+ * rebuild-required mark or an incomplete-antenna or incomplete-path mark, read through a
+ * short-lived connection.
  */
 async function readGenerationState(path: string): Promise<{
   rebuildRequired: boolean;
-  antennaCoverageIncomplete: boolean;
+  coverageIncomplete: boolean;
   weekly: Map<string, IngestFileRow>;
 }> {
   const store = createUlsStore(path);
@@ -777,7 +809,7 @@ async function readGenerationState(path: string): Promise<{
     const db = await store.raw();
     return {
       rebuildRequired: isRebuildRequired(db),
-      antennaCoverageIncomplete: isAntennaCoverageIncomplete(db),
+      coverageIncomplete: isAntennaCoverageIncomplete(db) || isPathCoverageIncomplete(db),
       weekly: readIngestRows(db, 'weekly'),
     };
   } finally {
@@ -861,6 +893,8 @@ CREATE TEMP TABLE stage_em (
 );
 DROP TABLE IF EXISTS temp.stage_mf;
 CREATE TEMP TABLE stage_mf AS SELECT * FROM main.market_blocks LIMIT 0;
+DROP TABLE IF EXISTS temp.stage_pa;
+CREATE TEMP TABLE stage_pa AS SELECT * FROM main.paths LIMIT 0;
 `;
 
 const STAGING_TABLES = [
@@ -874,6 +908,7 @@ const STAGING_TABLES = [
   'stage_fr',
   'stage_em',
   'stage_mf',
+  'stage_pa',
   'apply',
 ];
 
@@ -1014,7 +1049,7 @@ async function stageRecords(
 
 /**
  * Stage LO (with decimal coordinates and derived site state), AN, FR, EM (with each
- * designator's bandwidth), and MF, keeping only rows whose USI is in `live`.
+ * designator's bandwidth), MF, and PA, keeping only rows whose USI is in `live`.
  */
 async function stageTechnical(
   db: SqliteHandle,
@@ -1139,6 +1174,28 @@ async function stageTechnical(
     (mf) => (live.has(mf.usi) ? [mf.usi, mf.partitionAreaId ?? 0, mf.lowerMhz, mf.upperMhz] : null),
     'INSERT INTO temp.stage_mf (usi, partition_area_id, lower, upper) VALUES (?, ?, ?, ?)',
   );
+  await stageType(
+    pass,
+    'PA',
+    decodePa,
+    (pa) =>
+      live.has(pa.usi)
+        ? [
+            pa.usi,
+            pa.transmitLocationNumber,
+            pa.transmitAntennaNumber,
+            pa.pathNumber,
+            pa.receiveLocationNumber,
+            pa.receiveAntennaNumber,
+            pa.pathTypeCode,
+            pa.passiveReceiver === null ? null : Number(pa.passiveReceiver),
+            pa.receiverCallsign,
+          ]
+        : null,
+    `INSERT INTO temp.stage_pa (usi, location_number, antenna_number, path_number,
+       receive_location_number, receive_antenna_number, path_type, passive_receiver, receiver_callsign)
+     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+  );
   return pass.stats;
 }
 
@@ -1203,7 +1260,8 @@ function insertRecords(db: SqliteHandle): number {
  * {@link MAX_FRACTIONAL_BANDWIDTH} × f or more is a filing error and counts as none.
  * Frequencies and market blocks take the {@link bandClassSql band class} of their width. EM
  * rows with no FR partner are dropped and counted in `stats.EM.orphaned`. Sites a license
- * files under one location number take `site_seq` 1, 2, … in filing order.
+ * files under one location number take `site_seq` 1, 2, … in filing order. Paths keep their
+ * filing order, joined to nothing: an endpoint that names no LO or AN row is kept as filed.
  */
 function insertTechnical(db: SqliteHandle, stats: RecordStats): void {
   const bandwidth = `max(CASE WHEN e.bandwidth_mhz < ${MAX_FRACTIONAL_BANDWIDTH} * f.frequency_mhz
@@ -1237,7 +1295,8 @@ function insertTechnical(db: SqliteHandle, stats: RecordStats): void {
      INSERT INTO market_blocks (usi, partition_area_id, lower, upper, band_class)
        SELECT usi, partition_area_id, lower, upper,
          ${bandClassSql('COALESCE(upper, lower) - lower')}
-       FROM temp.stage_mf;`,
+       FROM temp.stage_mf;
+     INSERT INTO paths SELECT * FROM temp.stage_pa ORDER BY rowid;`,
   );
   const em = stats.EM;
   if (em) {

@@ -6,7 +6,8 @@
  * `location_offset` and `location_number` (with `location_start_conflict`) over a record
  * numbered from 0 with a gap, redaction on and off (site names and addresses included, on
  * shared location numbers too), the ASR registration-number rule, leases and market blocks,
- * the required enrichment on the zero-result (miss) and under-cap (hit) pages, and
+ * microwave paths (joined, unjoined, and shared receive ends, the 100-path window and its
+ * notice, a record with none, redaction) and incomplete path coverage, the required enrichment on the zero-result (miss) and under-cap (hit) pages, and
  * `format()` parity with registry text carrying CR/LF and `|`.
  * @module tests/tools/get-license.tool.test
  */
@@ -20,6 +21,7 @@ import { afterAll, beforeAll, beforeEach, describe, expect, it } from 'vitest';
 import { getLicense } from '@/mcp-server/tools/definitions/get-license.tool.js';
 import { ANTENNA_TYPES } from '@/services/uls/codes.js';
 import { createUlsStore, POINTER_FILE, writePointer } from '@/services/uls/schema.js';
+import { PATH_COVERAGE_NOTICE } from '@/services/uls/uls-index-service.js';
 import {
   type ContractResult,
   contractText,
@@ -1263,6 +1265,271 @@ describe('an individual whose sites file names', () => {
   });
 });
 
+/** A `microSite` fixture coordinate in whole minutes, as decimal degrees. */
+const microLat = (minute: number) => 34 + minute / 60;
+const microLon = (minute: number) => -(119 + minute / 60);
+
+/** `[locationNumber, antennaNumber, pathNumbers]` for every antenna that lists paths. */
+const pathsByAntenna = (locations: readonly Location[] | undefined) =>
+  (locations ?? []).flatMap((location) =>
+    location.antennas.flatMap((antenna) =>
+      antenna.paths
+        ? [[location.locationNumber, antenna.antennaNumber, antenna.paths.map((p) => p.pathNumber)]]
+        : [],
+    ),
+  );
+
+const antennaAt = (data: Output, location: number, antenna: number) =>
+  data.locations
+    ?.find((entry) => entry.locationNumber === location)
+    ?.antennas.find((entry) => entry.antennaNumber === antenna);
+
+/** The rendered lines of microwave paths. */
+const pathLines = (result: ContractResult) =>
+  lines(result).filter((line) => line.startsWith('- **Path '));
+
+describe('microwave paths', () => {
+  let micro: FixtureIndex;
+  beforeAll(async () => {
+    micro = await buildFixtureIndex({ groups: ['micro'] });
+  });
+  beforeEach(async () => {
+    await useIndex(micro.mirrorDir, { services: ['micro'] });
+  });
+  afterAll(async () => {
+    await releaseIndex();
+    await micro.dispose();
+  });
+
+  it('lists each path under its transmit antenna on both surfaces, with pathTotal', async () => {
+    const result = await run({ callsign: 'KZZ920' });
+    const data = hit(result);
+    expect(data).toMatchObject({ found: true, pathTotal: 10, locationTotal: 7, truncated: false });
+    expect(data.notice).toBeUndefined();
+    expect(pathsByAntenna(data.locations)).toEqual(
+      [3, 4, 5, 6, 7, 9, 10, 11, 15, 16].map((n) => [1, n, [n]]),
+    );
+    expect(antennaAt(data, 1, 3)?.paths).toEqual([
+      {
+        pathNumber: 3,
+        pathType: 'Fixed Point-to-Point',
+        passiveReceiver: false,
+        receiverCallsign: 'KZZ930',
+        receive: {
+          locationNumber: 2,
+          antennaNumber: 1,
+          latitude: microLat(22),
+          longitude: microLon(22),
+        },
+      },
+    ]);
+    expect(antennaAt(data, 2, 1)).not.toHaveProperty('paths');
+
+    const rendered = lines(result);
+    expect(rendered).toContain('**Paths:** 10');
+    const antenna3 = rendered.indexOf('**Antenna 3** · **Type:** T · **Azimuth °:** 3');
+    expect(antenna3).toBeGreaterThan(-1);
+    // The antenna heading, its frequency table, then its path line.
+    expect(rendered.slice(antenna3 + 5, antenna3 + 8)).toEqual([
+      '',
+      `- **Path 3** · **Type:** Fixed Point-to-Point · **Passive receiver:** no · **Receiver callsign:** KZZ930 · **Receive:** location 2 (${microLat(22)}, ${microLon(22)}), antenna 1`,
+      '',
+    ]);
+    expect(pathLines(result)).toHaveLength(10);
+    expectCarries(contractText(result), { locations: data.locations, pathTotal: data.pathTotal });
+  });
+
+  it('keeps unjoined receive ends, a blank receive antenna, and duplicate path numbers as filed', async () => {
+    const result = await run({ callsign: 'KZZ921' });
+    const data = hit(result);
+    expect(data.pathTotal).toBe(6);
+    expect(pathsByAntenna(data.locations)).toEqual([
+      [1, 1, [1, 2, 6]],
+      [1, 2, [2]],
+      [1, 8, [5]],
+      [1, 9, [4]],
+    ]);
+    const [unjoined, area, unfiledAntenna] = antennaAt(data, 1, 1)?.paths ?? [];
+    expect(unjoined?.receive).toEqual({
+      locationNumber: 3,
+      antennaNumber: 2,
+      antennaFiled: false,
+      siteCount: 0,
+    });
+    expect(area).toEqual({
+      pathNumber: 2,
+      pathType: 'Area',
+      receive: { locationNumber: 2, latitude: microLat(31), longitude: microLon(31) },
+    });
+    expect(unfiledAntenna?.receive).toEqual({
+      locationNumber: 2,
+      antennaNumber: 7,
+      antennaFiled: false,
+      latitude: microLat(31),
+      longitude: microLon(31),
+    });
+    expect(antennaAt(data, 1, 2)?.paths?.[0]).toMatchObject({
+      passiveReceiver: true,
+      receiverCallsign: 'KZZ920',
+    });
+    // A transmit antenna with no AN or FR row gets a bare entry carrying its path.
+    expect(antennaAt(data, 1, 8)).toEqual({
+      antennaNumber: 8,
+      frequencies: [],
+      paths: [expect.objectContaining({ pathNumber: 5 })],
+    });
+
+    const coordinates = `${microLat(31)}, ${microLon(31)}`;
+    expect(pathLines(result)).toEqual([
+      '- **Path 1** · **Type:** Fixed Point-to-Point · **Passive receiver:** no · **Receive:** location 3 (no site filed under this number), antenna 2 (no antenna record under this number)',
+      `- **Path 2** · **Type:** Area · **Receive:** location 2 (${coordinates}), antenna not filed`,
+      `- **Path 6** · **Type:** Fixed Point-to-Point · **Passive receiver:** no · **Receive:** location 2 (${coordinates}), antenna 7 (no antenna record under this number)`,
+      `- **Path 2** · **Type:** Fixed Point-to-Point · **Passive receiver:** yes · **Receiver callsign:** KZZ920 · **Receive:** location 2 (${coordinates}), antenna 1`,
+      `- **Path 5** · **Type:** Fixed Point-to-Point · **Passive receiver:** no · **Receive:** location 2 (${coordinates}), antenna 1`,
+      `- **Path 4** · **Type:** Fixed Point-to-Point · **Passive receiver:** no · **Receive:** location 2 (${coordinates}), antenna 1`,
+    ]);
+    const rendered = lines(result);
+    const bare = rendered.indexOf('**Antenna 8**');
+    expect(rendered.slice(bare, bare + 3)).toEqual([
+      '**Antenna 8**',
+      '',
+      expect.stringMatching(/^- \*\*Path 5\*\* · /),
+    ]);
+    expectCarries(contractText(result), { locations: data.locations });
+  });
+
+  it('gives a shared receive number its site count and no coordinates', async () => {
+    const result = await run({ callsign: 'KZZ922' });
+    const [shared, placeholder] = antennaAt(hit(result), 1, 1)?.paths ?? [];
+    expect(shared).toMatchObject({
+      pathNumber: 17,
+      receiverCallsign: 'KZZ931',
+      receive: { locationNumber: 2, antennaNumber: 1, siteCount: 2 },
+    });
+    expect(shared?.receive).not.toHaveProperty('latitude');
+    expect(placeholder?.receive).toEqual({ locationNumber: 3, antennaNumber: 1 });
+    expect(pathLines(result)).toEqual([
+      '- **Path 17** · **Type:** Fixed Point-to-Point · **Passive receiver:** no · **Receiver callsign:** KZZ931 · **Receive:** location 2 (2 sites share this number, so no coordinates), antenna 1',
+      '- **Path 18** · **Type:** Fixed Point-to-Point · **Passive receiver:** no · **Receive:** location 3 (coordinates not available), antenna 1',
+    ]);
+  });
+
+  it('lists a location with more than 100 paths alone and whole, and names the next offset', async () => {
+    const result = await run({ callsign: 'KZZ924', max_frequencies: 1000 });
+    const data = hit(result);
+    expect(data.locations?.map((location) => location.locationNumber)).toEqual([1]);
+    expect(pathsByAntenna(data.locations).flatMap(([, , paths]) => paths)).toEqual(
+      Array.from({ length: 103 }, (_, i) => i + 1),
+    );
+    expect(data).toMatchObject({ pathTotal: 103, nextLocationOffset: 1, truncated: true });
+    expect(data.notice).toBe(
+      'Listing 1 of 4 locations (1 of 4 sites; 103 of 103 paths) from location_offset 0; one call lists at most 50 sites, 100 antennas, and 100 paths. Call fcc_spectrum_get_license with usi "9005" and location_offset 1 for the next locations.',
+    );
+    expect(pathLines(result)).toHaveLength(103);
+
+    const rest = hit(await run({ usi: '9005', location_offset: 1 }));
+    expect(rest.locations?.map((location) => location.locationNumber)).toEqual([2, 3, 4]);
+    expect(pathsByAntenna(rest.locations)).toEqual([]);
+    expect(rest).toMatchObject({ pathTotal: 103 });
+    expect(rest).not.toHaveProperty('nextLocationOffset');
+  });
+
+  it('reports paths listed against pathTotal when the window stops before the rest', async () => {
+    const result = await run({ callsign: 'KZZ923', max_frequencies: 1000 });
+    const data = hit(result);
+    expect(data.locations?.map((location) => location.locationNumber)).toEqual([1, 2]);
+    expect(data).toMatchObject({ pathTotal: 120, nextLocationOffset: 2, truncated: true });
+    expect(data.notice).toBe(
+      'Listing 2 of 4 locations (2 of 4 sites; 80 of 120 paths) from location_offset 0; one call lists at most 50 sites, 100 antennas, and 100 paths. Call fcc_spectrum_get_license with usi "9004" and location_offset 2 for the next locations.',
+    );
+    expect(contractText(result)).toContain(data.notice);
+    expect(pathLines(result)).toHaveLength(80);
+
+    const rest = hit(await run({ usi: '9004', location_offset: 2, max_frequencies: 1000 }));
+    expect(rest.locations?.map((location) => location.locationNumber)).toEqual([3, 10]);
+    expect(pathsByAntenna(rest.locations)).toHaveLength(40);
+    expect(rest.notice).toBeUndefined();
+  });
+
+  it('adds no path noise to a live license that files none', async () => {
+    const result = await run({ callsign: 'KZZ925' });
+    const data = hit(result);
+    expect(data).toMatchObject({ found: true, pathTotal: 0 });
+    expect(data.locations?.[0]?.antennas).toHaveLength(1);
+    expect(JSON.stringify(result.structuredContent)).not.toContain('"paths"');
+    expect(lines(result)).toContain('**Paths:** 0');
+    expect(contractText(result)).not.toContain('**Path ');
+  });
+
+  it('reports pathTotal 0 for a cancelled license and says paths are not kept', async () => {
+    const result = await run({ callsign: 'KZZ927' });
+    expect(hit(result)).toMatchObject({ technicalRetained: false, locations: [], pathTotal: 0 });
+    expect(lines(result)).toContain(
+      '**Paths:** 0 (paths are kept only for active, pending-legal, and term-pending records)',
+    );
+  });
+
+  it("renders an individual's paths without the licensee or site names", async () => {
+    const result = await run({ callsign: 'KZZ926' });
+    const data = hit(result);
+    expect(data.license?.licensee).toMatchObject({ name: null, redacted: true });
+    expect(antennaAt(data, 1, 1)?.paths).toEqual([
+      {
+        pathNumber: 1,
+        pathType: 'Fixed Point-to-Point',
+        passiveReceiver: false,
+        receiverCallsign: 'KZZ928',
+        receive: {
+          locationNumber: 2,
+          antennaNumber: 1,
+          latitude: microLat(28),
+          longitude: -(119 + 16 / 60),
+        },
+      },
+    ]);
+    expect(pathLines(result)).toEqual([
+      `- **Path 1** · **Type:** Fixed Point-to-Point · **Passive receiver:** no · **Receiver callsign:** KZZ928 · **Receive:** location 2 (${microLat(28)}, ${-(119 + 16 / 60)}), antenna 1`,
+    ]);
+    const surfaces = `${JSON.stringify(result.structuredContent)}\n${contractText(result)}`;
+    for (const name of ['Pat Q Sample', 'SAMPLE HILL', '3 Sample Rd']) {
+      expect(surfaces).not.toContain(name);
+    }
+  });
+});
+
+describe('incomplete path coverage', () => {
+  let micro: FixtureIndex;
+  beforeAll(async () => {
+    micro = await buildFixtureIndex({ groups: ['micro'] });
+    const store = createUlsStore(join(micro.mirrorDir, micro.generation));
+    (await store.raw()).exec(
+      "INSERT INTO meta (key,value) VALUES ('path_coverage_incomplete','7')",
+    );
+    await store.close();
+    await useIndex(micro.mirrorDir, { services: ['micro'] });
+  });
+  afterAll(async () => {
+    await releaseIndex();
+    await micro.dispose();
+  });
+
+  it('discloses the gap once on both surfaces while the record stays readable', async () => {
+    const result = await run({ callsign: 'KZZ925' });
+    const data = hit(result);
+    expect(data.found).toBe(true);
+    expect(data.notice).toBe(PATH_COVERAGE_NOTICE);
+    const rendered = contractText(result);
+    expect(rendered).toContain(PATH_COVERAGE_NOTICE);
+    expect(rendered.split(PATH_COVERAGE_NOTICE)).toHaveLength(2);
+  });
+
+  it('omits pathTotal and the Paths line, since the generation cannot count paths', async () => {
+    const result = await run({ callsign: 'KZZ925' });
+    expect(hit(result)).not.toHaveProperty('pathTotal');
+    expect(contractText(result)).not.toContain('**Paths:**');
+  });
+});
+
 describe('format()', () => {
   const license: License = {
     usi: '77',
@@ -1461,6 +1728,41 @@ describe('format()', () => {
     for (const [code, label] of Object.entries(ANTENNA_TYPES)) {
       expect(described).toContain(`${code} ${label}`);
     }
+  });
+
+  it('renders a filed path type and receiver callsign as text, on one line', () => {
+    const rendered = formattedText(
+      getLicense.format?.({
+        found: true,
+        license,
+        technicalRetained: true,
+        locations: [
+          {
+            locationNumber: 1,
+            antennas: [
+              {
+                antennaNumber: 2,
+                frequencies: [],
+                paths: [
+                  {
+                    pathNumber: 7,
+                    pathType: 'Fixed\r\nPoint',
+                    receiverCallsign: '[NEW](x)',
+                    receive: { locationNumber: 4, siteCount: 3 },
+                  },
+                ],
+              },
+            ],
+          },
+        ],
+        pathTotal: 1,
+        otherCallsignRecords: [],
+      }),
+    ).split('\n');
+    expect(rendered).toContain('**Paths:** 1');
+    expect(rendered).toContain(
+      '- **Path 7** · **Type:** Fixed Point · **Receiver callsign:** \\[NEW\\](x) · **Receive:** location 4 (3 sites share this number, so no coordinates), antenna not filed',
+    );
   });
 
   it('says "not filed" for a location that filed no coordinates (typical of mobile locations)', () => {

@@ -20,6 +20,7 @@ import {
   decodeLo,
   decodeMf,
   decodeMk,
+  decodePa,
   emissionBandwidthMhz,
   MAX_LINE_LENGTH,
   numberField,
@@ -43,6 +44,7 @@ import {
   lo,
   mf,
   mk,
+  pa,
   record,
 } from '../../fixtures/uls-fixtures.js';
 
@@ -491,5 +493,78 @@ describe('record decoders', () => {
       upperMhz: 2508,
     });
     expect(decodeMf(record('MF', { 2: 1, 8: 2508 }))).toBeNull();
+  });
+
+  describe('decodePa', () => {
+    /** A path line as ULS ships it: the layout's 22 fields plus two empty ones. */
+    const filed = 'PA|9001|||KZZ920||3|1|3|2|1||Fixed Point-to-Point|N|||KZZ930|||||||';
+    const base = { usi: 1, path: 2, txLocation: 1, txAntenna: 4, rxLocation: 5 } as const;
+
+    it('reads a 24-field line at the layout positions', () => {
+      expect(filed.split('|')).toHaveLength(RECORD_FIELD_COUNTS.PA);
+      expect(decodePa(filed)).toEqual({
+        usi: 9001,
+        pathNumber: 3,
+        transmitLocationNumber: 1,
+        transmitAntennaNumber: 3,
+        receiveLocationNumber: 2,
+        receiveAntennaNumber: 1,
+        pathTypeCode: 'Fixed Point-to-Point',
+        passiveReceiver: false,
+        receiverCallsign: 'KZZ930',
+      });
+    });
+
+    it('rejects a line of the published 22-field layout length', () => {
+      expect(decodePa(filed.split('|').slice(0, 22).join('|'))).toBeNull();
+    });
+
+    it('keeps a blank receive antenna, path type, passive flag, and receiver as null', () => {
+      expect(decodePa(pa(base))).toEqual({
+        usi: 1,
+        pathNumber: 2,
+        transmitLocationNumber: 1,
+        transmitAntennaNumber: 4,
+        receiveLocationNumber: 5,
+        receiveAntennaNumber: null,
+        pathTypeCode: null,
+        passiveReceiver: null,
+        receiverCallsign: null,
+      });
+    });
+
+    it.each([
+      ['Y', true],
+      ['y', true],
+      ['N', false],
+      ['X', null],
+    ] as const)('reads passive receiver %s as %s', (passive, expected) => {
+      expect(decodePa(pa({ ...base, passive }))?.passiveReceiver).toBe(expected);
+    });
+
+    it('keeps the receiver callsign as filed, trimmed', () => {
+      expect(decodePa(pa({ ...base, receiver: ' NEW CALL ' }))?.receiverCallsign).toBe('NEW CALL');
+      expect(decodePa(pa({ ...base, receiver: 'wqid205' }))?.receiverCallsign).toBe('wqid205');
+    });
+
+    it.each([
+      ['USI', 2],
+      ['path number', 7],
+      ['transmit location', 8],
+      ['transmit antenna', 9],
+      ['receive location', 10],
+    ])('rejects a line whose %s is blank or not a number', (_label, position) => {
+      const fields = filed.split('|');
+      for (const value of ['', '3a']) {
+        fields[position - 1] = value;
+        expect(decodePa(fields.join('|'))).toBeNull();
+      }
+    });
+
+    it('rejects a filed receive antenna that is not a number', () => {
+      const fields = filed.split('|');
+      fields[10] = 'R1';
+      expect(decodePa(fields.join('|'))).toBeNull();
+    });
   });
 });

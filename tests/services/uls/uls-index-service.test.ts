@@ -3,13 +3,17 @@
  * the fixture zips: cold-index behavior (not ready, building, failed build, dangling and
  * malformed pointer), stored errors and read failures (an unreadable pointer, a generation
  * that will not open) kept free of the mirror path, readiness and service
- * codes, `searchLicenses`, `getLicense` (from a location offset or number), `findTransmitters`,
+ * codes, `searchLicenses`, `getLicense` (from a location offset or number; the location windows
+ * of records without paths pinned as they were before paths; microwave paths under their transmit
+ * antennas, the 100-path window budget, a daily file's replacement paths, and the path-coverage
+ * mark of a migrated generation), `findTransmitters`,
  * `searchFrequencies` (redaction on and off, site names and addresses included), the ASR
  * registration-number rule, operating areas (location type, radius of operation, and the
  * location type filter), and the switch to a newly published generation.
  * @module tests/services/uls/uls-index-service.test
  */
 
+import { createHash } from 'node:crypto';
 import { chmod, mkdir, rename, rm, writeFile } from 'node:fs/promises';
 import { join } from 'node:path';
 import { JsonRpcErrorCode, McpError } from '@cyanheads/mcp-ts-core/errors';
@@ -27,6 +31,8 @@ import type {
   Band,
   FindTransmittersParams,
   FrequencyAssignment,
+  GetLicenseParams,
+  GetLicenseResult,
   LicenseSummary,
   PageResult,
   SearchFrequenciesParams,
@@ -36,15 +42,25 @@ import type {
 import { radioServiceLabel, UlsIndexService } from '@/services/uls/uls-index-service.js';
 import {
   AREA_SITES_WEEKLY,
+  an,
   BAND_CLASS_WEEKLY,
+  DAILY_MW_MON,
   DAILY_PG_MON,
   DATA_QUALITY_WEEKLY,
+  en,
   FakeIngestClient,
+  type FixtureFile,
+  fr,
+  hd,
   INDIVIDUAL_SITES_WEEKLY,
+  lo,
   MARKET_CODES_WEEKLY,
   MARKET_STATES_WEEKLY,
+  MICRO_WEEKLY,
   PAGING_WEEKLY,
+  pa,
   QUIRKS_WEEKLY,
+  recordsZip,
   sprawlingPagingWeekly,
 } from '../../fixtures/uls-fixtures.js';
 import {
@@ -489,7 +505,7 @@ describe('cold index', () => {
     try {
       const db = await upgraded.raw();
       expect(db.prepare<{ version: number }>('SELECT version FROM schema_version').get()).toEqual({
-        version: 7,
+        version: 8,
       });
       expect(
         db.prepare('SELECT 1 FROM meta WHERE key = ?').get(META_KEYS.rebuildRequired),
@@ -1289,6 +1305,574 @@ describe('getLicense from a location number', () => {
     expect(await byOffset(50)).toMatchObject({ locationOffset: 50, nextLocationOffset: 100 });
     const plain = await service.getLicense({ usi: '7001', maxFrequencies: 100 });
     expect(plain).toMatchObject({ locationOffset: 0, nextLocationOffset: 50 });
+  });
+});
+
+/**
+ * Every location window of a record, from offset 0 along `nextLocationOffset`: one
+ * `[locationOffset, first number, last number, locations, sitesShown, nextLocationOffset]` row per
+ * window, and a digest of each window's whole result without the two path counts, which must be 0
+ * on a record that files no paths. The record must carry no `paths` anywhere.
+ */
+async function licenseWindows(service: UlsIndexService, usi: string, maxFrequencies: number) {
+  const rows: (number | undefined)[][] = [];
+  const digests: string[] = [];
+  let offset: number | undefined = 0;
+  while (offset !== undefined) {
+    const result = await service.getLicense({ usi, maxFrequencies, locationOffset: offset });
+    if (!result.found) throw new Error(`Expected USI ${usi}.`);
+    const { pathTotal, pathsShown, ...rest } = result as typeof result & {
+      pathTotal?: number;
+      pathsShown?: number;
+    };
+    expect(pathTotal ?? 0).toBe(0);
+    expect(pathsShown ?? 0).toBe(0);
+    const json = JSON.stringify(rest);
+    expect(json).not.toContain('"paths"');
+    digests.push(createHash('sha256').update(json).digest('hex').slice(0, 16));
+    rows.push([
+      result.locationOffset,
+      result.locations[0]?.locationNumber,
+      result.locations.at(-1)?.locationNumber,
+      result.locations.length,
+      result.sitesShown,
+      result.nextLocationOffset,
+    ]);
+    offset = result.nextLocationOffset;
+  }
+  return { rows, digests };
+}
+
+describe('location windows of records that file no paths', () => {
+  let sitesBound: FixtureIndex;
+  let antennasBound: FixtureIndex;
+  let micro: FixtureIndex;
+  beforeAll(async () => {
+    sitesBound = await buildFixtureIndex({
+      groups: ['paging'],
+      weekly: {
+        paging: sprawlingPagingWeekly({
+          locations: 60,
+          sitesAtFirst: 3,
+          antennasPerLocation: 1,
+          leases: 0,
+        }),
+      },
+    });
+    antennasBound = await buildFixtureIndex({
+      groups: ['paging'],
+      weekly: {
+        paging: sprawlingPagingWeekly({
+          locations: 41,
+          sitesAtFirst: 70,
+          antennasPerLocation: 3,
+          leases: 0,
+        }),
+      },
+    });
+    micro = await buildFixtureIndex({ groups: ['micro'] });
+  });
+  afterAll(async () => {
+    await Promise.all([sitesBound?.dispose(), antennasBound?.dispose(), micro?.dispose()]);
+  });
+
+  it('lists every window of the fixture records as it did before paths', async () => {
+    const store = createUlsStore(join(fixture.mirrorDir, fixture.generation));
+    let all: string[];
+    try {
+      all = (await store.raw())
+        .prepare<{ usi: number }>('SELECT usi FROM licenses ORDER BY usi')
+        .all()
+        .map((row) => String(row.usi));
+    } finally {
+      await store.close();
+    }
+    const seen: Record<string, unknown> = {};
+    for (const usi of all) {
+      seen[usi] = await licenseWindows(on, usi, 100);
+      seen[`${usi}/off`] = await licenseWindows(off, usi, 2);
+    }
+    seen['sites/7001'] = await licenseWindows(sitesBound.service(), '7001', 100);
+    seen['sites/7001/cap'] = await licenseWindows(sitesBound.service(), '7001', 30);
+    seen['antennas/7001'] = await licenseWindows(antennasBound.service(), '7001', 100);
+    seen['micro/9006'] = await licenseWindows(micro.service(), '9006', 100);
+    seen['micro/9008'] = await licenseWindows(micro.service(), '9008', 100);
+    expect(seen).toEqual(WINDOWS_BEFORE_PATHS);
+  });
+});
+
+/**
+ * The windows {@link licenseWindows} read from the code before paths were listed, on both
+ * runtimes: every fixture record with redaction on (100 frequency rows) and off (2 rows), the
+ * site-bound and antenna-bound sprawls (the first at 30 rows too), and the microwave fixture's
+ * pathless live record KZZ925 and cancelled KZZ927.
+ */
+const WINDOWS_BEFORE_PATHS = {
+  '1001': { rows: [[0, 1, 2, 2, 2, undefined]], digests: ['84fcfa47c06e392e'] },
+  '1002': { rows: [[0, undefined, undefined, 0, 0, undefined]], digests: ['ba2586ae38da81f9'] },
+  '1003': { rows: [[0, 1, 1, 1, 1, undefined]], digests: ['62ec9e7ec8d283bf'] },
+  '1005': { rows: [[0, undefined, undefined, 0, 0, undefined]], digests: ['5550b518da8b2c52'] },
+  '1006': { rows: [[0, 1, 1, 1, 1, undefined]], digests: ['c1296e5eb25f76fc'] },
+  '1007': { rows: [[0, 1, 1, 1, 1, undefined]], digests: ['fd2a8be7ace0094a'] },
+  '1008': { rows: [[0, 1, 1, 1, 1, undefined]], digests: ['6292dbae4f69bf0c'] },
+  '1009': { rows: [[0, 1, 1, 1, 1, undefined]], digests: ['deede79fb91b2ae0'] },
+  '2001': { rows: [[0, 1, 2, 2, 2, undefined]], digests: ['c5a6192bf207a695'] },
+  '2002': { rows: [[0, undefined, undefined, 0, 0, undefined]], digests: ['82b094aae5683725'] },
+  '2003': { rows: [[0, undefined, undefined, 0, 0, undefined]], digests: ['adb7229d6de4e218'] },
+  '2004': { rows: [[0, undefined, undefined, 0, 0, undefined]], digests: ['53ea29390b7fc875'] },
+  '2005': { rows: [[0, 1, 1, 1, 1, undefined]], digests: ['6f07c7df0e023a4a'] },
+  '2006': { rows: [[0, undefined, undefined, 0, 0, undefined]], digests: ['de2979e8a7b9a89f'] },
+  '2007': { rows: [[0, undefined, undefined, 0, 0, undefined]], digests: ['e8b0a6ec3688d452'] },
+  '2008': { rows: [[0, undefined, undefined, 0, 0, undefined]], digests: ['323c16b3f750b13f'] },
+  '3001': { rows: [[0, undefined, undefined, 0, 0, undefined]], digests: ['6b4b653c6b9633b2'] },
+  '3002': { rows: [[0, undefined, undefined, 0, 0, undefined]], digests: ['36326d1dfa63509c'] },
+  '3003': { rows: [[0, undefined, undefined, 0, 0, undefined]], digests: ['30ca50027fd2002b'] },
+  '1001/off': { rows: [[0, 1, 2, 2, 2, undefined]], digests: ['a7083aa364943835'] },
+  '1002/off': { rows: [[0, undefined, undefined, 0, 0, undefined]], digests: ['ba2586ae38da81f9'] },
+  '1003/off': { rows: [[0, 1, 1, 1, 1, undefined]], digests: ['380397e7920856ee'] },
+  '1005/off': { rows: [[0, undefined, undefined, 0, 0, undefined]], digests: ['5550b518da8b2c52'] },
+  '1006/off': { rows: [[0, 1, 1, 1, 1, undefined]], digests: ['c1296e5eb25f76fc'] },
+  '1007/off': { rows: [[0, 1, 1, 1, 1, undefined]], digests: ['fd2a8be7ace0094a'] },
+  '1008/off': { rows: [[0, 1, 1, 1, 1, undefined]], digests: ['6292dbae4f69bf0c'] },
+  '1009/off': { rows: [[0, 1, 1, 1, 1, undefined]], digests: ['deede79fb91b2ae0'] },
+  '2001/off': { rows: [[0, 1, 2, 2, 2, undefined]], digests: ['c5a6192bf207a695'] },
+  '2002/off': { rows: [[0, undefined, undefined, 0, 0, undefined]], digests: ['82b094aae5683725'] },
+  '2003/off': { rows: [[0, undefined, undefined, 0, 0, undefined]], digests: ['adb7229d6de4e218'] },
+  '2004/off': { rows: [[0, undefined, undefined, 0, 0, undefined]], digests: ['53ea29390b7fc875'] },
+  '2005/off': { rows: [[0, 1, 1, 1, 1, undefined]], digests: ['6f07c7df0e023a4a'] },
+  '2006/off': { rows: [[0, undefined, undefined, 0, 0, undefined]], digests: ['de2979e8a7b9a89f'] },
+  '2007/off': { rows: [[0, undefined, undefined, 0, 0, undefined]], digests: ['e8b0a6ec3688d452'] },
+  '2008/off': { rows: [[0, undefined, undefined, 0, 0, undefined]], digests: ['323c16b3f750b13f'] },
+  '3001/off': { rows: [[0, undefined, undefined, 0, 0, undefined]], digests: ['815c8c4ba494539e'] },
+  '3002/off': { rows: [[0, undefined, undefined, 0, 0, undefined]], digests: ['e093f645439f477d'] },
+  '3003/off': { rows: [[0, undefined, undefined, 0, 0, undefined]], digests: ['a07d193167319ec8'] },
+  'sites/7001': {
+    rows: [
+      [0, 1, 48, 48, 50, 48],
+      [48, 49, 60, 12, 12, undefined],
+    ],
+    digests: ['1392e45f7c6fcaa4', '325493c77a4e1237'],
+  },
+  'sites/7001/cap': {
+    rows: [
+      [0, 1, 48, 48, 50, 48],
+      [48, 49, 60, 12, 12, undefined],
+    ],
+    digests: ['7f2e8984e5315ab8', '325493c77a4e1237'],
+  },
+  'antennas/7001': {
+    rows: [
+      [0, 1, 1, 1, 70, 1],
+      [1, 2, 34, 33, 33, 34],
+      [34, 35, 41, 7, 7, undefined],
+    ],
+    digests: ['1b9361c09bf479c8', 'fe09fd14ead36cbb', 'a59d0bd2eda9f467'],
+  },
+  'micro/9006': { rows: [[0, 1, 1, 1, 1, undefined]], digests: ['a4cfe486c412f77d'] },
+  'micro/9008': {
+    rows: [[0, undefined, undefined, 0, 0, undefined]],
+    digests: ['fb5f24a70c8e3e34'],
+  },
+};
+
+/** A found `getLicense` result, or the test fails. */
+function found(result: GetLicenseResult): Extract<GetLicenseResult, { found: true }> {
+  if (!result.found) throw new Error('Expected a record.');
+  return result;
+}
+
+/** The antenna entry numbered `antenna` at location `location` of a result's window. */
+function antennaAt(result: GetLicenseResult, location: number, antenna: number) {
+  return found(result)
+    .locations.find((entry) => entry.locationNumber === location)
+    ?.antennas.find((entry) => entry.antennaNumber === antenna);
+}
+
+/** `[location, antenna, path numbers]` for every antenna of a window that lists paths. */
+const pathsByAntenna = (result: GetLicenseResult) =>
+  found(result).locations.flatMap((location) =>
+    location.antennas
+      .filter((antenna) => antenna.paths)
+      .map((antenna) => [
+        location.locationNumber,
+        antenna.antennaNumber,
+        antenna.paths?.map((path) => path.pathNumber),
+      ]),
+  );
+
+/** Coordinates of a microwave fixture site at `34-<minute>-0 N 119-<minute>-0 W`. */
+const microSite = (minute: number) => ({
+  latitude: dms(34, minute, 0),
+  longitude: dms(119, minute, 0, true),
+});
+
+/** Every key a listed path or its receive end may carry: none is a name. */
+const PATH_KEYS = new Set([
+  'pathNumber',
+  'pathType',
+  'passiveReceiver',
+  'receiverCallsign',
+  'receive',
+]);
+const RECEIVE_KEYS = new Set([
+  'locationNumber',
+  'antennaNumber',
+  'antennaFiled',
+  'latitude',
+  'longitude',
+  'siteCount',
+]);
+
+/**
+ * KZZ950 (USI 9101, MG): transmit locations 1–3, one antenna and frequency row each, filing 60,
+ * 40, and 1 paths from antenna 1 (path numbers 1–101) to receive location 4 antenna 1. Four sites
+ * and four antennas stay far under their budgets, so only the path budget can split the window:
+ * 60 + 40 is exactly 100, and location 3's path would be the 101st.
+ */
+function pathBudgetWeekly(): FixtureFile {
+  const usi = 9101;
+  const site = (number: number) =>
+    lo({
+      usi,
+      number,
+      type: 'F',
+      locationClass: number === 4 ? 'R' : 'T',
+      lat: [34, number, 0, 'N'],
+      lon: [119, number, 0, 'W'],
+    });
+  const zip = recordsZip('Sun Sep 27 09:39:09 EDT 2026', {
+    HD: [hd({ usi, callsign: 'KZZ950', status: 'A', service: 'MG', grant: '01/01/2020' })],
+    EN: [en({ usi, name: 'Path Budget Links Co', state: 'CA', applicantType: 'C' })],
+    LO: [1, 2, 3, 4].map(site),
+    AN: [1, 2, 3, 4].map((location) =>
+      an({ usi, antenna: 1, location, type: location === 4 ? 'R' : 'T' }),
+    ),
+    FR: [1, 2, 3].map((location) =>
+      fr({ usi, location, antenna: 1, seq: 1, stationClass: 'FXO', frequency: 6000 + location }),
+    ),
+    PA: [
+      ...Array.from({ length: 60 }, (_, i) => [1, i + 1]),
+      ...Array.from({ length: 40 }, (_, i) => [2, i + 61]),
+      [3, 101],
+    ].map(([txLocation = 0, path = 0]) =>
+      pa({
+        usi,
+        path,
+        txLocation,
+        txAntenna: 1,
+        rxLocation: 4,
+        rxAntenna: 1,
+        pathType: 'Fixed Point-to-Point',
+        passive: 'N',
+      }),
+    ),
+  });
+  return {
+    countsCreated: MICRO_WEEKLY.countsCreated,
+    lastModified: MICRO_WEEKLY.lastModified,
+    zip,
+  };
+}
+
+describe('getLicense microwave paths', () => {
+  let micro: FixtureIndex;
+  let service: UlsIndexService;
+  let open: UlsIndexService;
+  beforeAll(async () => {
+    micro = await buildFixtureIndex({ groups: ['micro'] });
+    service = micro.service();
+    open = micro.service({ redactIndividuals: false });
+  });
+  afterAll(async () => {
+    await micro?.dispose();
+  });
+  const license = (
+    usi: string,
+    extra: Partial<{ locationOffset: number; locationNumber: number }> = {},
+  ) => service.getLicense({ usi, maxFrequencies: 1000, ...extra } as GetLicenseParams);
+
+  it('lists each path under its transmit antenna, with the receive site this license files', async () => {
+    const result = found(await service.getLicense({ callsign: 'KZZ920', maxFrequencies: 100 }));
+    expect(result).toMatchObject({ pathTotal: 10, pathsShown: 10, locationTotal: 7 });
+    expect(result).not.toHaveProperty('pathCoverageIncomplete');
+    expect(antennaAt(result, 1, 3)?.paths).toEqual([
+      {
+        pathNumber: 3,
+        pathType: 'Fixed Point-to-Point',
+        passiveReceiver: false,
+        receiverCallsign: 'KZZ930',
+        receive: { locationNumber: 2, antennaNumber: 1, ...microSite(22) },
+      },
+    ]);
+    expect(
+      found(result).locations[0]?.antennas.map((antenna) => [
+        antenna.antennaNumber,
+        antenna.frequencies.length,
+        antenna.paths?.map((path) => [
+          path.pathNumber,
+          path.receive.locationNumber,
+          path.receiverCallsign,
+        ]),
+      ]),
+    ).toEqual([
+      [3, 1, [[3, 2, 'KZZ930']]],
+      [4, 1, [[4, 3, 'KZZ931']]],
+      [5, 1, [[5, 4, undefined]]],
+      [6, 1, [[6, 5, 'KZZ933']]],
+      [7, 1, [[7, 6, undefined]]],
+      [9, 1, [[9, 7, 'KZZ935']]],
+      [10, 1, [[10, 2, undefined]]],
+      [11, 1, [[11, 3, 'KZZ937']]],
+      [15, 1, [[15, 4, undefined]]],
+      [16, 1, [[16, 5, 'KZZ939']]],
+    ]);
+    // Receive antennas transmit nothing.
+    const receivers = result.locations.slice(1).flatMap((location) => location.antennas);
+    expect(receivers).toHaveLength(6);
+    for (const antenna of receivers) expect(antenna).not.toHaveProperty('paths');
+  });
+
+  it('keeps unjoined endpoints as filed, duplicate path numbers in filing order, and bare transmit antennas', async () => {
+    const result = found(await license('9002'));
+    expect(result).toMatchObject({ pathTotal: 6, pathsShown: 6, locationTotal: 2 });
+    expect(pathsByAntenna(result)).toEqual([
+      [1, 1, [1, 2, 6]],
+      [1, 2, [2]],
+      [1, 8, [5]],
+      [1, 9, [4]],
+    ]);
+    const receiveSite = microSite(31);
+    expect(antennaAt(result, 1, 1)?.paths).toEqual([
+      {
+        pathNumber: 1,
+        pathType: 'Fixed Point-to-Point',
+        passiveReceiver: false,
+        receive: { locationNumber: 3, antennaNumber: 2, antennaFiled: false, siteCount: 0 },
+      },
+      { pathNumber: 2, pathType: 'Area', receive: { locationNumber: 2, ...receiveSite } },
+      {
+        pathNumber: 6,
+        pathType: 'Fixed Point-to-Point',
+        passiveReceiver: false,
+        receive: { locationNumber: 2, antennaNumber: 7, antennaFiled: false, ...receiveSite },
+      },
+    ]);
+    expect(antennaAt(result, 1, 2)?.paths).toEqual([
+      {
+        pathNumber: 2,
+        pathType: 'Fixed Point-to-Point',
+        passiveReceiver: true,
+        receiverCallsign: 'KZZ920',
+        receive: { locationNumber: 2, antennaNumber: 1, ...receiveSite },
+      },
+    ]);
+    // Antenna 8 files no AN or FR row: a bare entry carries its path.
+    expect(antennaAt(result, 1, 8)).toEqual({
+      antennaNumber: 8,
+      frequencies: [],
+      paths: [
+        {
+          pathNumber: 5,
+          pathType: 'Fixed Point-to-Point',
+          passiveReceiver: false,
+          receive: { locationNumber: 2, antennaNumber: 1, ...receiveSite },
+        },
+      ],
+    });
+    // Antenna 9 files only a frequency row.
+    expect(antennaAt(result, 1, 9)).toMatchObject({
+      antennaNumber: 9,
+      frequencies: [{ frequencyMhz: 6100 }],
+      paths: [{ pathNumber: 4 }],
+    });
+    expect(found(result).locations[0]?.antennas.map((antenna) => antenna.antennaNumber)).toEqual([
+      1, 2, 8, 9,
+    ]);
+  });
+
+  it('gives a receive number filed at several sites its site count and no coordinates, and an invalid site neither', async () => {
+    const result = found(await license('9003'));
+    expect(antennaAt(result, 1, 1)?.paths).toEqual([
+      {
+        pathNumber: 17,
+        pathType: 'Fixed Point-to-Point',
+        passiveReceiver: false,
+        receiverCallsign: 'KZZ931',
+        receive: { locationNumber: 2, antennaNumber: 1, siteCount: 2 },
+      },
+      {
+        pathNumber: 18,
+        pathType: 'Fixed Point-to-Point',
+        passiveReceiver: false,
+        receive: { locationNumber: 3, antennaNumber: 1 },
+      },
+    ]);
+  });
+
+  it('pages paths spread over locations with the window, counting every path in pathTotal', async () => {
+    const first = found(await license('9004'));
+    expect(first).toMatchObject({ pathTotal: 120, pathsShown: 80, nextLocationOffset: 2 });
+    expect(first.locations.map((location) => location.locationNumber)).toEqual([1, 2]);
+    expect(pathsByAntenna(first)).toHaveLength(80);
+    expect(antennaAt(first, 2, 40)?.paths?.map((path) => path.pathNumber)).toEqual([80]);
+    const second = found(await license('9004', { locationOffset: 2 }));
+    expect(second).toMatchObject({ pathTotal: 120, pathsShown: 40, locationOffset: 2 });
+    expect(second).not.toHaveProperty('nextLocationOffset');
+    expect(second.locations.map((location) => location.locationNumber)).toEqual([3, 10]);
+    expect(antennaAt(second, 3, 1)?.paths?.map((path) => path.pathNumber)).toEqual([81]);
+  });
+
+  it('lists a location with more than 100 paths alone and whole', async () => {
+    const first = found(await license('9005'));
+    expect(first).toMatchObject({ pathTotal: 103, pathsShown: 103, nextLocationOffset: 1 });
+    expect(first.locations.map((location) => location.locationNumber)).toEqual([1]);
+    const listed = first.locations[0]?.antennas.flatMap((antenna) => antenna.paths ?? []);
+    expect(listed?.map((path) => path.pathNumber)).toEqual(
+      Array.from({ length: 103 }, (_, i) => i + 1),
+    );
+    expect(listed?.[102]?.receive).toEqual({
+      locationNumber: 3,
+      antennaNumber: 1,
+      ...microSite(3),
+    });
+    const rest = found(await license('9005', { locationOffset: 1 }));
+    expect(rest).toMatchObject({ pathTotal: 103, pathsShown: 0, locationOffset: 1 });
+    expect(rest.locations.map((location) => location.locationNumber)).toEqual([2, 3, 4]);
+  });
+
+  it('carries no paths on a live license that files none or a non-live one', async () => {
+    const pathless = found(await license('9006'));
+    expect(pathless).toMatchObject({ pathTotal: 0, pathsShown: 0 });
+    expect(pathless.locations[0]?.antennas).toHaveLength(1);
+    expect(pathless.locations[0]?.antennas[0]).not.toHaveProperty('paths');
+    expect(found(await license('9008'))).toMatchObject({
+      technicalRetained: false,
+      locations: [],
+      pathTotal: 0,
+      pathsShown: 0,
+    });
+  });
+
+  it("lists a redacted individual's paths with no name on them", async () => {
+    const result = found(await license('9007'));
+    expect(result.license.licensee).toMatchObject({ name: null, redacted: true });
+    expect(result.pathTotal).toBe(1);
+    const paths = antennaAt(result, 1, 1)?.paths ?? [];
+    expect(paths).toEqual([
+      {
+        pathNumber: 1,
+        pathType: 'Fixed Point-to-Point',
+        passiveReceiver: false,
+        receiverCallsign: 'KZZ928',
+        receive: {
+          locationNumber: 2,
+          antennaNumber: 1,
+          latitude: dms(34, 28, 0),
+          longitude: dms(119, 16, 0, true),
+        },
+      },
+    ]);
+    for (const path of paths) {
+      for (const key of Object.keys(path)) expect(PATH_KEYS).toContain(key);
+      for (const key of Object.keys(path.receive)) expect(RECEIVE_KEYS).toContain(key);
+    }
+    const json = JSON.stringify(result);
+    for (const name of ['Pat Q Sample', 'SAMPLE HILL', '3 Sample Rd'])
+      expect(json).not.toContain(name);
+    // The names are in the data: redaction, not their absence, keeps them out.
+    const unredacted = JSON.stringify(
+      found(await open.getLicense({ usi: '9007', maxFrequencies: 100 })),
+    );
+    for (const name of ['Pat Q Sample', 'SAMPLE HILL', '3 Sample Rd'])
+      expect(unredacted).toContain(name);
+  });
+
+  it('stops the window before the 101st path when sites and antennas leave room', async () => {
+    const budget = await buildFixtureIndex({
+      groups: ['micro'],
+      weekly: { micro: pathBudgetWeekly() },
+    });
+    try {
+      const paths = budget.service();
+      const first = found(await paths.getLicense({ usi: '9101', maxFrequencies: 100 }));
+      expect(first).toMatchObject({
+        pathTotal: 101,
+        pathsShown: 100,
+        sitesShown: 2,
+        locationTotal: 4,
+        nextLocationOffset: 2,
+      });
+      expect(first.locations.map((location) => location.locationNumber)).toEqual([1, 2]);
+      const second = found(
+        await paths.getLicense({ usi: '9101', maxFrequencies: 100, locationNumber: 3 }),
+      );
+      expect(second).toMatchObject({ pathTotal: 101, pathsShown: 1, locationOffset: 2 });
+      expect(second).not.toHaveProperty('nextLocationOffset');
+      expect(pathsByAntenna(second)).toEqual([[3, 1, [101]]]);
+    } finally {
+      await budget.dispose();
+    }
+  });
+});
+
+describe('microwave paths across a daily file and a pre-path generation', () => {
+  it('serves the paths a daily file replaced, and none for a license it cancelled', async () => {
+    const daily = await buildFixtureIndex({
+      groups: ['micro'],
+      daily: { 'l_mw_mon.zip': DAILY_MW_MON },
+    });
+    try {
+      const service = daily.service();
+      const ridgeline = found(await service.getLicense({ usi: '9001', maxFrequencies: 100 }));
+      expect(ridgeline).toMatchObject({ pathTotal: 2, pathsShown: 2 });
+      expect(pathsByAntenna(ridgeline)).toEqual([
+        [1, 3, [3]],
+        [1, 4, [4]],
+      ]);
+      expect(antennaAt(ridgeline, 1, 3)?.paths?.[0]?.receiverCallsign).toBe('KZZ940');
+      expect(found(await service.getLicense({ usi: '9002', maxFrequencies: 100 }))).toMatchObject({
+        technicalRetained: false,
+        pathTotal: 0,
+      });
+      expect(
+        pathsByAntenna(found(await service.getLicense({ usi: '9009', maxFrequencies: 100 }))),
+      ).toEqual([[1, 1, [1]]]);
+      expect((await service.coverage()).index).not.toHaveProperty('pathCoverageIncomplete');
+    } finally {
+      await daily.dispose();
+    }
+  });
+
+  it('discloses incomplete path coverage on a generation migrated from before paths, until a rebuild', async () => {
+    const { mirror, service } = await coldService();
+    const ingester = fixtureIngester(mirror, {
+      client: new FakeIngestClient().withWeekly(['micro']),
+      groups: ['micro'],
+    });
+    const { generation } = await ingester.rebuild();
+    const v7 = createUlsStore(join(mirror.mirrorDir, generation));
+    try {
+      // The schema 7 layout: no paths table.
+      (await v7.raw()).exec(
+        'DROP INDEX paths_key; DROP TABLE paths; UPDATE schema_version SET version = 7;',
+      );
+    } finally {
+      await v7.close();
+    }
+
+    expect((await service.coverage()).index).toMatchObject({
+      ready: true,
+      pathCoverageIncomplete: true,
+    });
+    const migrated = found(await service.getLicense({ usi: '9001', maxFrequencies: 100 }));
+    expect(migrated).toMatchObject({ pathCoverageIncomplete: true, pathTotal: 0, pathsShown: 0 });
+    expect(pathsByAntenna(migrated)).toEqual([]);
+
+    await ingester.rebuild();
+    expect((await service.coverage()).index).not.toHaveProperty('pathCoverageIncomplete');
+    const rebuilt = found(await service.getLicense({ usi: '9001', maxFrequencies: 100 }));
+    expect(rebuilt).not.toHaveProperty('pathCoverageIncomplete');
+    expect(rebuilt.pathTotal).toBe(10);
   });
 });
 

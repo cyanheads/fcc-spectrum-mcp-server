@@ -267,6 +267,33 @@ export function mf(v: { usi: number; partition?: number; lower: number; upper?: 
   return record('MF', { 2: v.usi, 6: v.partition, 7: v.lower, 8: v.upper });
 }
 
+/** PA — microwave path from a transmit location and antenna to a receive location and antenna. */
+export function pa(v: {
+  usi: number;
+  callsign?: string;
+  path: number;
+  txLocation: number;
+  txAntenna: number;
+  rxLocation: number;
+  rxAntenna?: number;
+  pathType?: string;
+  passive?: string;
+  receiver?: string;
+}): string {
+  return record('PA', {
+    2: v.usi,
+    5: v.callsign,
+    7: v.path,
+    8: v.txLocation,
+    9: v.txAntenna,
+    10: v.rxLocation,
+    11: v.rxAntenna,
+    13: v.pathType,
+    14: v.passive,
+    17: v.receiver,
+  });
+}
+
 /** A `.dat` body: CRLF line endings, as ULS ships them. */
 export function datFile(lines: readonly string[]): string {
   return lines.map((line) => `${line}\r\n`).join('');
@@ -946,8 +973,8 @@ export const DAILY_PG_MON: FixtureFile = {
   ]),
 };
 
-/** Monday's market daily: the lease 2002 and its parent 2001 re-sent whole. */
-export const DAILY_MK_MON: FixtureFile = {
+/** Monday's BRS/EBS (`mi`) daily: the lease 2002 and its parent 2001 re-sent whole. */
+export const DAILY_MI_MON: FixtureFile = {
   countsCreated: '2026-09-28T12:02:00Z',
   lastModified: '2026-09-28T12:02:03Z',
   zip: buildZip([
@@ -1071,6 +1098,40 @@ export const DAILY_PG_TUE: FixtureFile = {
   lastModified: '2026-09-29T12:00:07Z',
   zip: buildZip([{ name: 'counts', data: countsFile('Tue Sep 29 08:00:05 EDT 2026') }]),
 };
+
+const WEEKDAY_NAMES = ['Sun', 'Mon', 'Tue', 'Wed', 'Thu', 'Fri', 'Sat'];
+const MONTH_NAMES = [
+  'Jan',
+  'Feb',
+  'Mar',
+  'Apr',
+  'May',
+  'Jun',
+  'Jul',
+  'Aug',
+  'Sep',
+  'Oct',
+  'Nov',
+  'Dec',
+];
+
+/** The `counts` creation header ULS writes for a UTC time in summer (`Mon Sep 28 08:00:05 EDT 2026`). */
+export function edtCreated(iso: string): string {
+  const local = new Date(Date.parse(iso) - 4 * 60 * 60 * 1000);
+  const clock = [local.getUTCHours(), local.getUTCMinutes(), local.getUTCSeconds()]
+    .map((part) => String(part).padStart(2, '0'))
+    .join(':');
+  return `${WEEKDAY_NAMES[local.getUTCDay()]} ${MONTH_NAMES[local.getUTCMonth()]} ${local.getUTCDate()} ${clock} EDT ${local.getUTCFullYear()}`;
+}
+
+/** An empty daily file (`counts` only) created at `countsCreated` (UTC), served 2 s later. */
+export function emptyDaily(countsCreated: string): FixtureFile {
+  return {
+    countsCreated,
+    lastModified: new Date(Date.parse(countsCreated) + 2000).toISOString().replace('.000Z', 'Z'),
+    zip: buildZip([{ name: 'counts', data: countsFile(edtCreated(countsCreated)) }]),
+  };
+}
 
 /** Sunday's paging daily, created before the weekly snapshot: never applied. */
 export const DAILY_PG_SUN: FixtureFile = {
@@ -2097,11 +2158,479 @@ export const MARKET_CODES_WEEKLY: FixtureFile = {
   ]),
 };
 
+/** One microwave license of {@link MICRO_WEEKLY} or {@link DAILY_MW_MON}, as its record lines. */
+interface MicroLicense {
+  antennas: string[];
+  callsign: string;
+  frequencies: string[];
+  individual?: boolean;
+  name: string;
+  paths: string[];
+  service: 'CF' | 'MG';
+  sites: string[];
+  status: string;
+  usi: number;
+}
+
+/** A microwave site: transmit (`T`) or receive (`R`) class, at `lat` N `lon` W in whole minutes. */
+const microSite = (usi: number, number: number, locationClass: 'R' | 'T', minute: number) =>
+  lo({
+    usi,
+    number,
+    type: 'F',
+    locationClass,
+    lat: [34, minute % 60, 0, 'N'],
+    lon: [119, minute % 60, 0, 'W'],
+    name: `SITE ${usi}-${number}`,
+  });
+
+/** Transmit antennas `numbers` at `location`, each with one 6 GHz frequency row. */
+function microTransmitters(usi: number, location: number, numbers: readonly number[]) {
+  return {
+    antennas: numbers.map((antenna) => an({ usi, antenna, location, type: 'T', azimuth: antenna })),
+    frequencies: numbers.map((antenna) =>
+      fr({
+        usi,
+        location,
+        antenna,
+        seq: 1,
+        stationClass: 'FXO',
+        frequency: (5925 + location + antenna / 100).toFixed(2),
+      }),
+    ),
+  };
+}
+
+/** One receive antenna, number 1, at each of `locations`. */
+const microReceivers = (usi: number, locations: readonly number[]) =>
+  locations.map((location) => an({ usi, antenna: 1, location, type: 'R' }));
+
+/** Path numbers `1…count`. */
+const numbered = (count: number) => Array.from({ length: count }, (_, i) => i + 1);
+
+/**
+ * KZZ920 (USI 9001, CF), the active owner of `SITE 9001-1` (location 1, transmit) and
+ * `SITE 9001-2`…`-7` (receive): ten transmit antennas (3, 4, 5, 6, 7, 9, 10, 11, 15, 16) at
+ * location 1, each a frequency row, and those of `paths` that it files — each path numbered as
+ * its antenna, to receive antenna 1 at location `2 + index % 6` (index in that antenna list).
+ * Path 3 runs from antenna 3 to location 2 and names `receiverOfPath3`; paths 4, 6, 9, 11, and 16
+ * (odd indexes) name `KZZ93<index>`, the rest no receiver. All are `Fixed Point-to-Point`, passive
+ * `N`.
+ */
+function ridgelineLicense(paths: readonly number[], receiverOfPath3: string): MicroLicense {
+  const usi = 9001;
+  const transmit = microTransmitters(usi, 1, [3, 4, 5, 6, 7, 9, 10, 11, 15, 16]);
+  return {
+    usi,
+    callsign: 'KZZ920',
+    service: 'CF',
+    status: 'A',
+    name: 'Ridgeline Microwave Co',
+    sites: [
+      microSite(usi, 1, 'T', 10),
+      ...[2, 3, 4, 5, 6, 7].map((n) => microSite(usi, n, 'R', 20 + n)),
+    ],
+    antennas: [...transmit.antennas, ...microReceivers(usi, [2, 3, 4, 5, 6, 7])],
+    frequencies: transmit.frequencies,
+    paths: [3, 4, 5, 6, 7, 9, 10, 11, 15, 16].flatMap((path, i) =>
+      paths.includes(path)
+        ? [
+            pa({
+              usi,
+              callsign: 'KZZ920',
+              path,
+              txLocation: 1,
+              txAntenna: path,
+              rxLocation: 2 + (i % 6),
+              rxAntenna: 1,
+              pathType: 'Fixed Point-to-Point',
+              passive: 'N',
+              ...(path === 3
+                ? { receiver: receiverOfPath3 }
+                : i % 2
+                  ? { receiver: `KZZ93${i}` }
+                  : {}),
+            }),
+          ]
+        : [],
+    ),
+  };
+}
+
+/** The microwave licenses of {@link MICRO_WEEKLY}; see its description. */
+function microLicenses(): MicroLicense[] {
+  const unjoined = microTransmitters(9002, 1, [1, 2]);
+  const spread = [1, 2, 3].map((location) => microTransmitters(9004, location, numbered(40)));
+  const dense = microTransmitters(9005, 1, numbered(103));
+  return [
+    ridgelineLicense([3, 4, 5, 6, 7, 9, 10, 11, 15, 16], 'KZZ930'),
+    {
+      usi: 9002,
+      callsign: 'KZZ921',
+      service: 'MG',
+      status: 'A',
+      name: 'Unjoined Links LLC',
+      sites: [microSite(9002, 1, 'T', 30), microSite(9002, 2, 'R', 31)],
+      antennas: [...unjoined.antennas, ...microReceivers(9002, [2])],
+      frequencies: [
+        ...unjoined.frequencies,
+        fr({ usi: 9002, location: 1, antenna: 9, seq: 1, stationClass: 'FXO', frequency: 6100 }),
+      ],
+      paths: [
+        // Receive location 3 has no LO row, and its antenna 2 no AN row.
+        pa({
+          usi: 9002,
+          path: 1,
+          txLocation: 1,
+          txAntenna: 1,
+          rxLocation: 3,
+          rxAntenna: 2,
+          pathType: 'Fixed Point-to-Point',
+          passive: 'N',
+        }),
+        // A blank receive antenna, and path number 2 filed twice.
+        pa({ usi: 9002, path: 2, txLocation: 1, txAntenna: 1, rxLocation: 2, pathType: 'Area' }),
+        pa({
+          usi: 9002,
+          path: 2,
+          txLocation: 1,
+          txAntenna: 2,
+          rxLocation: 2,
+          rxAntenna: 1,
+          pathType: 'Fixed Point-to-Point',
+          passive: 'Y',
+          receiver: 'KZZ920',
+        }),
+        // Transmit antenna 9 files only a frequency row, antenna 8 nothing at all.
+        pa({
+          usi: 9002,
+          path: 4,
+          txLocation: 1,
+          txAntenna: 9,
+          rxLocation: 2,
+          rxAntenna: 1,
+          pathType: 'Fixed Point-to-Point',
+          passive: 'N',
+        }),
+        pa({
+          usi: 9002,
+          path: 5,
+          txLocation: 1,
+          txAntenna: 8,
+          rxLocation: 2,
+          rxAntenna: 1,
+          pathType: 'Fixed Point-to-Point',
+          passive: 'N',
+        }),
+        // Receive location 2 is filed, its antenna 7 is not.
+        pa({
+          usi: 9002,
+          path: 6,
+          txLocation: 1,
+          txAntenna: 1,
+          rxLocation: 2,
+          rxAntenna: 7,
+          pathType: 'Fixed Point-to-Point',
+          passive: 'N',
+        }),
+      ],
+    },
+    {
+      usi: 9003,
+      callsign: 'KZZ922',
+      service: 'MG',
+      status: 'A',
+      name: 'Shared Receive Sites Inc',
+      sites: [
+        microSite(9003, 1, 'T', 40),
+        microSite(9003, 2, 'R', 41),
+        microSite(9003, 2, 'R', 42),
+        lo({
+          usi: 9003,
+          number: 3,
+          type: 'F',
+          locationClass: 'R',
+          lat: [0, 0, 0, 'N'],
+          lon: [0, 0, 0, 'W'],
+        }),
+      ],
+      antennas: [
+        an({ usi: 9003, antenna: 1, location: 1, type: 'T' }),
+        ...microReceivers(9003, [2, 3]),
+      ],
+      frequencies: [
+        fr({ usi: 9003, location: 1, antenna: 1, seq: 1, stationClass: 'FXO', frequency: 6200 }),
+      ],
+      paths: [
+        pa({
+          usi: 9003,
+          path: 17,
+          txLocation: 1,
+          txAntenna: 1,
+          rxLocation: 2,
+          rxAntenna: 1,
+          pathType: 'Fixed Point-to-Point',
+          passive: 'N',
+          receiver: 'KZZ931',
+        }),
+        pa({
+          usi: 9003,
+          path: 18,
+          txLocation: 1,
+          txAntenna: 1,
+          rxLocation: 3,
+          rxAntenna: 1,
+          pathType: 'Fixed Point-to-Point',
+          passive: 'N',
+        }),
+      ],
+    },
+    {
+      usi: 9004,
+      callsign: 'KZZ923',
+      service: 'MG',
+      status: 'A',
+      name: 'Spread Backhaul Co',
+      sites: [
+        ...[1, 2, 3].map((n) => microSite(9004, n, 'T', 50 + n)),
+        microSite(9004, 10, 'R', 59),
+      ],
+      antennas: [...spread.flatMap((location) => location.antennas), ...microReceivers(9004, [10])],
+      frequencies: spread.flatMap((location) => location.frequencies),
+      paths: [1, 2, 3].flatMap((location) =>
+        numbered(40).map((antenna) =>
+          pa({
+            usi: 9004,
+            path: (location - 1) * 40 + antenna,
+            txLocation: location,
+            txAntenna: antenna,
+            rxLocation: 10,
+            rxAntenna: 1,
+            pathType: 'Fixed Point-to-Point',
+            passive: 'N',
+          }),
+        ),
+      ),
+    },
+    {
+      usi: 9005,
+      callsign: 'KZZ924',
+      service: 'MG',
+      status: 'A',
+      name: 'Dense Hub Networks',
+      sites: [microSite(9005, 1, 'T', 0), ...[2, 3, 4].map((n) => microSite(9005, n, 'R', n))],
+      antennas: [...dense.antennas, ...microReceivers(9005, [2, 3, 4])],
+      frequencies: dense.frequencies,
+      paths: numbered(103).map((antenna) =>
+        pa({
+          usi: 9005,
+          path: antenna,
+          txLocation: 1,
+          txAntenna: antenna,
+          rxLocation: 2 + (antenna % 3),
+          rxAntenna: 1,
+          pathType: 'Fixed Point-to-Point',
+          passive: 'N',
+        }),
+      ),
+    },
+    {
+      usi: 9006,
+      callsign: 'KZZ925',
+      service: 'MG',
+      status: 'A',
+      name: 'Pathless Fixed Co',
+      sites: [microSite(9006, 1, 'T', 5)],
+      antennas: [an({ usi: 9006, antenna: 1, location: 1, type: 'T' })],
+      frequencies: [
+        fr({ usi: 9006, location: 1, antenna: 1, seq: 1, stationClass: 'FXO', frequency: 6300 }),
+      ],
+      paths: [],
+    },
+    {
+      usi: 9007,
+      callsign: 'KZZ926',
+      service: 'MG',
+      status: 'A',
+      name: 'Pat Q Sample',
+      individual: true,
+      sites: [
+        lo({
+          usi: 9007,
+          number: 1,
+          type: 'F',
+          locationClass: 'T',
+          address: '3 Sample Rd',
+          city: 'OJAI',
+          state: 'CA',
+          lat: [34, 27, 0, 'N'],
+          lon: [119, 15, 0, 'W'],
+          name: 'Pat Q Sample',
+        }),
+        lo({
+          usi: 9007,
+          number: 2,
+          type: 'F',
+          locationClass: 'R',
+          lat: [34, 28, 0, 'N'],
+          lon: [119, 16, 0, 'W'],
+          name: 'SAMPLE HILL',
+        }),
+      ],
+      antennas: [
+        an({ usi: 9007, antenna: 1, location: 1, type: 'T' }),
+        ...microReceivers(9007, [2]),
+      ],
+      frequencies: [
+        fr({ usi: 9007, location: 1, antenna: 1, seq: 1, stationClass: 'FXO', frequency: 6400 }),
+      ],
+      paths: [
+        pa({
+          usi: 9007,
+          path: 1,
+          txLocation: 1,
+          txAntenna: 1,
+          rxLocation: 2,
+          rxAntenna: 1,
+          pathType: 'Fixed Point-to-Point',
+          passive: 'N',
+          receiver: 'KZZ928',
+        }),
+      ],
+    },
+    {
+      usi: 9008,
+      callsign: 'KZZ927',
+      service: 'MG',
+      status: 'C',
+      name: 'Retired Links Co',
+      sites: [microSite(9008, 1, 'T', 6), microSite(9008, 2, 'R', 7)],
+      antennas: [
+        an({ usi: 9008, antenna: 1, location: 1, type: 'T' }),
+        ...microReceivers(9008, [2]),
+      ],
+      frequencies: [
+        fr({ usi: 9008, location: 1, antenna: 1, seq: 1, stationClass: 'FXO', frequency: 6500 }),
+      ],
+      paths: [
+        pa({
+          usi: 9008,
+          path: 1,
+          txLocation: 1,
+          txAntenna: 1,
+          rxLocation: 2,
+          rxAntenna: 1,
+          pathType: 'Fixed Point-to-Point',
+          passive: 'N',
+        }),
+      ],
+    },
+  ];
+}
+
+/** A zip holding each record type's `lines` as `<TYPE>.dat`, with a matching `counts` file. */
+export function recordsZip(created: string, lines: Record<string, readonly string[]>): Buffer {
+  const counts = Object.fromEntries(
+    Object.entries(lines).map(([type, rows]) => [type, rows.length]),
+  );
+  return buildZip([
+    { name: 'counts', data: countsFile(created, counts) },
+    ...Object.entries(lines).map(([type, rows]) => ({ name: `${type}.dat`, data: datFile(rows) })),
+  ]);
+}
+
+/** A zip holding `licenses` as HD, EN, LO, AN, FR, and PA records, with a matching `counts` file. */
+function microZip(created: string, licenses: readonly MicroLicense[]): Buffer {
+  return recordsZip(created, {
+    HD: licenses.map((l) =>
+      hd({
+        usi: l.usi,
+        callsign: l.callsign,
+        status: l.status,
+        service: l.service,
+        grant: '01/01/2020',
+      }),
+    ),
+    EN: licenses.map((l) =>
+      en({ usi: l.usi, name: l.name, state: 'CA', applicantType: l.individual ? 'I' : 'C' }),
+    ),
+    LO: licenses.flatMap((l) => l.sites),
+    AN: licenses.flatMap((l) => l.antennas),
+    FR: licenses.flatMap((l) => l.frequencies),
+    PA: licenses.flatMap((l) => l.paths),
+  });
+}
+
+/**
+ * Weekly microwave snapshot of filed paths (PA), USIs 9001–9008, every license but the last
+ * active. KZZ920 (9001, CF) files ten paths ({@link ridgelineLicense}). KZZ921 (9002) files
+ * paths that do not join: path 1 to receive location 3 (no LO row) antenna 2 (no AN row), path
+ * 2 twice — to location 2 with a blank receive antenna (`Area`, blank passive flag) and from
+ * antenna 2 to location 2 antenna 1 (passive `Y`, receiver KZZ920) — path 4 from transmit
+ * antenna 9 (a frequency row, no AN row), path 5 from transmit antenna 8 (neither), and path 6 to
+ * location 2's unfiled antenna 7. KZZ922 (9003) files path 17 to location 2, filed at two
+ * sites, receiver KZZ931, and path 18 to location 3, whose coordinates are the 0-0-0
+ * placeholder. KZZ923 (9004) files 120 paths, 40 from each of transmit locations 1–3 (antennas
+ * 1–40, path `(location − 1) × 40 + antenna`), all to location 10 antenna 1. KZZ924 (9005) files
+ * 103 paths from 103 antennas at location 1 to locations 2–4. KZZ925 (9006) is live and files no
+ * path. KZZ926 (9007) is an individual's (Pat Q Sample, applicant type I), with path 1 to
+ * location 2 (`SAMPLE HILL`), receiver KZZ928. KZZ927 (9008) is cancelled and files one path.
+ * Every transmit antenna that files an AN row has one frequency row; receive antennas have none.
+ */
+export const MICRO_WEEKLY: FixtureFile = {
+  countsCreated: '2026-09-27T13:39:09Z',
+  lastModified: '2026-09-27T13:40:15Z',
+  zip: microZip('Sun Sep 27 09:39:09 EDT 2026', microLicenses()),
+};
+
+/**
+ * Monday's microwave daily: KZZ920 (9001) re-sent whole with only paths 3 (now naming receiver
+ * KZZ940) and 4; KZZ921 (9002) cancelled, re-sent with its paths; and the new active KZZ929
+ * (USI 9009, MG) with one path, from location 1 antenna 1 to location 2 antenna 1.
+ */
+export const DAILY_MW_MON: FixtureFile = {
+  countsCreated: '2026-09-28T12:03:00Z',
+  lastModified: '2026-09-28T12:03:02Z',
+  zip: microZip('Mon Sep 28 08:03:00 EDT 2026', [
+    ridgelineLicense([3, 4], 'KZZ940'),
+    { ...(microLicenses()[1] as MicroLicense), status: 'C' },
+    {
+      usi: 9009,
+      callsign: 'KZZ929',
+      service: 'MG',
+      status: 'A',
+      name: 'Fresh Links Co',
+      sites: [microSite(9009, 1, 'T', 11), microSite(9009, 2, 'R', 12)],
+      antennas: [
+        an({ usi: 9009, antenna: 1, location: 1, type: 'T' }),
+        ...microReceivers(9009, [2]),
+      ],
+      frequencies: [
+        fr({ usi: 9009, location: 1, antenna: 1, seq: 1, stationClass: 'FXO', frequency: 6600 }),
+      ],
+      paths: [
+        pa({
+          usi: 9009,
+          path: 1,
+          txLocation: 1,
+          txAntenna: 1,
+          rxLocation: 2,
+          rxAntenna: 1,
+          pathType: 'Fixed Point-to-Point',
+          passive: 'N',
+        }),
+      ],
+    },
+  ]),
+};
+
 /** The fixture weekly snapshot of each group. */
 export const WEEKLY_FIXTURES = {
   paging: PAGING_WEEKLY,
   mdsitfs: MDSITFS_WEEKLY,
   amat: AMAT_WEEKLY,
+  market: MARKET_CODES_WEEKLY,
+  micro: MICRO_WEEKLY,
 } as const;
 
 // --- Fake bulk client --------------------------------------------------------------------

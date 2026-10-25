@@ -1,6 +1,7 @@
 /**
  * @fileoverview Tests for `fcc_spectrum_list_reference`: vocabulary topics and coverage on a
- * cold, a malformed-pointer, and a warm index, the radio-service filter, input validation and
+ * cold, a malformed-pointer, and a warm index (with incomplete antenna or path coverage), the
+ * radio-service filter, input validation and
  * both surfaces through `runToolContract`, and `format()` keeping registry text out of inline
  * markdown slots.
  * @module tests/tools/list-reference.tool.test
@@ -14,7 +15,7 @@ import { afterAll, beforeAll, describe, expect, it } from 'vitest';
 import { listReference } from '@/mcp-server/tools/definitions/list-reference.tool.js';
 import { LICENSE_STATUSES, RADIO_SERVICES } from '@/services/uls/codes.js';
 import { createUlsStore, LOCK_FILE, POINTER_FILE } from '@/services/uls/schema.js';
-import { initUlsIndexService } from '@/services/uls/uls-index-service.js';
+import { initUlsIndexService, PATH_COVERAGE_NOTICE } from '@/services/uls/uls-index-service.js';
 import {
   buildFixtureIndex,
   FIXTURE_GROUPS,
@@ -291,6 +292,7 @@ describe('warm index', () => {
     });
     expect(result.redactIndividuals).toBe(true);
     expect(enrichment.notice).toBeUndefined();
+    expect(result.index).not.toHaveProperty('pathCoverageIncomplete');
   });
 
   it('discloses an unused warm coverage filter without altering readiness', async () => {
@@ -439,6 +441,36 @@ describe('incomplete antenna coverage', () => {
     expect(text(result)).toContain('mirror:init');
     expect(text(result)).toContain('filter was not applied');
     expect(text(result).match(/daily refresh restores only licenses it replaces/g)).toHaveLength(1);
+  });
+});
+
+describe('incomplete path coverage', () => {
+  let fixture: FixtureIndex;
+  let service: ReturnType<typeof useIndex>;
+  beforeAll(async () => {
+    fixture = await buildFixtureIndex();
+    const store = createUlsStore(join(fixture.mirrorDir, fixture.generation));
+    (await store.raw()).exec(
+      "INSERT INTO meta (key,value) VALUES ('path_coverage_incomplete','7')",
+    );
+    await store.close();
+    service = useIndex(fixture.mirrorDir);
+  });
+  afterAll(async () => {
+    await service.close();
+    await fixture.dispose();
+  });
+  it('keeps ready true and renders the marker and rebuild recovery on both surfaces', async () => {
+    const result = await runToolContract(listReference, { topic: 'coverage' });
+    expect(result.structuredContent).toMatchObject({
+      index: { ready: true, pathCoverageIncomplete: true },
+      notice: PATH_COVERAGE_NOTICE,
+    });
+    expect(result.structuredContent).not.toHaveProperty('index.antennaCoverageIncomplete');
+    const rendered = text(result);
+    expect(rendered.split('\n')).toContain('**Path coverage incomplete:** Yes.');
+    expect(rendered).not.toContain('Antenna coverage incomplete');
+    expect(rendered.split(PATH_COVERAGE_NOTICE)).toHaveLength(2);
   });
 });
 

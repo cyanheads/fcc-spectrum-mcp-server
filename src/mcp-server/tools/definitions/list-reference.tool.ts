@@ -19,7 +19,11 @@ import {
   STATION_CLASSES,
   toEntries,
 } from '@/services/uls/codes.js';
-import { ANTENNA_COVERAGE_NOTICE, getUlsIndexService } from '@/services/uls/uls-index-service.js';
+import {
+  ANTENNA_COVERAGE_NOTICE,
+  getUlsIndexService,
+  PATH_COVERAGE_NOTICE,
+} from '@/services/uls/uls-index-service.js';
 
 const TOPICS = [
   'radio_services',
@@ -80,6 +84,12 @@ const IndexStateSchema = z
       .optional()
       .describe(
         'True when earlier decoding discarded unnumbered antenna records; searches remain available, but a complete weekly rebuild is needed.',
+      ),
+    pathCoverageIncomplete: z
+      .boolean()
+      .optional()
+      .describe(
+        'True when the generation was built before microwave paths were indexed, so a license can list no paths it files; searches remain available, but a complete weekly rebuild is needed.',
       ),
     status: z
       .enum(['none', 'building', 'ready'])
@@ -193,7 +203,7 @@ export const listReference = tool('fcc_spectrum_list_reference', {
       .string()
       .optional()
       .describe(
-        'Guidance when a filter matched nothing, was not applied, or the index is not built yet.',
+        'Guidance when a filter matched nothing, was not applied, the index is not built yet, or its antenna or path coverage needs a full rebuild.',
       ),
   },
 
@@ -221,6 +231,7 @@ export const listReference = tool('fcc_spectrum_list_reference', {
           'filter applies to topics "radio_services" and "station_classes" only; filter was not applied to coverage.',
         );
       if (coverage.index.antennaCoverageIncomplete) notices.push(ANTENNA_COVERAGE_NOTICE);
+      if (coverage.index.pathCoverageIncomplete) notices.push(PATH_COVERAGE_NOTICE);
       if (!coverage.index.ready) {
         notices.push(
           `The local ULS index has not been ${coverage.index.status === 'building' ? 'published yet (a build is running)' : 'built yet'}, so the search tools cannot answer; an operator must run the mirror:init script once. Configured service groups: ${index.services.join(', ')}.`,
@@ -301,6 +312,7 @@ export const listReference = tool('fcc_spectrum_list_reference', {
       if (index.lastDailyApplied) lines.push(`**Last daily applied:** ${index.lastDailyApplied}`);
       if (index.dataAsOf) lines.push(`**Data as of:** ${index.dataAsOf}`);
       if (index.antennaCoverageIncomplete) lines.push('**Antenna coverage incomplete:** Yes.');
+      if (index.pathCoverageIncomplete) lines.push('**Path coverage incomplete:** Yes.');
       if (index.error) {
         lines.push('**Last error:**', ...index.error.split(/\r?\n/).map((line) => `> ${line}`));
       }

@@ -1,7 +1,7 @@
 /**
  * @fileoverview Tests for the bundled ULS code tables: radio service, status, and USPS
- * vocabularies, the full-state-name lookup, the weekly service groups, `toEntries`, and
- * `codeLabel`.
+ * vocabularies, the full-state-name lookup, the weekly service groups and their daily file
+ * codes, `toEntries`, and `codeLabel`.
  * @module tests/services/uls/codes.test
  */
 
@@ -10,7 +10,9 @@ import {
   ANTENNA_TYPES,
   APPLICANT_TYPES,
   codeLabel,
+  DAILY_CODE_GROUPS,
   DEFAULT_SERVICE_GROUPS,
+  dailyFileCode,
   LICENSE_STATUSES,
   LOCATION_TYPES,
   OPERATOR_CLASSES,
@@ -125,6 +127,44 @@ describe('SERVICE_GROUPS', () => {
       expect(DEFAULT_SERVICE_GROUPS).not.toContain(group);
     }
   });
+});
+
+describe('DAILY_CODE_GROUPS', () => {
+  it('gives every weekly group exactly one daily code', () => {
+    for (const group of SERVICE_GROUPS) {
+      const codes = [...DAILY_CODE_GROUPS].filter(([, mapped]) => mapped === group);
+      expect(codes, group).toHaveLength(1);
+    }
+  });
+
+  it('maps fc to frc, which is never indexed, and leaves rb unmapped', () => {
+    expect(DAILY_CODE_GROUPS.get('fc')).toBe('frc');
+    expect(DAILY_CODE_GROUPS.has('rb')).toBe(false);
+    expect(DAILY_CODE_GROUPS.size).toBe(14);
+  });
+
+  it('has no group for a code named like an object member', () => {
+    for (const code of ['constructor', 'toString', '__proto__']) {
+      expect(DAILY_CODE_GROUPS.get(code)).toBeUndefined();
+    }
+  });
+});
+
+describe('dailyFileCode', () => {
+  it.each([
+    ['l_pg_mon.zip', 'pg'],
+    ['L_MW_SAT.ZIP', 'mw'],
+    ['l_rb_sun.zip', 'rb'],
+  ])('%s → %s', (name, code) => {
+    expect(dailyFileCode(name)).toBe(code);
+  });
+
+  it.each(['a_cl_sun.zip', 'l_pg.zip', 'l__mon.zip', 'l_pg_mon_x.zip', 'l_pg_mon.zip.sig'])(
+    '%s has no daily code',
+    (name) => {
+      expect(dailyFileCode(name)).toBeUndefined();
+    },
+  );
 });
 
 describe('toEntries', () => {

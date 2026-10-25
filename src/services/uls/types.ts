@@ -95,6 +95,33 @@ export interface LicenseFrequency {
   upperMhz?: number;
 }
 
+/**
+ * A microwave path (PA record) filed from a transmit antenna, as filed: path numbers are not
+ * unique on a license. The receive end is resolved against this license's own LO and AN records
+ * only; the receiver's license is not read.
+ */
+export interface LicensePath {
+  /** `true` for a passive receiver (`Y`), `false` for `N`; absent when blank. */
+  passiveReceiver?: boolean;
+  pathNumber: number;
+  /** Path type as filed, e.g. `Fixed Point-to-Point`, `Area`. */
+  pathType?: string;
+  receive: {
+    /** Absent when the filing leaves the receive antenna blank. */
+    antennaNumber?: number;
+    /** `false` when `antennaNumber` has no AN record at the receive location on this license. */
+    antennaFiled?: false;
+    /** Only when this license files exactly one site under the number, with valid coordinates. */
+    latitude?: number;
+    locationNumber: number;
+    longitude?: number;
+    /** Sites this license files under the receive number, when not 1: 0 for none, 2+ shared. */
+    siteCount?: number;
+  };
+  /** Receiving station's callsign as filed (trimmed); not normalized or checked. */
+  receiverCallsign?: string;
+}
+
 /** An antenna at a license location, with its frequency rows. */
 export interface LicenseAntenna {
   /** Absent for an independently retained unnumbered AN record. */
@@ -109,6 +136,8 @@ export interface LicenseAntenna {
   heightToTipM?: number;
   make?: string;
   model?: string;
+  /** Paths this antenna transmits on, in filing order; absent when it files none. */
+  paths?: LicensePath[];
   polarization?: string;
   /**
    * AN records filed under this location and antenna number, when more than one; only the
@@ -271,6 +300,15 @@ export type GetLicenseResult =
       /** Offset of the first location number past this window; absent on the last window. */
       nextLocationOffset?: number;
       otherCallsignRecords: { licenseStatus: string; usi: string }[];
+      /**
+       * True on a generation built before paths were indexed: an empty path list there is not
+       * evidence the record files none.
+       */
+      pathCoverageIncomplete?: boolean;
+      /** Paths listed in this window (every path of its locations). */
+      pathsShown: number;
+      /** Paths the record files (0 for a non-live record, whose paths are not kept). */
+      pathTotal: number;
       /** Sites the record files, each site of a shared location number counted. */
       siteTotal: number;
       /** Sites in this window. */
@@ -412,6 +450,8 @@ export interface IndexState {
   generation?: string;
   lastDailyApplied?: string;
   lastFullBuild?: string;
+  /** Nonblocking warning: the generation predates path indexing, so paths need a full rebuild. */
+  pathCoverageIncomplete?: boolean;
   ready: boolean;
   status: 'none' | 'building' | 'ready';
 }

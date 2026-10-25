@@ -20,7 +20,7 @@ import {
 export const MIRROR_NAME = 'fcc-uls';
 
 /** Current store schema version; bump it and add a migration on any schema change. */
-const SCHEMA_VERSION = 7;
+const SCHEMA_VERSION = 8;
 
 /** License statuses whose records keep sites, antennas, frequencies, and market blocks. */
 export const LIVE_STATUSES = ['A', 'L', 'X'] as const;
@@ -66,6 +66,27 @@ export const LICENSE_COLUMNS = {
   is_individual: 'INTEGER NOT NULL DEFAULT 0',
   is_lease: 'INTEGER NOT NULL DEFAULT 0',
 } as const;
+
+/**
+ * Filed microwave paths (PA) of live licenses: one row per filed line, in filing order, keyed
+ * like the other technical tables by the transmit `(usi, location_number)`. `path_number` is
+ * not unique per license; a blank receive antenna, path type, passive-receiver flag (1 `Y`,
+ * 0 `N`), or receiver callsign stays `NULL`. Schema 8 ({@link addPaths}).
+ */
+const PATHS_DDL = `
+CREATE TABLE IF NOT EXISTS paths (
+  usi INTEGER NOT NULL,
+  location_number INTEGER NOT NULL,
+  antenna_number INTEGER NOT NULL,
+  path_number INTEGER NOT NULL,
+  receive_location_number INTEGER NOT NULL,
+  receive_antenna_number INTEGER,
+  path_type TEXT,
+  passive_receiver INTEGER,
+  receiver_callsign TEXT
+);
+CREATE INDEX IF NOT EXISTS paths_key ON paths (usi, location_number);
+`;
 
 /**
  * Auxiliary tables and their indexes. Keys of the upstream-data tables are indexed but
@@ -158,7 +179,7 @@ CREATE TABLE IF NOT EXISTS market_blocks (
 );
 CREATE INDEX IF NOT EXISTS market_blocks_usi ON market_blocks (usi);
 CREATE INDEX IF NOT EXISTS market_blocks_band ON market_blocks (band_class, lower);
-
+${PATHS_DDL}
 CREATE TABLE IF NOT EXISTS service_codes (
   code TEXT PRIMARY KEY NOT NULL,
   service_group TEXT NOT NULL,
@@ -199,6 +220,11 @@ export const META_KEYS = {
   rebuildRequired: 'rebuild_required',
   /** Discarded unnumbered AN records require a full rebuild; ordinary reads remain available. */
   antennaCoverageIncomplete: 'antenna_coverage_incomplete',
+  /**
+   * The generation predates the `paths` table, so licenses it did not refresh since have no PA
+   * rows; a full rebuild clears it, and ordinary reads remain available.
+   */
+  pathCoverageIncomplete: 'path_coverage_incomplete',
 } as const;
 
 /** Per-group counts kept in `meta` under {@link META_KEYS.groupStats}. */
@@ -345,6 +371,23 @@ function repairZeroCoordinates(handle: SqliteHandle): void {
     state_derived = 0 WHERE lat = 0 AND lon = 0;`);
 }
 
+/**
+ * Schema 8: add the `paths` table. A generation that already holds licenses was built without
+ * PA records, so it is marked {@link META_KEYS.pathCoverageIncomplete}; a new database holds no
+ * licenses when its migrations run and takes no mark.
+ */
+function addPaths(handle: SqliteHandle): void {
+  handle.exec(`${PATHS_DDL}
+    INSERT OR REPLACE INTO meta (key, value) SELECT '${META_KEYS.pathCoverageIncomplete}', '8' WHERE EXISTS (SELECT 1 FROM licenses);`);
+}
+
+/** True until a full rebuild has filled the paths of a generation built before schema 8. */
+export function isPathCoverageIncomplete(handle: SqliteHandle): boolean {
+  return Boolean(
+    handle.prepare('SELECT 1 FROM meta WHERE key = ?').get(META_KEYS.pathCoverageIncomplete),
+  );
+}
+
 /** True until a full rebuild has restored AN rows discarded by earlier decoders. */
 export function isAntennaCoverageIncomplete(handle: SqliteHandle): boolean {
   return Boolean(
@@ -380,6 +423,7 @@ export function createUlsStore(path: string): MirrorStore {
       { version: 5, up: addMarketCodeIndex },
       { version: 6, up: allowUnnumberedAntennas },
       { version: 7, up: repairZeroCoordinates },
+      { version: 8, up: addPaths },
     ],
   });
 }

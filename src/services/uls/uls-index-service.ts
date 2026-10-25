@@ -35,6 +35,7 @@ import {
   isAntennaCoverageIncomplete,
   isGenerationFile,
   isMalformedPointer,
+  isPathCoverageIncomplete,
   isProcessAlive,
   isRebuildRequired,
   LIVE_STATUSES,
@@ -57,6 +58,7 @@ import type {
   LicenseDetail,
   LicenseeFields,
   LicenseLocation,
+  LicensePath,
   LicenseSite,
   LicenseSummary,
   LiveStatusFilter,
@@ -116,15 +118,19 @@ const KM_PER_DEGREE = (Math.PI * EARTH_RADIUS_KM) / 180;
 
 /**
  * What one `getLicense` call lists of each repeating section: the location window holds
- * whole locations up to this many sites and antennas (one location larger than either is
- * listed alone), and leases are listed this many at a time. Frequency rows are capped by the
- * caller's `maxFrequencies`.
+ * whole locations up to this many sites, antennas, and transmitted paths (one location larger
+ * than any is listed alone), and leases are listed this many at a time. Frequency rows are
+ * capped by the caller's `maxFrequencies`.
  */
-export const LICENSE_PAGE = { sites: 50, antennas: 100, leases: 100 } as const;
+export const LICENSE_PAGE = { sites: 50, antennas: 100, paths: 100, leases: 100 } as const;
 
 /** Recovery for data discarded by earlier antenna decoders. */
 export const ANTENNA_COVERAGE_NOTICE =
   'Antenna coverage is incomplete: this generation discarded AN records without antenna numbers. An operator must run mirror:init for a complete weekly rebuild; daily refresh restores only licenses it replaces.';
+
+/** Recovery for a generation built before microwave paths were indexed. */
+export const PATH_COVERAGE_NOTICE =
+  'Path coverage is incomplete: this generation was built before microwave path (PA) records were indexed, so a license can list no paths it files. An operator must run mirror:init for a complete weekly rebuild; daily refresh restores only licenses it replaces.';
 
 /** Callsign-prefix candidates offered on a miss. */
 const MAX_CANDIDATES = 5;
@@ -226,6 +232,18 @@ interface FrequencyRow {
   transmitter_make: string | null;
   transmitter_model: string | null;
   upper_mhz: number | null;
+}
+
+/** A `paths` row: one filed PA line, endpoints as filed (blank columns `NULL`). */
+interface PathRow {
+  antenna_number: number;
+  location_number: number;
+  passive_receiver: number | null;
+  path_number: number;
+  path_type: string | null;
+  receive_antenna_number: number | null;
+  receive_location_number: number;
+  receiver_callsign: string | null;
 }
 
 /** The license columns every site and assignment row carries. */
@@ -629,6 +647,67 @@ function siteFields(lo: LocationRow, nameAndAddressVisible: boolean): LicenseSit
   };
 }
 
+/** What a license files at its paths' receive location numbers. */
+interface ReceiveEnds {
+  /** `location:antenna` keys of the numbered AN records filed at those numbers. */
+  antennas: Set<string>;
+  /** Per number: its site count, and the coordinates when it files exactly one site. */
+  sites: Map<number, { count: number; lat: number | null; lon: number | null }>;
+}
+
+/** This license's own LO and AN records at the receive location numbers of `paths`. */
+function receiveEnds(db: SqliteHandle, usi: number, paths: readonly PathRow[]): ReceiveEnds {
+  const numbers = JSON.stringify([...new Set(paths.map((pa) => pa.receive_location_number))]);
+  const inNumbers = 'usi = ? AND location_number IN (SELECT value FROM json_each(?))';
+  const sites = db
+    .prepare<{ count: number; lat: number | null; lon: number | null; n: number }>(
+      `SELECT location_number AS n, count(*) AS count, max(lat) AS lat, max(lon) AS lon
+       FROM locations WHERE ${inNumbers} GROUP BY n`,
+    )
+    .all(usi, numbers);
+  const antennas = db
+    .prepare<{ a: number; n: number }>(
+      `SELECT DISTINCT location_number AS n, antenna_number AS a
+       FROM antennas WHERE ${inNumbers} AND antenna_number IS NOT NULL`,
+    )
+    .all(usi, numbers);
+  return {
+    sites: new Map(sites.map(({ n, ...site }) => [n, site])),
+    antennas: new Set(antennas.map(({ n, a }) => `${n}:${a}`)),
+  };
+}
+
+/**
+ * One path as filed. Its receive end carries coordinates only when the license files exactly
+ * one site under the number and that site's coordinates validated at ingest (both stored), a
+ * `siteCount` when the number is filed at no site or several, and `antennaFiled: false` when a
+ * filed receive antenna number has no AN record there. Nothing is read from the receiver's own
+ * license.
+ */
+function licensePath(pa: PathRow, ends: ReceiveEnds): LicensePath {
+  const site = ends.sites.get(pa.receive_location_number);
+  const siteCount = site?.count ?? 0;
+  const antennaNumber = pa.receive_antenna_number;
+  return {
+    pathNumber: pa.path_number,
+    ...opt('pathType', pa.path_type),
+    ...(pa.passive_receiver !== null && { passiveReceiver: pa.passive_receiver === 1 }),
+    ...opt('receiverCallsign', pa.receiver_callsign),
+    receive: {
+      locationNumber: pa.receive_location_number,
+      ...opt('antennaNumber', antennaNumber),
+      ...(antennaNumber !== null &&
+        !ends.antennas.has(`${pa.receive_location_number}:${antennaNumber}`) && {
+          antennaFiled: false as const,
+        }),
+      ...(siteCount === 1 &&
+        site?.lat != null &&
+        site.lon != null && { latitude: site.lat, longitude: site.lon }),
+      ...(siteCount !== 1 && { siteCount }),
+    },
+  };
+}
+
 /** Read path over the published ULS index generation. */
 export class UlsIndexService {
   private current: OpenGeneration | undefined;
@@ -702,6 +781,7 @@ export class UlsIndexService {
       Object.assign(index, {
         ready: true,
         ...(isAntennaCoverageIncomplete(db) && { antennaCoverageIncomplete: true }),
+        ...(isPathCoverageIncomplete(db) && { pathCoverageIncomplete: true }),
         status: 'ready',
         generation: generation.file,
         lastFullBuild: generation.publishedAt,
@@ -974,7 +1054,7 @@ export class UlsIndexService {
       ? this.locationWindow(db, row.usi, params, params.maxFrequencies)
       : undefined;
     const { locations, shown } = window
-      ? this.licenseLocations(db, row, window.listed, params.maxFrequencies)
+      ? this.licenseLocations(db, row, window.listed, params.maxFrequencies, window.pathsShown > 0)
       : { locations: [], shown: 0 };
     const { license, nextLeaseOffset } = this.licenseDetail(db, row, params.leaseOffset ?? 0);
     return {
@@ -995,6 +1075,9 @@ export class UlsIndexService {
       siteTotal: window?.siteTotal ?? 0,
       sitesShown: window?.sitesShown ?? 0,
       windowFrequencyTotal: window?.windowFrequencyTotal ?? 0,
+      pathTotal: window?.pathTotal ?? 0,
+      pathsShown: window?.pathsShown ?? 0,
+      ...(isPathCoverageIncomplete(db) && { pathCoverageIncomplete: true }),
       ...(window?.nextOffset !== undefined && { nextLocationOffset: window.nextOffset }),
       ...(window?.cutAt && { frequencyCutAt: window.cutAt }),
       ...(nextLeaseOffset !== undefined && { nextLeaseOffset }),
@@ -1005,12 +1088,13 @@ export class UlsIndexService {
    * The window of location numbers one `getLicense` call lists: whole locations from
    * `start.locationOffset`, or from the offset of `start.locationNumber` (the count of the
    * record's numbers below it, so an unfiled number starts at the next filed one), in number
-   * order, until the next would pass {@link LICENSE_PAGE}'s site or antenna budget. The first
-   * location is always listed, so one larger than a budget is listed alone rather than split.
-   * Sites count every site of a shared number; antennas and frequency rows count those
-   * {@link licenseLocations} lists. `listed` holds the window's numbers, in order. `cutAt` is
-   * the first location whose frequency rows `maxFrequencies` drops, since rows are read in
-   * location order.
+   * order, until the next would pass {@link LICENSE_PAGE}'s site, antenna, or path budget. The
+   * first location is always listed, so one larger than a budget is listed alone rather than
+   * split. Sites count every site of a shared number; antennas, frequency rows, and paths count
+   * those {@link licenseLocations} lists, so a path's transmit location and antenna are counted
+   * even when it files no LO, AN, or FR row of its own. A path counts at its transmit location
+   * only. `listed` holds the window's numbers, in order. `cutAt` is the first location whose
+   * frequency rows `maxFrequencies` drops, since rows are read in location order.
    */
   private locationWindow(
     db: SqliteHandle,
@@ -1020,12 +1104,18 @@ export class UlsIndexService {
   ) {
     const summary = new Map<
       number,
-      { antennas: Set<number>; unnumbered: number; frequencies: number; sites: number }
+      {
+        antennas: Set<number>;
+        unnumbered: number;
+        frequencies: number;
+        paths: number;
+        sites: number;
+      }
     >();
     const entry = (number: number) => {
       let counts = summary.get(number);
       if (!counts) {
-        counts = { antennas: new Set(), unnumbered: 0, frequencies: 0, sites: 0 };
+        counts = { antennas: new Set(), unnumbered: 0, frequencies: 0, paths: 0, sites: 0 };
         summary.set(number, counts);
       }
       return counts;
@@ -1055,6 +1145,16 @@ export class UlsIndexService {
       counts.antennas.add(a);
       counts.frequencies += count;
     }
+    for (const { n, a, count } of db
+      .prepare<{ a: number; count: number; n: number }>(
+        `SELECT location_number AS n, antenna_number AS a, count(*) AS count FROM paths
+         WHERE usi = ? GROUP BY n, a`,
+      )
+      .all(usi)) {
+      const counts = entry(n);
+      counts.antennas.add(a);
+      counts.paths += count;
+    }
     const ordered = [...summary].sort(([a], [b]) => a - b);
     const { locationNumber, locationOffset = 0 } = start;
     const offset =
@@ -1066,11 +1166,13 @@ export class UlsIndexService {
     let sites = 0;
     let antennas = 0;
     let frequencies = 0;
+    let paths = 0;
     let cutAt: { locationNumber: number; offset: number } | undefined;
     for (const [number, counts] of ordered.slice(offset)) {
       const over =
         sites + counts.sites > LICENSE_PAGE.sites ||
-        antennas + counts.antennas.size + counts.unnumbered > LICENSE_PAGE.antennas;
+        antennas + counts.antennas.size + counts.unnumbered > LICENSE_PAGE.antennas ||
+        paths + counts.paths > LICENSE_PAGE.paths;
       if (listed.length > 0 && over) break;
       if (!cutAt && frequencies + counts.frequencies > maxFrequencies) {
         cutAt = { locationNumber: number, offset: offset + listed.length };
@@ -1079,6 +1181,7 @@ export class UlsIndexService {
       sites += counts.sites;
       antennas += counts.antennas.size + counts.unnumbered;
       frequencies += counts.frequencies;
+      paths += counts.paths;
     }
     const end = offset + listed.length;
     return {
@@ -1091,6 +1194,8 @@ export class UlsIndexService {
       sitesShown: sites,
       frequencyTotal: ordered.reduce((sum, [, counts]) => sum + counts.frequencies, 0),
       windowFrequencyTotal: frequencies,
+      pathTotal: ordered.reduce((sum, [, counts]) => sum + counts.paths, 0),
+      pathsShown: paths,
       ...(end < ordered.length && { nextOffset: end }),
     };
   }
@@ -1214,12 +1319,16 @@ export class UlsIndexService {
    * no antennas. A location number filed at several sites lists them in `sites`; AN and FR rows
    * carry only the number, so its antennas stay on the entry. Numbered antennas merge AN records
    * filed for them (a field is kept only when every record agrees); unnumbered rows stay independent.
+   * With `withPaths` (the window holds paths), every path filed from the window's locations is
+   * listed under its transmit antenna, in filing order, with its receive end read from this
+   * record's own LO and AN rows ({@link licensePath}).
    */
   private licenseLocations(
     db: SqliteHandle,
     row: LicenseRow,
     listed: readonly number[],
     maxFrequencies: number,
+    withPaths: boolean,
   ): { locations: LicenseLocation[]; shown: number } {
     const first = listed[0];
     const last = listed.at(-1);
@@ -1319,6 +1428,17 @@ export class UlsIndexService {
         ...opt('transmitterModel', fr.transmitter_model),
         emissions: fr.emissions?.split(',') ?? [],
       });
+    }
+    if (withPaths) {
+      const paths = db
+        .prepare<PathRow>(`SELECT * FROM paths WHERE ${inRange} ORDER BY rowid`)
+        .all(...rangeArgs);
+      const ends = receiveEnds(db, row.usi, paths);
+      for (const pa of paths) {
+        const entry = antenna(pa.location_number, pa.antenna_number);
+        entry.paths ??= [];
+        entry.paths.push(licensePath(pa, ends));
+      }
     }
     for (const number of listed) location(number);
     const sorted = [...locations.values()].sort((a, b) => a.locationNumber - b.locationNumber);

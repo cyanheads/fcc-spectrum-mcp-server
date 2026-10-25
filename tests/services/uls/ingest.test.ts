@@ -10,15 +10,17 @@
 import { spawnSync } from 'node:child_process';
 import { existsSync } from 'node:fs';
 import { readdir, readFile, writeFile } from 'node:fs/promises';
-import { join } from 'node:path';
+import { basename, join } from 'node:path';
 import { JsonRpcErrorCode } from '@cyanheads/mcp-ts-core/errors';
 import type { SqliteHandle } from '@cyanheads/mcp-ts-core/mirror';
 import { afterAll, afterEach, beforeAll, describe, expect, it } from 'vitest';
 import { marketStates, type RebuildResult } from '@/services/uls/ingest.js';
 import {
   createUlsStore,
+  isPathCoverageIncomplete,
   LICENSE_COLUMNS,
   LOCK_FILE,
+  META_KEYS,
   POINTER_FILE,
   readPointer,
   writePointer,
@@ -30,16 +32,19 @@ import {
   at,
   buildZip,
   countsFile,
-  DAILY_MK_MON,
+  DAILY_MI_MON,
+  DAILY_MW_MON,
   DAILY_PG_MON,
   DAILY_PG_SUN,
   DAILY_PG_TUE,
   DAILY_WIDE_MON,
   datFile,
+  emptyDaily,
   en,
   FakeIngestClient,
   hd,
   lo,
+  MARKET_CODES_WEEKLY,
   MDSITFS_WEEKLY,
   PAGING_WEEKLY,
 } from '../../fixtures/uls-fixtures.js';
@@ -1023,9 +1028,9 @@ describe('daily refresh', () => {
 
   it('replaces record sets by USI, skips unindexed codes, and keeps lease links whole', async () => {
     const dbPath = await built();
-    client.withDaily({ 'l_mk_mon.zip': DAILY_MK_MON, 'l_pg_mon.zip': DAILY_PG_MON });
+    client.withDaily({ 'l_mi_mon.zip': DAILY_MI_MON, 'l_pg_mon.zip': DAILY_PG_MON });
     const result = await refresh();
-    expect(result.applied).toEqual(['daily/l_pg_mon.zip', 'daily/l_mk_mon.zip']);
+    expect(result.applied).toEqual(['daily/l_pg_mon.zip', 'daily/l_mi_mon.zip']);
     expect(await checkpoint(dbPath)).toBe('2026-09-28T12:02:00Z');
 
     await readDb(dbPath, (db) => {
@@ -1058,7 +1063,8 @@ describe('daily refresh', () => {
           .prepare<{ emissions: string }>('SELECT emissions FROM frequencies WHERE usi = 1100')
           .get()?.emissions,
       ).toBe('11K2F3E');
-      expect(license(1101)).toBeUndefined();
+      // bun:sqlite returns null for no row, better-sqlite3 undefined.
+      expect(license(1101) ?? undefined).toBeUndefined();
       expect(count(db, 'SELECT count(*) AS n FROM locations WHERE usi = 1101')).toBe(0);
       // The untouched expired record with the same callsign is still there.
       expect(license(1005)?.license_status).toBe('E');
@@ -1088,7 +1094,7 @@ describe('daily refresh', () => {
         ),
       ).toEqual([
         {
-          path: 'daily/l_mk_mon.zip',
+          path: 'daily/l_mi_mon.zip',
           kind: 'daily',
           stage: 'complete',
           counts_created: '2026-09-28T12:02:00Z',
@@ -1126,7 +1132,7 @@ describe('daily refresh', () => {
 
   it('skips files already applied or older than the checkpoint on a rerun', async () => {
     await built();
-    client.withDaily({ 'l_pg_mon.zip': DAILY_PG_MON, 'l_mk_mon.zip': DAILY_MK_MON });
+    client.withDaily({ 'l_pg_mon.zip': DAILY_PG_MON, 'l_mi_mon.zip': DAILY_MI_MON });
     await refresh();
     const downloadsBefore = client.calls.filter((call) => call.method === 'download').length;
     const rerun = await refresh();
@@ -1158,17 +1164,17 @@ describe('daily refresh', () => {
     const dbPath = await built();
     client.withDaily({
       'l_pg_tue.zip': DAILY_PG_TUE,
-      'l_mk_mon.zip': DAILY_MK_MON,
+      'l_mi_mon.zip': DAILY_MI_MON,
       'l_pg_mon.zip': DAILY_PG_MON,
     });
-    client.failDownloads.add('daily/l_mk_mon.zip');
+    client.failDownloads.add('daily/l_mi_mon.zip');
     await expect(refresh()).rejects.toMatchObject({ code: JsonRpcErrorCode.ServiceUnavailable });
 
     expect(
       client.calls.filter((call) => call.method === 'download' && call.path?.startsWith('daily/')),
     ).toEqual([
       { method: 'download', path: 'daily/l_pg_mon.zip' },
-      { method: 'download', path: 'daily/l_mk_mon.zip' },
+      { method: 'download', path: 'daily/l_mi_mon.zip' },
     ]);
     expect(await checkpoint(dbPath)).toBe('2026-09-28T12:01:10Z');
     await readDb(dbPath, (db) => {
@@ -1183,8 +1189,8 @@ describe('daily refresh', () => {
 
   it('widens the band bounds with each daily file, so a refresh that stops partway still finds every committed row', async () => {
     const dbPath = await built();
-    client.withDaily({ 'l_mw_mon.zip': DAILY_WIDE_MON, 'l_mk_mon.zip': DAILY_MK_MON });
-    client.failDownloads.add('daily/l_mk_mon.zip');
+    client.withDaily({ 'l_pg_mon.zip': DAILY_WIDE_MON, 'l_mi_mon.zip': DAILY_MI_MON });
+    client.failDownloads.add('daily/l_mi_mon.zip');
     await expect(refresh()).rejects.toMatchObject({ code: JsonRpcErrorCode.ServiceUnavailable });
 
     await readDb(dbPath, (db) => {
@@ -1220,6 +1226,355 @@ describe('daily refresh', () => {
     };
     expect(await usisAt(494)).toEqual(['site:1200']);
     expect(await usisAt(2573)).toEqual(['market:2100']);
+  });
+
+  describe('daily files of groups the generation does not hold', () => {
+    /** Every daily code the ULS listing carries. */
+    const LISTED_CODES = [
+      'ac',
+      'am',
+      'cg',
+      'cl',
+      'fc',
+      'gm',
+      'lb',
+      'lc',
+      'lp',
+      'mi',
+      'mk',
+      'mw',
+      'pg',
+      'rb',
+      'sh',
+    ];
+
+    /** Monday files for `codes`, each created a second after the last, from 12:00:00Z. */
+    const monday = (codes: readonly string[]) =>
+      Object.fromEntries(
+        codes.map((code, i) => [
+          `l_${code}_mon.zip`,
+          emptyDaily(`2026-09-28T12:00:${String(i).padStart(2, '0')}Z`),
+        ]),
+      );
+
+    async function generation(groups: FixtureGroup[]): Promise<string> {
+      mirror = await tempMirror();
+      client = new FakeIngestClient().withWeekly(groups);
+      const result = await fixtureIngester(mirror, { client, groups }).rebuild();
+      return join(mirror.mirrorDir, result.generation);
+    }
+
+    const dailyCalls = (method: 'download' | 'head') =>
+      client.calls
+        .filter((call) => call.method === method && call.path?.startsWith('daily/'))
+        .map((call) => call.path);
+
+    it('skips, before HEAD, every code a paging generation does not hold, keeping pg and the unmapped rb', async () => {
+      const dbPath = await generation(['paging']);
+      client.withDaily(monday(LISTED_CODES));
+      const info: unknown[][] = [];
+      const result = await fixtureIngester(mirror, {
+        client,
+        groups: ['paging'],
+        logger: { info: (...args) => info.push(args) },
+      }).refresh();
+
+      expect(dailyCalls('head')).toEqual(['daily/l_pg_mon.zip', 'daily/l_rb_mon.zip']);
+      expect(dailyCalls('download')).toEqual(['daily/l_pg_mon.zip', 'daily/l_rb_mon.zip']);
+      expect(result.applied).toEqual(['daily/l_pg_mon.zip', 'daily/l_rb_mon.zip']);
+      expect(info).toContainEqual([
+        'Daily files to apply',
+        {
+          count: 2,
+          checkpoint: PAGING_WEEKLY.countsCreated,
+          skipped: 13,
+          skippedCodes: [
+            'ac',
+            'am',
+            'cg',
+            'cl',
+            'fc',
+            'gm',
+            'lb',
+            'lc',
+            'lp',
+            'mi',
+            'mk',
+            'mw',
+            'sh',
+          ],
+        },
+      ]);
+      // The checkpoint is the last applied file's counts time (rb, listed 13th); skipped files
+      // leave no ingest_files row.
+      expect(await checkpoint(dbPath)).toBe('2026-09-28T12:00:13Z');
+      await readDb(dbPath, (db) => {
+        expect(
+          all<{ path: string }>(
+            db,
+            "SELECT path FROM ingest_files WHERE kind = 'daily' ORDER BY path",
+          ).map((row) => row.path),
+        ).toEqual(['daily/l_pg_mon.zip', 'daily/l_rb_mon.zip']);
+      });
+    });
+
+    it.each([
+      ['the generation', ['paging', 'market']],
+      ['a narrower FCC_SPECTRUM_SERVICES', ['paging']],
+    ] as const)(
+      'applies held, unmapped, and unknown codes on a paging,market generation under %s',
+      async (_label, services) => {
+        await generation(['paging', 'market']);
+        client.withDaily(monday(['mk', 'mw', 'pg', 'rb', 'zz']));
+        const result = await fixtureIngester(mirror, { client, groups: services }).refresh();
+        expect(dailyCalls('head')).toEqual([
+          'daily/l_mk_mon.zip',
+          'daily/l_pg_mon.zip',
+          'daily/l_rb_mon.zip',
+          'daily/l_zz_mon.zip',
+        ]);
+        expect(result.applied).toEqual([
+          'daily/l_mk_mon.zip',
+          'daily/l_pg_mon.zip',
+          'daily/l_rb_mon.zip',
+          'daily/l_zz_mon.zip',
+        ]);
+      },
+    );
+
+    it('applies a newly selected group from the rebuild that adds it, back to the weekly checkpoint', async () => {
+      const firstPath = await generation(['paging']);
+      const now = at('2026-10-01T20:00:00Z');
+      const week: Record<string, ReturnType<typeof emptyDaily>> = {};
+      for (const [day, date] of [
+        ['mon', '28'],
+        ['tue', '29'],
+        ['wed', '30'],
+      ] as const) {
+        week[`l_mk_${day}.zip`] = emptyDaily(`2026-09-${date}T12:00:01Z`);
+        week[`l_pg_${day}.zip`] = emptyDaily(`2026-09-${date}T12:00:02Z`);
+      }
+      client.withDaily(week);
+
+      const first = await fixtureIngester(mirror, { client, groups: ['paging'], now }).refresh();
+      expect(first.applied).toEqual([
+        'daily/l_pg_mon.zip',
+        'daily/l_pg_tue.zip',
+        'daily/l_pg_wed.zip',
+      ]);
+      expect(await checkpoint(firstPath)).toBe('2026-09-30T12:00:02Z');
+
+      client.set('complete/l_market.zip', MARKET_CODES_WEEKLY);
+      const both = fixtureIngester(mirror, { client, groups: ['paging', 'market'], now });
+      const rebuilt = await both.rebuild();
+      expect(rebuilt).toMatchObject({
+        status: 'rebuilt',
+        generation: 'fcc-uls-20260927T133855Z-2.db',
+      });
+      const secondPath = join(mirror.mirrorDir, rebuilt.generation);
+      expect(await checkpoint(secondPath)).toBe(PAGING_WEEKLY.countsCreated);
+
+      const second = await both.refresh();
+      expect(second.applied).toEqual([
+        'daily/l_mk_mon.zip',
+        'daily/l_pg_mon.zip',
+        'daily/l_mk_tue.zip',
+        'daily/l_pg_tue.zip',
+        'daily/l_mk_wed.zip',
+        'daily/l_pg_wed.zip',
+      ]);
+      expect(await checkpoint(secondPath)).toBe('2026-09-30T12:00:02Z');
+    });
+  });
+});
+
+describe('microwave paths', () => {
+  interface PathRow {
+    antenna_number: number;
+    location_number: number;
+    passive_receiver: number | null;
+    path_number: number;
+    path_type: string | null;
+    receive_antenna_number: number | null;
+    receive_location_number: number;
+    receiver_callsign: string | null;
+  }
+  const pathsOf = (db: SqliteHandle, usi: number) =>
+    all<PathRow>(
+      db,
+      `SELECT path_number, location_number, antenna_number, receive_location_number,
+         receive_antenna_number, path_type, passive_receiver, receiver_callsign
+       FROM paths WHERE usi = ? ORDER BY rowid`,
+      usi,
+    );
+  const perLicense = (db: SqliteHandle) =>
+    all<{ usi: number; n: number }>(
+      db,
+      'SELECT usi, count(*) AS n FROM paths GROUP BY usi ORDER BY usi',
+    );
+  const WEEKLY_PATHS = [
+    { usi: 9001, n: 10 },
+    { usi: 9002, n: 6 },
+    { usi: 9003, n: 2 },
+    { usi: 9004, n: 120 },
+    { usi: 9005, n: 103 },
+    { usi: 9007, n: 1 },
+  ];
+
+  async function microGeneration() {
+    const mirror = await tempMirror();
+    const client = new FakeIngestClient().withWeekly(['micro']);
+    const info: unknown[][] = [];
+    const ingester = fixtureIngester(mirror, {
+      client,
+      groups: ['micro'],
+      logger: { info: (...args) => info.push(args) },
+    });
+    const { generation } = await ingester.rebuild();
+    return { client, info, ingester, mirror, dbPath: join(mirror.mirrorDir, generation) };
+  }
+
+  it('keeps every PA line of a live license, as filed and in filing order, and none of a cancelled one', async () => {
+    const { dbPath, info } = await microGeneration();
+    await readDb(dbPath, (db) => {
+      expect(perLicense(db)).toEqual(WEEKLY_PATHS);
+      expect(pathsOf(db, 9002)).toEqual([
+        {
+          path_number: 1,
+          location_number: 1,
+          antenna_number: 1,
+          receive_location_number: 3,
+          receive_antenna_number: 2,
+          path_type: 'Fixed Point-to-Point',
+          passive_receiver: 0,
+          receiver_callsign: null,
+        },
+        {
+          path_number: 2,
+          location_number: 1,
+          antenna_number: 1,
+          receive_location_number: 2,
+          receive_antenna_number: null,
+          path_type: 'Area',
+          passive_receiver: null,
+          receiver_callsign: null,
+        },
+        {
+          path_number: 2,
+          location_number: 1,
+          antenna_number: 2,
+          receive_location_number: 2,
+          receive_antenna_number: 1,
+          path_type: 'Fixed Point-to-Point',
+          passive_receiver: 1,
+          receiver_callsign: 'KZZ920',
+        },
+        ...[
+          [4, 9, 1],
+          [5, 8, 1],
+          [6, 1, 7],
+        ].map(([path_number, antenna_number, receive_antenna_number]) => ({
+          path_number,
+          location_number: 1,
+          antenna_number,
+          receive_location_number: 2,
+          receive_antenna_number,
+          path_type: 'Fixed Point-to-Point',
+          passive_receiver: 0,
+          receiver_callsign: null,
+        })),
+      ]);
+      expect(pathsOf(db, 9001)[0]).toMatchObject({
+        path_number: 3,
+        location_number: 1,
+        antenna_number: 3,
+        receive_location_number: 2,
+        receive_antenna_number: 1,
+        receiver_callsign: 'KZZ930',
+      });
+      expect(
+        all(
+          db,
+          'SELECT location_number, count(*) AS n FROM paths WHERE usi = 9004 GROUP BY location_number',
+        ),
+      ).toEqual([
+        { location_number: 1, n: 40 },
+        { location_number: 2, n: 40 },
+        { location_number: 3, n: 40 },
+      ]);
+      expect(stats(db, 'complete/l_micro.zip').PA).toEqual({ read: 243, rejected: 0, kept: 242 });
+    });
+    expect(info).toContainEqual([
+      'Loaded technical records',
+      expect.objectContaining({ group: 'micro', liveLicenses: 7, paths: 242 }),
+    ]);
+  });
+
+  it('replaces a license’s paths with its daily record set and drops a cancelled license’s', async () => {
+    const { client, dbPath, ingester } = await microGeneration();
+    client.withDaily({ 'l_mw_mon.zip': DAILY_MW_MON });
+    expect((await ingester.refresh()).applied).toEqual(['daily/l_mw_mon.zip']);
+    await readDb(dbPath, (db) => {
+      expect(perLicense(db)).toEqual([
+        { usi: 9001, n: 2 },
+        { usi: 9003, n: 2 },
+        { usi: 9004, n: 120 },
+        { usi: 9005, n: 103 },
+        { usi: 9007, n: 1 },
+        { usi: 9009, n: 1 },
+      ]);
+      expect(pathsOf(db, 9001).map((row) => [row.path_number, row.receiver_callsign])).toEqual([
+        [3, 'KZZ940'],
+        [4, 'KZZ931'],
+      ]);
+      expect(count(db, 'SELECT count(*) AS n FROM locations WHERE usi = 9002')).toBe(0);
+    });
+  });
+
+  it('rebuilds a generation from before paths, which a daily file only partly fills, even when the snapshots are unchanged', async () => {
+    const { client, dbPath, info, ingester, mirror } = await microGeneration();
+    const published = basename(dbPath);
+    // The schema 7 layout: no paths table.
+    await readDb(dbPath, (db) =>
+      db.exec('DROP INDEX paths_key; DROP TABLE paths; UPDATE schema_version SET version = 7;'),
+    );
+
+    client.withDaily({ 'l_mw_mon.zip': DAILY_MW_MON });
+    await ingester.refresh();
+    await readDb(dbPath, (db) => {
+      expect(perLicense(db)).toEqual([
+        { usi: 9001, n: 2 },
+        { usi: 9009, n: 1 },
+      ]);
+      expect(isPathCoverageIncomplete(db)).toBe(true);
+    });
+
+    const rebuilt = await ingester.rebuild();
+    expect(rebuilt).toMatchObject({
+      status: 'rebuilt',
+      generation: `${published.slice(0, -3)}-2.db`,
+    });
+    expect(client.downloads('complete/l_micro.zip')).toBe(2);
+    await readDb(join(mirror.mirrorDir, rebuilt.generation), (db) => {
+      expect(perLicense(db)).toEqual(WEEKLY_PATHS);
+      expect(isPathCoverageIncomplete(db)).toBe(false);
+    });
+    expect((await ingester.rebuild()).status).toBe('skipped');
+
+    // The next rebuild targets the primary name again: the marked file is discarded, not resumed.
+    await readDb(join(mirror.mirrorDir, rebuilt.generation), (db) =>
+      db.exec(`INSERT INTO meta (key, value) VALUES ('${META_KEYS.pathCoverageIncomplete}', '8')`),
+    );
+    const again = await ingester.rebuild();
+    expect(again).toMatchObject({ status: 'rebuilt', generation: published });
+    expect(info).toContainEqual([
+      'Discarding a generation an earlier version of this server started; building it afresh.',
+      { generation: published },
+    ]);
+    await readDb(dbPath, (db) => {
+      expect(perLicense(db)).toEqual(WEEKLY_PATHS);
+      expect(isPathCoverageIncomplete(db)).toBe(false);
+    });
   });
 });
 

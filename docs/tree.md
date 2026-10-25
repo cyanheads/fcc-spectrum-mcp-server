@@ -1,6 +1,6 @@
 # fcc-spectrum-mcp-server - Directory Structure
 
-Generated on: 2026-10-13 13:13:45
+Generated on: 2026-10-25 07:55:26
 
 ```text
 fcc-spectrum-mcp-server/
@@ -117,7 +117,6 @@ fcc-spectrum-mcp-server/
 │   └── tool-defs-analysis/
 │       └── SKILL.md
 ├── scripts/
-│   ├── _mirror-context.ts
 │   ├── build-changelog.ts
 │   ├── build-market-states.ts
 │   ├── build-state-boundaries.ts
@@ -130,9 +129,6 @@ fcc-spectrum-mcp-server/
 │   ├── clean-mcpb.ts
 │   ├── clean.ts
 │   ├── devcheck.ts
-│   ├── fcc-mirror-init.ts
-│   ├── fcc-mirror-refresh.ts
-│   ├── fcc-mirror-verify.ts
 │   ├── install-otel.ts
 │   ├── lint-mcp.ts
 │   ├── lint-packaging.ts
@@ -141,6 +137,11 @@ fcc-spectrum-mcp-server/
 │   ├── release-github.ts
 │   └── tree.ts
 ├── src/
+│   ├── cli/
+│   │   ├── mirror-context.ts
+│   │   ├── mirror-init.ts
+│   │   ├── mirror-refresh.ts
+│   │   └── mirror-verify.ts
 │   ├── config/
 │   │   └── server-config.ts
 │   ├── mcp-server/
@@ -179,6 +180,8 @@ fcc-spectrum-mcp-server/
 │   │       └── zip-reader.ts
 │   └── index.ts
 ├── tests/
+│   ├── cli/
+│   │   └── mirror-verify.test.ts
 │   ├── config/
 │   │   └── server-config.test.ts
 │   ├── fixtures/

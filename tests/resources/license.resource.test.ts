@@ -5,7 +5,8 @@
  * record `fcc_spectrum_get_license` returns, the frequency-row counts under its fixed cap of
  * 100, the first page of a large license with the notice naming the call that reads the rest,
  * redaction on and off (site names and addresses included, on shared location numbers too),
- * the ASR registration-number rule, and registry text kept verbatim in the JSON body.
+ * the ASR registration-number rule, registry text kept verbatim in the JSON body, and
+ * microwave paths with `pathTotal`, the path count in the notice, and incomplete path coverage.
  * @module tests/resources/license.resource.test
  */
 
@@ -18,6 +19,7 @@ import { licenseResource } from '@/mcp-server/resources/definitions/license.reso
 import { getLicense } from '@/mcp-server/tools/definitions/get-license.tool.js';
 import { createUlsStore, POINTER_FILE, writePointer } from '@/services/uls/schema.js';
 import type { GetLicenseResult } from '@/services/uls/types.js';
+import { PATH_COVERAGE_NOTICE } from '@/services/uls/uls-index-service.js';
 import { releaseIndex, successOf, useIndex } from '../fixtures/tool-harness.js';
 import {
   dataQualityWeekly,
@@ -44,6 +46,7 @@ type ResourceResult = Pick<
   | 'nextLeaseOffset'
   | 'nextLocationOffset'
   | 'otherCallsignRecords'
+  | 'pathTotal'
   | 'siteTotal'
   | 'technicalRetained'
 > & { dataAsOf: string; notice?: string };
@@ -272,6 +275,7 @@ describe('warm index', () => {
         'locationTotal',
         'locations',
         'otherCallsignRecords',
+        'pathTotal',
         'siteTotal',
         'technicalRetained',
       ]);
@@ -297,6 +301,7 @@ describe('warm index', () => {
         locations: tool.locations,
         locationTotal: tool.locationTotal,
         siteTotal: tool.siteTotal,
+        pathTotal: tool.pathTotal,
         otherCallsignRecords: tool.otherCallsignRecords,
         frequenciesShown: expect.any(Number),
         frequencyTotal: expect.any(Number),
@@ -486,5 +491,64 @@ describe('a large license', () => {
       await runToolContract(getLicense, { callsign: 'KZZ701' } as never),
     );
     expect(result.locations).toEqual(tool.locations);
+  });
+});
+
+describe('microwave paths', () => {
+  let micro: FixtureIndex;
+  beforeAll(async () => {
+    micro = await buildFixtureIndex({ groups: ['micro'] });
+  });
+  beforeEach(async () => {
+    await useIndex(micro.mirrorDir, { services: ['micro'] });
+  });
+  afterAll(async () => {
+    await releaseIndex();
+    await micro.dispose();
+  });
+
+  it.each([
+    ['a license with joined paths', 'KZZ920'],
+    ['unjoined receive ends and a bare transmit antenna', 'KZZ921'],
+    ['an individual licensee', 'KZZ926'],
+  ])('carries the paths fcc_spectrum_get_license lists for %s', async (_label, callsign) => {
+    const resource = await read(callsign);
+    const tool = successOf<ToolOutput>(await runToolContract(getLicense, { callsign } as never));
+    const paths = resource.locations.flatMap((location) =>
+      location.antennas.flatMap((antenna) => antenna.paths ?? []),
+    );
+    expect(paths.length).toBeGreaterThan(0);
+    expect(paths).toHaveLength(resource.pathTotal);
+    expect(resource.pathTotal).toBe(tool.pathTotal);
+    expect(resource.locations).toEqual(tool.locations);
+  });
+
+  it('names the path count in the notice when the first window stops before the rest', async () => {
+    const result = await read('KZZ924');
+    expect(result.locations.map((location) => location.locationNumber)).toEqual([1]);
+    expect(result).toMatchObject({
+      pathTotal: 103,
+      nextLocationOffset: 1,
+      notice:
+        'Lists 1 of 4 locations and 103 of 103 paths; call fcc_spectrum_get_license with usi "9005" and location_offset 1 for the rest. Lists 100 of 103 frequency rows at these locations; call fcc_spectrum_get_license with usi "9005" and a higher max_frequencies (up to 1000) for the rest.',
+    });
+  });
+
+  it('reports pathTotal 0 and no paths for a live license that files none', async () => {
+    const result = await read('KZZ925');
+    expect(result.pathTotal).toBe(0);
+    expect(JSON.stringify(result)).not.toContain('"paths"');
+    expect(result).not.toHaveProperty('notice');
+  });
+
+  it('discloses incomplete path coverage in its JSON notice', async () => {
+    const store = createUlsStore(join(micro.mirrorDir, micro.generation));
+    (await store.raw()).exec(
+      "INSERT INTO meta (key,value) VALUES ('path_coverage_incomplete','7')",
+    );
+    await store.close();
+    const result = await read('KZZ925');
+    expect(result.notice).toBe(PATH_COVERAGE_NOTICE);
+    expect(result).not.toHaveProperty('pathTotal');
   });
 });

@@ -1,7 +1,8 @@
 /**
  * @fileoverview `fcc_spectrum_get_license` — one ULS license or spectrum lease in full, by
- * callsign or USI: licensee, status and dates, locations with antennas and frequency rows
- * (emission designators folded in), market blocks, and lease links in both directions.
+ * callsign or USI: licensee, status and dates, locations with antennas, frequency rows
+ * (emission designators folded in), and the microwave paths each antenna transmits on, market
+ * blocks, and lease links in both directions.
  * @module mcp-server/tools/definitions/get-license
  */
 
@@ -22,6 +23,7 @@ import {
   ANTENNA_COVERAGE_NOTICE,
   getUlsIndexService,
   LICENSE_PAGE,
+  PATH_COVERAGE_NOTICE,
 } from '@/services/uls/uls-index-service.js';
 
 const FrequencySchema = z
@@ -52,6 +54,67 @@ const FrequencySchema = z
   .describe(
     'One authorized frequency row, as filed (adaptive-modulation filings repeat a frequency per step).',
   );
+
+const PathSchema = z
+  .object({
+    pathNumber: z
+      .number()
+      .describe(
+        'Path number as filed; not unique on a license, where a number can be filed more than once.',
+      ),
+    pathType: z
+      .string()
+      .optional()
+      .describe('Path type as filed, e.g. "Fixed Point-to-Point" or "Area"; absent when blank.'),
+    passiveReceiver: z
+      .boolean()
+      .optional()
+      .describe(
+        'True when the filing marks the receiver passive, false when not; absent when blank.',
+      ),
+    receiverCallsign: z
+      .string()
+      .optional()
+      .describe(
+        "Receiving station's callsign as filed, neither normalized nor checked (some filings hold placeholders such as N/A); absent when blank. Pass it as callsign to fcc_spectrum_get_license to try reading the receiving license.",
+      ),
+    receive: z
+      .object({
+        locationNumber: z.number().describe('Location number of the receive end, on this license.'),
+        antennaNumber: z
+          .number()
+          .optional()
+          .describe(
+            'Receive antenna number at that location; absent when the filing leaves it blank.',
+          ),
+        antennaFiled: z
+          .literal(false)
+          .optional()
+          .describe(
+            'false when this license files no antenna record under antennaNumber at the receive location; absent otherwise.',
+          ),
+        latitude: z
+          .number()
+          .optional()
+          .describe(
+            "Receive site latitude, decimal degrees, from this license's own site record; present only when the license files exactly one site under the receive location number and its coordinates validate.",
+          ),
+        longitude: z
+          .number()
+          .optional()
+          .describe('Receive site longitude, decimal degrees; present with latitude.'),
+        siteCount: z
+          .number()
+          .optional()
+          .describe(
+            'Sites this license files under the receive location number, when not exactly one: 0 when it files none, 2 or more when the number is shared, and then no coordinates are given.',
+          ),
+      })
+      .describe(
+        "The receive end, resolved against this license's own location and antenna records; the receiving station's license is not read.",
+      ),
+  })
+  .describe('One microwave path (PA record) this antenna transmits on, as filed.');
 
 const AntennaSchema = z
   .object({
@@ -88,6 +151,12 @@ const AntennaSchema = z
     frequencies: z
       .array(FrequencySchema)
       .describe('Frequency rows on this antenna, in filing order.'),
+    paths: z
+      .array(PathSchema)
+      .optional()
+      .describe(
+        'Microwave paths this antenna transmits on, in filing order; present only on an antenna that transmits on a filed path. An antenna with a path but no antenna or frequency record is listed with only its number, empty frequencies, and paths.',
+      ),
   })
   .describe('One antenna at a location.');
 
@@ -309,7 +378,7 @@ const LicenseSchema = z
 
 export const getLicense = tool('fcc_spectrum_get_license', {
   title: 'Get an FCC ULS license',
-  description: `Fetch one FCC ULS license or spectrum lease in full by callsign or unique system identifier (USI): licensee (the lessee on a lease), status and key dates, its locations with coordinates, elevation, structure height, and ASR number, each location's antennas, and each antenna's authorized frequencies with power, ERP/EIRP, station class, transmitter, and emission designators; geographic-area licenses list their market and spectrum blocks, and lease links are shown in both directions. Large records are paged: one call lists whole locations up to ${LICENSE_PAGE.sites} sites and ${LICENSE_PAGE.antennas} antennas, up to max_frequencies frequency rows, and ${LICENSE_PAGE.leases} leases, and names the location_offset or lease_offset that reads the rest; location_number starts the locations at a location number the search tools return. Technical detail is kept for active, pending-legal, and term-pending records only. A callsign shared by several records returns the active one, else the most recent.`,
+  description: `Fetch one FCC ULS license or spectrum lease in full by callsign or unique system identifier (USI): licensee (the lessee on a lease), status and key dates, its locations with coordinates, elevation, structure height, and ASR number, each location's antennas, each antenna's authorized frequencies with power, ERP/EIRP, station class, transmitter, and emission designators, and the microwave paths it transmits on (receive location and antenna, receive coordinates, receiving callsign); geographic-area licenses list their market and spectrum blocks, and lease links are shown in both directions. Large records are paged: one call lists whole locations up to ${LICENSE_PAGE.sites} sites, ${LICENSE_PAGE.antennas} antennas, and ${LICENSE_PAGE.paths} paths, up to max_frequencies frequency rows, and ${LICENSE_PAGE.leases} leases, and names the location_offset or lease_offset that reads the rest; location_number starts the locations at a location number the search tools return. Technical detail is kept for active, pending-legal, and term-pending records only. A callsign shared by several records returns the active one, else the most recent.`,
   annotations: { readOnlyHint: true, idempotentHint: true, openWorldHint: false },
   input: z.object({
     callsign: blankAsUnset(callsignSchema.optional()).describe(
@@ -384,7 +453,7 @@ export const getLicense = tool('fcc_spectrum_get_license', {
       .array(LocationSchema)
       .optional()
       .describe(
-        `Locations with antennas and frequency rows, one entry per location number (a number filed at several sites lists them in sites): whole locations from location_offset or location_number up to ${LICENSE_PAGE.sites} sites and ${LICENSE_PAGE.antennas} antennas, or one larger location alone; present when found is true.`,
+        `Locations with antennas, frequency rows, and paths, one entry per location number (a number filed at several sites lists them in sites): whole locations from location_offset or location_number up to ${LICENSE_PAGE.sites} sites, ${LICENSE_PAGE.antennas} antennas, and ${LICENSE_PAGE.paths} paths (a path counted at its transmit location), or one larger location alone; present when found is true.`,
       ),
     locationTotal: z
       .number()
@@ -395,6 +464,12 @@ export const getLicense = tool('fcc_spectrum_get_license', {
       .optional()
       .describe(
         'Sites the record files, each site of a shared location number counted; present when found is true.',
+      ),
+    pathTotal: z
+      .number()
+      .optional()
+      .describe(
+        'Microwave paths the record files across all its locations; 0 when technicalRetained is false, since paths are kept only for status A, L, or X. Present when found is true, except on an index built before paths were indexed, where the notice reports the gap.',
       ),
     nextLocationOffset: z
       .number()
@@ -527,8 +602,10 @@ export const getLicense = tool('fcc_spectrum_get_license', {
       `Location ${requested} is not filed on this record; listing from location ${firstListed} (location_offset ${locationOffset}).`;
     const omitted: string[] = [];
     if (result.nextLocationOffset !== undefined) {
+      // The path budget is named only on records that file paths, so others read as before.
+      const withPaths = result.pathTotal > 0;
       omitted.push(
-        `Listing ${locations.length} of ${result.locationTotal} locations (${result.sitesShown} of ${result.siteTotal} sites) from location_offset ${locationOffset}; one call lists at most ${LICENSE_PAGE.sites} sites and ${LICENSE_PAGE.antennas} antennas. Call fcc_spectrum_get_license with usi "${license.usi}" and location_offset ${result.nextLocationOffset} for the next locations.`,
+        `Listing ${locations.length} of ${result.locationTotal} locations (${result.sitesShown} of ${result.siteTotal} sites${withPaths ? `; ${result.pathsShown} of ${result.pathTotal} paths` : ''}) from location_offset ${locationOffset}; one call lists at most ${withPaths ? `${LICENSE_PAGE.sites} sites, ${LICENSE_PAGE.antennas} antennas, and ${LICENSE_PAGE.paths} paths` : `${LICENSE_PAGE.sites} sites and ${LICENSE_PAGE.antennas} antennas`}. Call fcc_spectrum_get_license with usi "${license.usi}" and location_offset ${result.nextLocationOffset} for the next locations.`,
       );
     }
     if (result.windowFrequencyTotal > result.frequenciesShown) {
@@ -566,6 +643,7 @@ export const getLicense = tool('fcc_spectrum_get_license', {
     const notice = [
       clampNotice,
       result.antennaCoverageIncomplete && ANTENNA_COVERAGE_NOTICE,
+      result.pathCoverageIncomplete && PATH_COVERAGE_NOTICE,
       unfiledStart,
       ...omitted,
       ...pastEnd,
@@ -588,6 +666,8 @@ export const getLicense = tool('fcc_spectrum_get_license', {
       locations,
       locationTotal: result.locationTotal,
       siteTotal: result.siteTotal,
+      // A generation built before paths were indexed cannot count them; the notice says so.
+      ...(!result.pathCoverageIncomplete && { pathTotal: result.pathTotal }),
       ...(result.nextLocationOffset !== undefined && {
         nextLocationOffset: result.nextLocationOffset,
       }),
@@ -630,6 +710,11 @@ export const getLicense = tool('fcc_spectrum_get_license', {
           'Sites and frequencies are kept only for active (A), pending-legal (L), and term-pending (X) records, so this record lists none.',
         );
       }
+    }
+    if (result.pathTotal !== undefined) {
+      lines.push(
+        `**Paths:** ${result.pathTotal}${result.technicalRetained === false ? ' (paths are kept only for active, pending-legal, and term-pending records)' : ''}`,
+      );
     }
     if (result.locations) {
       const listed = result.locations.length;
@@ -781,20 +866,43 @@ function locationLines(location: z.infer<typeof LocationSchema>): string[] {
       '',
       `**${heading}**${part('Type', antenna.antennaTypeCode)}${part('Height to tip m', antenna.heightToTipM)}${part('Height to center m', antenna.heightToCenterM)}${part('HAAT m', antenna.haatM)}${part('Azimuth °', antenna.azimuthDeg)}${part('Gain dBi', antenna.gainDbi)}${part('Beamwidth °', antenna.beamwidthDeg)}${part('Polarization', antenna.polarization)}${part('Make', antenna.make && inline(antenna.make))}${part('Model', antenna.model && inline(antenna.model))}${part('Filed records', antenna.recordCount && `${antenna.recordCount} (fields that differ between them are omitted)`)}`,
     );
-    if (!antenna.frequencies.length) continue;
-    lines.push(
-      '',
-      '| Frequency MHz | Upper MHz | Bandwidth MHz | Class | Power W | ERP W | EIRP dBm | Transmitter | Emissions |',
-      '|--------------:|----------:|--------------:|:------|--------:|------:|---------:|:------------|:----------|',
-    );
-    for (const frequency of antenna.frequencies) {
-      const transmitter = [frequency.transmitterMake, frequency.transmitterModel]
-        .filter((value): value is string => Boolean(value))
-        .join(' ');
+    if (antenna.frequencies.length) {
       lines.push(
-        `| ${frequency.frequencyMhz} | ${frequency.upperMhz ?? '—'} | ${frequency.bandwidthMhz ?? '—'} | ${frequency.stationClass ? cell(frequency.stationClass) : '—'} | ${frequency.powerOutputW ?? '—'} | ${frequency.erpW ?? '—'} | ${frequency.eirpDbm ?? '—'} | ${transmitter ? cell(transmitter) : '—'} | ${frequency.emissions.length ? cell(frequency.emissions.join(', ')) : '—'} |`,
+        '',
+        '| Frequency MHz | Upper MHz | Bandwidth MHz | Class | Power W | ERP W | EIRP dBm | Transmitter | Emissions |',
+        '|--------------:|----------:|--------------:|:------|--------:|------:|---------:|:------------|:----------|',
       );
+      for (const frequency of antenna.frequencies) {
+        const transmitter = [frequency.transmitterMake, frequency.transmitterModel]
+          .filter((value): value is string => Boolean(value))
+          .join(' ');
+        lines.push(
+          `| ${frequency.frequencyMhz} | ${frequency.upperMhz ?? '—'} | ${frequency.bandwidthMhz ?? '—'} | ${frequency.stationClass ? cell(frequency.stationClass) : '—'} | ${frequency.powerOutputW ?? '—'} | ${frequency.erpW ?? '—'} | ${frequency.eirpDbm ?? '—'} | ${transmitter ? cell(transmitter) : '—'} | ${frequency.emissions.length ? cell(frequency.emissions.join(', ')) : '—'} |`,
+        );
+      }
     }
+    if (antenna.paths) lines.push('', ...antenna.paths.map(pathLine));
   }
   return lines;
+}
+
+/** One path as a list line: number, filed attributes, then its receive end on this license. */
+function pathLine(path: z.infer<typeof PathSchema>): string {
+  const { receive } = path;
+  // The service gives coordinates or a site count, never both; each renders on its own.
+  const coordinates =
+    receive.latitude !== undefined &&
+    receive.longitude !== undefined &&
+    `${receive.latitude}, ${receive.longitude}`;
+  const sites =
+    receive.siteCount !== undefined &&
+    (receive.siteCount === 0
+      ? 'no site filed under this number'
+      : `${receive.siteCount} sites share this number, so no coordinates`);
+  const site = [coordinates, sites].filter(Boolean).join('; ') || 'coordinates not available';
+  const antenna =
+    receive.antennaNumber === undefined
+      ? 'antenna not filed'
+      : `antenna ${receive.antennaNumber}${receive.antennaFiled === false ? ' (no antenna record under this number)' : ''}`;
+  return `- **Path ${path.pathNumber}**${part('Type', path.pathType && inline(path.pathType))}${part('Passive receiver', path.passiveReceiver === undefined ? undefined : yesNo(path.passiveReceiver))}${part('Receiver callsign', path.receiverCallsign && inline(path.receiverCallsign))} · **Receive:** location ${receive.locationNumber} (${site}), ${antenna}`;
 }

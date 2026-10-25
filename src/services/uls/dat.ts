@@ -21,6 +21,8 @@ export const RECORD_FIELD_COUNTS = {
   EM: 16,
   MK: 23,
   MF: 10,
+  // The published layout lists 22 fields; every filed line carries two more, always empty.
+  PA: 24,
 } as const;
 
 /** A record type the ingester reads (`HD.dat`, `EN.dat`, …). */
@@ -571,4 +573,61 @@ export function decodeMf(line: string): MfRecord | null {
   const lowerMhz = f && numberField(f, 7);
   if (!f || usi === null || lowerMhz === null) return null;
   return { usi, partitionAreaId: numberField(f, 6), lowerMhz, upperMhz: numberField(f, 8) };
+}
+
+/**
+ * PA — microwave path: one transmit antenna's filed link to a receive location and antenna of
+ * the same license. Path numbers are filing order and are not unique per license.
+ */
+export interface PaRecord {
+  /** `true` for `Y`, `false` for `N`, `null` when blank or anything else (field 14). */
+  passiveReceiver: boolean | null;
+  pathNumber: number;
+  /**
+   * As filed (field 13), `null` when blank: `Fixed Point-to-Point`, `Area`, `Master-Remote`,
+   * `Remote-Master`, `Nodal-User`, `User-Nodal`.
+   */
+  pathTypeCode: string | null;
+  /** `null` when blank (field 11). */
+  receiveAntennaNumber: number | null;
+  receiveLocationNumber: number;
+  /** As filed, trimmed; often blank, and sometimes not a callsign (`NEW CALL`, `N/A`). */
+  receiverCallsign: string | null;
+  transmitAntennaNumber: number;
+  transmitLocationNumber: number;
+  usi: number;
+}
+
+/** Decode a PA line. A nonblank receive antenna number that is not numeric rejects the line. */
+export function decodePa(line: string): PaRecord | null {
+  const f = splitRecord(line, 'PA');
+  const usi = f && numberField(f, 2);
+  const pathNumber = f && numberField(f, 7);
+  const transmitLocationNumber = f && numberField(f, 8);
+  const transmitAntennaNumber = f && numberField(f, 9);
+  const receiveLocationNumber = f && numberField(f, 10);
+  const receiveAntennaNumber = f && numberField(f, 11);
+  if (
+    !f ||
+    usi === null ||
+    pathNumber === null ||
+    transmitLocationNumber === null ||
+    transmitAntennaNumber === null ||
+    receiveLocationNumber === null ||
+    (receiveAntennaNumber === null && textField(f, 11) !== null)
+  ) {
+    return null;
+  }
+  const passive = textField(f, 14)?.toUpperCase();
+  return {
+    usi,
+    pathNumber,
+    transmitLocationNumber,
+    transmitAntennaNumber,
+    receiveLocationNumber,
+    receiveAntennaNumber,
+    pathTypeCode: textField(f, 13),
+    passiveReceiver: passive === 'Y' ? true : passive === 'N' ? false : null,
+    receiverCallsign: textField(f, 17),
+  };
 }
