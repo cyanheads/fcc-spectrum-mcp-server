@@ -1,6 +1,6 @@
 # fcc-spectrum-mcp-server - Directory Structure
 
-Generated on: 2026-10-25 07:55:26
+Generated on: 2026-10-26 06:36:20
 
 ```text
 fcc-spectrum-mcp-server/
@@ -37,6 +37,8 @@ fcc-spectrum-mcp-server/
 │   ├── add-resource/
 │   │   └── SKILL.md
 │   ├── add-service/
+│   │   └── SKILL.md
+│   ├── add-skill/
 │   │   └── SKILL.md
 │   ├── add-test/
 │   │   └── SKILL.md
@@ -136,6 +138,9 @@ fcc-spectrum-mcp-server/
 │   ├── prune-musl-packages.ts
 │   ├── release-github.ts
 │   └── tree.ts
+├── skills/
+│   └── fcc-spectrum-guide/
+│       └── SKILL.md
 ├── src/
 │   ├── cli/
 │   │   ├── mirror-context.ts
@@ -167,6 +172,7 @@ fcc-spectrum-mcp-server/
 │   │       ├── bulk-client.ts
 │   │       ├── codes.ts
 │   │       ├── dat.ts
+│   │       ├── eastern-time.ts
 │   │       ├── ingest-job.ts
 │   │       ├── ingest-schedule.ts
 │   │       ├── ingest.ts
@@ -195,6 +201,7 @@ fcc-spectrum-mcp-server/
 │   │       ├── bulk-client.test.ts
 │   │       ├── codes.test.ts
 │   │       ├── dat.test.ts
+│   │       ├── eastern-time.test.ts
 │   │       ├── ingest-job.test.ts
 │   │       ├── ingest-schedule.test.ts
 │   │       ├── ingest.test.ts
@@ -232,7 +239,9 @@ fcc-spectrum-mcp-server/
 ├── Dockerfile
 ├── LICENSE
 ├── manifest.json
+├── mcp.json
 ├── package.json
+├── plugin.json
 ├── README.md
 ├── server.json
 ├── tsconfig.build.json

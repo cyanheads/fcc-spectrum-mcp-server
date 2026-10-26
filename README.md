@@ -1,13 +1,13 @@
 <div align="center">
   <h1>@cyanheads/fcc-spectrum-mcp-server</h1>
   <p><b>Search FCC radio licenses, find nearby licensed sites, and see who is licensed on a frequency via MCP. STDIO or Streamable HTTP.</b>
-  <div>5 Tools • 1 Resource</div>
+  <div>5 Tools • 2 Resources</div>
   </p>
 </div>
 
 <div align="center">
 
-[![Version](https://img.shields.io/badge/Version-0.2.1-blue.svg?style=flat-square)](./CHANGELOG.md) [![License](https://img.shields.io/badge/License-Apache%202.0-orange.svg?style=flat-square)](./LICENSE) [![Docker](https://img.shields.io/badge/Docker-ghcr.io-2496ED?style=flat-square&logo=docker&logoColor=white)](https://github.com/users/cyanheads/packages/container/package/fcc-spectrum-mcp-server) [![MCP SDK](https://img.shields.io/badge/MCP%20SDK-^2.3.1-green.svg?style=flat-square)](https://modelcontextprotocol.io/) [![npm](https://img.shields.io/npm/v/%40cyanheads%2Ffcc-spectrum-mcp-server?style=flat-square&logo=npm&logoColor=white)](https://www.npmjs.com/package/@cyanheads/fcc-spectrum-mcp-server) [![TypeScript](https://img.shields.io/badge/TypeScript-^7.0.2-3178C6.svg?style=flat-square)](https://www.typescriptlang.org/) [![Bun](https://img.shields.io/badge/Bun-v1.4.4-blueviolet.svg?style=flat-square)](https://bun.sh/)
+[![Version](https://img.shields.io/badge/Version-0.2.1-blue.svg?style=flat-square)](./CHANGELOG.md) [![License](https://img.shields.io/badge/License-Apache%202.0-orange.svg?style=flat-square)](./LICENSE) [![Docker](https://img.shields.io/badge/Docker-ghcr.io-2496ED?style=flat-square&logo=docker&logoColor=white)](https://github.com/users/cyanheads/packages/container/package/fcc-spectrum-mcp-server) [![MCP SDK](https://img.shields.io/badge/MCP%20SDK-^2.4.0-green.svg?style=flat-square)](https://modelcontextprotocol.io/) [![npm](https://img.shields.io/npm/v/%40cyanheads%2Ffcc-spectrum-mcp-server?style=flat-square&logo=npm&logoColor=white)](https://www.npmjs.com/package/@cyanheads/fcc-spectrum-mcp-server) [![TypeScript](https://img.shields.io/badge/TypeScript-^7.0.2-3178C6.svg?style=flat-square)](https://www.typescriptlang.org/) [![Bun](https://img.shields.io/badge/Bun-v1.4.4-blueviolet.svg?style=flat-square)](https://bun.sh/)
 
 </div>
 
@@ -29,7 +29,7 @@
 
 ## Overview
 
-US radio spectrum licensing from the FCC's Universal Licensing System, searchable offline. Look up a callsign, licensee, or market; read a license's sites, antennas, frequencies, and microwave paths; find transmitters near a point; and see who's authorized on any frequency or band. Covers land mobile, microwave, cellular, paging, amateur, and more; broadcast stations and satellite earth stations aren't included. No API key required.
+US radio spectrum licensing from the FCC's Universal Licensing System, searchable offline. Look up a callsign, licensee, or market; read a license's sites, antennas, frequencies, and microwave paths; find transmitters near a point; and see who's authorized on any frequency or band. Covers land mobile, microwave, cellular, paging, amateur, and more; full-power broadcast stations and satellite earth stations aren't included. No API key required.
 
 ### Tools
 
@@ -46,8 +46,9 @@ US radio spectrum licensing from the FCC's Universal Licensing System, searchabl
 | Resource | Description |
 |:---|:---|
 | `fcc-spectrum://license/{callsign}` | One license or lease by callsign as JSON — the first page `fcc_spectrum_get_license` returns. |
+| `skill://fcc-spectrum-guide/SKILL.md` | Workflow guidance for ULS investigations: completeness checks, identifiers, shared sites, market geography, leases, and microwave paths. |
 
-Also reachable via `fcc_spectrum_get_license`.
+License records are also reachable via `fcc_spectrum_get_license`. The [investigation guide](./skills/fcc-spectrum-guide/SKILL.md) is available to clients through `resources/list` and `resources/read`.
 
 ## Capability reference
 
@@ -122,120 +123,43 @@ Agent-friendly output:
 
 ## Getting started
 
-### Public Hosted Instance
-
-A public instance is available at `https://fcc-spectrum.caseyjhand.com/mcp` — no installation required. It serves Streamable HTTP; each client takes its own config shape.
-
-For Claude Code:
+Connect to the hosted instance, no install:
 
 ```sh
 claude mcp add --transport http fcc-spectrum-mcp-server https://fcc-spectrum.caseyjhand.com/mcp
 ```
 
-For Cline (`cline_mcp_settings.json`):
+The hosted index is rebuilt weekly and refreshed daily, with individual licensees redacted.
 
-```json
-{
-  "mcpServers": {
-    "fcc-spectrum-mcp-server": {
-      "type": "streamableHttp",
-      "url": "https://fcc-spectrum.caseyjhand.com/mcp"
-    }
-  }
-}
-```
-
-For Cursor (`mcp.json`):
-
-```json
-{
-  "mcpServers": {
-    "fcc-spectrum-mcp-server": {
-      "url": "https://fcc-spectrum.caseyjhand.com/mcp"
-    }
-  }
-}
-```
-
-Claude Desktop adds remote servers under Settings → Connectors.
-
-The hosted index is rebuilt weekly and refreshed daily from the FCC bulk files, with individual licensees redacted.
-
-### Self-Hosted / Local
-
-> **The index must be built once before any search works — see [First-run setup](#first-run-setup).** The package does not ship FCC data; until `mirror:init` has run, data tools fail with `index_not_ready` and `fcc_spectrum_list_reference` with topic `coverage` reports the build state.
-
-Add the following to your MCP client configuration file:
-
-```json
-{
-  "mcpServers": {
-    "fcc-spectrum-mcp-server": {
-      "type": "stdio",
-      "command": "bunx",
-      "args": ["@cyanheads/fcc-spectrum-mcp-server@latest"],
-      "env": {
-        "MCP_TRANSPORT_TYPE": "stdio",
-        "MCP_LOG_LEVEL": "info",
-        "FCC_SPECTRUM_MIRROR_DIR": "/path/to/fcc-uls"
-      }
-    }
-  }
-}
-```
-
-Or with npx (no Bun required):
-
-```json
-{
-  "mcpServers": {
-    "fcc-spectrum-mcp-server": {
-      "type": "stdio",
-      "command": "npx",
-      "args": ["-y", "@cyanheads/fcc-spectrum-mcp-server@latest"],
-      "env": {
-        "MCP_TRANSPORT_TYPE": "stdio",
-        "MCP_LOG_LEVEL": "info",
-        "FCC_SPECTRUM_MIRROR_DIR": "/path/to/fcc-uls"
-      }
-    }
-  }
-}
-```
-
-Or with Docker (mount a volume at `/usr/src/app/.mirror` so the index persists across containers):
-
-```json
-{
-  "mcpServers": {
-    "fcc-spectrum-mcp-server": {
-      "type": "stdio",
-      "command": "docker",
-      "args": [
-        "run", "-i", "--rm",
-        "-e", "MCP_TRANSPORT_TYPE=stdio",
-        "-v", "fcc-uls:/usr/src/app/.mirror",
-        "ghcr.io/cyanheads/fcc-spectrum-mcp-server:latest"
-      ]
-    }
-  }
-}
-```
-
-For Streamable HTTP, set the transport and start the server:
+Or run it locally against an index built with [First-run setup](#first-run-setup):
 
 ```sh
-MCP_TRANSPORT_TYPE=http MCP_HTTP_PORT=3010 FCC_SPECTRUM_MIRROR_DIR=/path/to/fcc-uls bun run start:http
-# Server listens at http://localhost:3010/mcp
+claude mcp add fcc-spectrum-mcp-server -e FCC_SPECTRUM_MIRROR_DIR=/path/to/fcc-uls -- bunx @cyanheads/fcc-spectrum-mcp-server
 ```
 
-`FCC_SPECTRUM_MIRROR_DIR` must name the directory `mirror:init` built. A relative path resolves against the process's working directory, which an MCP client chooses, so use an absolute path.
+For other clients, add this to the MCP config file:
+
+```json
+{
+  "mcpServers": {
+    "fcc-spectrum-mcp-server": {
+      "command": "bunx",
+      "args": ["@cyanheads/fcc-spectrum-mcp-server"],
+      "env": { "FCC_SPECTRUM_MIRROR_DIR": "/path/to/fcc-uls" }
+    }
+  }
+}
+```
+
+`FCC_SPECTRUM_MIRROR_DIR` must name the directory `mirror:init` built. Use an absolute path: MCP clients choose the process's working directory. Until the first build completes, data tools fail with `index_not_ready`; `fcc_spectrum_list_reference` with topic `coverage` reports the build state.
+
+For Docker or a source build, see [Running the server](#running-the-server).
 
 ### First-run setup
 
 The index is built from the FCC's public ULS bulk files at `data.fcc.gov` — weekly full snapshots per service group, plus daily incrementals. On the default groups a build downloads about 1.1 GB of zips, one at a time; a measured build produced 3,270,502 license records and an index of about 1.8 GB in about 3 minutes.
 
-Build it once from a source checkout after `bun run build` (see [Installation](#installation)), from an installed package, or with the Docker image:
+Build it once from a source checkout after `bun run build` (see [Running the server](#running-the-server)), from an installed package, or with the Docker image:
 
 ```sh
 # Download the weekly snapshots and build the index (resumable; skips when nothing is newer)
@@ -254,50 +178,10 @@ With Docker, run the same commands against the volume: `docker run --rm -v fcc-u
 
 Keeping it current:
 
-- **HTTP transport.** The server schedules the weekly rebuild on Sundays at 16:00 and the daily refresh at 17:00, in the process's local time (the Docker image runs in UTC; the FCC publishes snapshots Sunday morning US Eastern). A daily refresh that has fallen more than six days behind runs the weekly rebuild instead. Neither job runs until `mirror:init` has published a first index. Each job runs in a child process on the server's runtime, so queries and `/healthz` keep answering while it writes, and its log lines appear in the server log; on shutdown a running job is stopped and resumes at the next run.
+- **HTTP transport.** The server schedules the weekly rebuild on Sundays at 16:00 and the daily refresh at 17:00, in the process's local time (the Docker image runs in UTC; the FCC publishes snapshots Sunday morning US Eastern). Refresh checks the available daily publication dates for gaps and overwritten files. When they cannot cover the checkpoint, it runs the weekly rebuild and retries refresh; if no newer snapshot is available, the job reports failure until recovery is possible. Neither job runs until `mirror:init` has published a first index. Each job runs in a child process on the server's runtime, so queries and `/healthz` keep answering while it writes, and its log lines appear in the server log; on shutdown a running job is stopped and resumes at the next run.
 - **stdio.** Nothing is scheduled. Run `mirror:refresh` daily and `mirror:init` weekly from cron or another scheduler; daily files never remove licenses, so removals arrive with the weekly rebuild.
 - **Disk.** A rebuild writes a new generation beside the one being served, so leave room for a second index plus the largest zip (about 420 MB). Older generations are deleted at the start of the next rebuild.
 - **Concurrency.** An ingest lock lets one `mirror:init`, `mirror:refresh`, or scheduled job write at a time; an interrupted `mirror:init` resumes from its last completed step when rerun.
-
-### Prerequisites
-
-- [Bun v1.4](https://bun.sh/) or higher (or Node.js v24+). `bun:sqlite` is built into Bun; under Node, install `better-sqlite3` beside the server (declared as an optional peer dependency).
-- Disk for the index at `FCC_SPECTRUM_MIRROR_DIR`: about 1.8 GB on the default groups, plus rebuild room as above.
-- Network access to `data.fcc.gov` when building or refreshing the index. Queries need none.
-
-### Installation
-
-For local development, or to build the index from source:
-
-1. **Clone the repository:**
-
-```sh
-git clone https://github.com/cyanheads/fcc-spectrum-mcp-server.git
-```
-
-2. **Navigate into the directory:**
-
-```sh
-cd fcc-spectrum-mcp-server
-```
-
-3. **Install dependencies:**
-
-```sh
-bun install
-```
-
-4. **Build the server**, which also compiles the `mirror:*` entries:
-
-```sh
-bun run build
-```
-
-5. **Build the index** (see [First-run setup](#first-run-setup)):
-
-```sh
-FCC_SPECTRUM_MIRROR_DIR=/path/to/fcc-uls bun run mirror:init
-```
 
 ## Configuration
 
@@ -367,6 +251,46 @@ Licensee mailing street addresses, ZIP codes, PO boxes, attention lines, phone n
 
 ## Running the server
 
+### Prerequisites
+
+- [Bun v1.4](https://bun.sh/) or higher (or Node.js v24+). `bun:sqlite` is built into Bun; under Node, install `better-sqlite3` beside the server (declared as an optional peer dependency).
+- Disk for the index at `FCC_SPECTRUM_MIRROR_DIR`: about 1.8 GB on the default groups, plus rebuild room as above.
+- Network access to `data.fcc.gov` when building or refreshing the index. Queries need none.
+
+### Installation
+
+For local development, or to build the index from source:
+
+1. **Clone the repository:**
+
+```sh
+git clone https://github.com/cyanheads/fcc-spectrum-mcp-server.git
+```
+
+2. **Navigate into the directory:**
+
+```sh
+cd fcc-spectrum-mcp-server
+```
+
+3. **Install dependencies:**
+
+```sh
+bun install
+```
+
+4. **Build the server**, which also compiles the `mirror:*` entries:
+
+```sh
+bun run build
+```
+
+5. **Build the index** (see [First-run setup](#first-run-setup)):
+
+```sh
+FCC_SPECTRUM_MIRROR_DIR=/path/to/fcc-uls bun run mirror:init
+```
+
 ### Local development
 
 - **Build and run:**
@@ -395,26 +319,26 @@ Licensee mailing street addresses, ZIP codes, PO boxes, attention lines, phone n
 ### Docker
 
 ```sh
-docker build -t fcc-spectrum-mcp-server .
 # Build the index once against the volume:
-docker run --rm -v fcc-uls:/usr/src/app/.mirror fcc-spectrum-mcp-server bun run mirror:init
+docker run --rm -v fcc-uls:/usr/src/app/.mirror ghcr.io/cyanheads/fcc-spectrum-mcp-server:latest bun run mirror:init
 # Serve over HTTP:
-docker run --rm -p 3010:3010 -v fcc-uls:/usr/src/app/.mirror fcc-spectrum-mcp-server
+docker run --rm -p 3010:3010 -v fcc-uls:/usr/src/app/.mirror ghcr.io/cyanheads/fcc-spectrum-mcp-server:latest
 ```
 
-The image defaults to HTTP transport with stateless sessions, includes the `mirror:*` CLI, and logs to `/var/log/fcc-spectrum-mcp-server`. OpenTelemetry peer dependencies are installed by default; build with `--build-arg OTEL_ENABLED=false` to omit them.
+The image defaults to HTTP transport with stateless sessions, includes the `mirror:*` CLI, and logs to `/var/log/fcc-spectrum-mcp-server`. For stdio, use `docker run -i --rm -e MCP_TRANSPORT_TYPE=stdio -v fcc-uls:/usr/src/app/.mirror ghcr.io/cyanheads/fcc-spectrum-mcp-server:latest`. Build locally with `docker build -t fcc-spectrum-mcp-server .`. OpenTelemetry peer dependencies are installed by default; build with `--build-arg OTEL_ENABLED=false` to omit them.
 
 ## Project structure
 
 | Directory | Purpose |
 |:---|:---|
-| `src/index.ts` | `createApp()` entry point — registers the tools and resource, inits the index service, and starts the ingest schedule under HTTP transport. |
+| `src/index.ts` | `createApp()` entry point — registers tools, resources, and the skill directory, inits the index service, and starts the ingest schedule under HTTP transport. |
 | `src/config` | Server environment variable parsing and validation with Zod. |
 | `src/mcp-server/tools` | Tool definitions (`*.tool.ts`), shared input schemas, and format helpers. |
 | `src/mcp-server/resources` | Resource definitions (`*.resource.ts`). |
 | `src/services/uls` | ULS service — bulk client, record parsers, ingester, index generations, read path with redaction, and the ingest schedule with the job process it spawns. |
 | `src/cli` | Index lifecycle CLI — `mirror:init`, `mirror:refresh`, `mirror:verify` — compiled to `dist/cli/`. |
 | `tests/` | Unit and integration tests mirroring `src/`, with fixture ULS records. |
+| `skills/` | Published investigation guide, served as an MCP resource. |
 
 ## Development guide
 
