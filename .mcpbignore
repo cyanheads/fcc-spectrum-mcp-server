@@ -8,6 +8,16 @@
 .mcpregistry_*
 /.claude/
 /.agents/
+/.claude-plugin/
+/.codex-plugin/
+/plugin.json
+/mcp.json
+/CLAUDE.md
+/AGENTS.md
+/.dockerignore
+/.gitattributes
+/devcheck.config.json
+/changelog/
 /framework-skills/
 /.cache/
 /src/

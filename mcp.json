@@ -1,0 +1,11 @@
+{
+  "$schema": "https://agent-plugins.org/schemas/1.0.0/mcp.schema.json",
+  "mcpServers": {
+    "fcc-spectrum-mcp-server": {
+      "type": "stdio",
+      "command": "npx",
+      "args": ["-y", "@cyanheads/fcc-spectrum-mcp-server"],
+      "env": { "MCP_TRANSPORT_TYPE": "stdio" }
+    }
+  }
+}

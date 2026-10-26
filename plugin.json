@@ -1,0 +1,39 @@
+{
+  "$schema": "https://agent-plugins.org/schemas/1.0.0/plugin.schema.json",
+  "name": "fcc-spectrum-mcp-server",
+  "version": "0.2.1",
+  "description": "Search FCC radio licenses, find nearby licensed sites, and see who is licensed on a frequency via MCP. STDIO or Streamable HTTP.",
+  "author": {
+    "name": "Casey Hand",
+    "email": "casey@caseyjhand.com",
+    "url": "https://caseyjhand.com"
+  },
+  "homepage": "https://github.com/cyanheads/fcc-spectrum-mcp-server#readme",
+  "repository": "https://github.com/cyanheads/fcc-spectrum-mcp-server",
+  "license": "Apache-2.0",
+  "keywords": [
+    "mcp",
+    "mcp-server",
+    "model-context-protocol",
+    "typescript",
+    "bun",
+    "stdio",
+    "streamable-http",
+    "ai-agent",
+    "fcc",
+    "uls",
+    "universal-licensing-system",
+    "spectrum",
+    "radio",
+    "rf",
+    "frequency",
+    "callsign",
+    "transmitter",
+    "wireless",
+    "land-mobile",
+    "microwave",
+    "amateur-radio",
+    "sqlite",
+    "fts5"
+  ]
+}
