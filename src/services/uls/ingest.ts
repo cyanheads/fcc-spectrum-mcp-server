@@ -27,6 +27,7 @@ import {
 } from '@cyanheads/mcp-ts-core/mirror';
 import {
   dailyZipPath,
+  type UlsDailyFile,
   type UlsDownload,
   type UlsRemoteFile,
   weeklyZipPath,
@@ -51,6 +52,7 @@ import {
   type RecordType,
   toIsoSeconds,
 } from './dat.js';
+import { easternDate, shiftDate } from './eastern-time.js';
 import { hasOrganizationWord } from './organization-names.js';
 import {
   acquireIngestLock,
@@ -85,7 +87,7 @@ import { openZipArchive, type ZipArchive } from './zip-reader.js';
 export interface IngestClient {
   download(path: string, destination: string, signal?: AbortSignal): Promise<UlsDownload>;
   head(path: string, signal?: AbortSignal): Promise<UlsRemoteFile | null>;
-  listDailyFiles(signal?: AbortSignal): Promise<string[]>;
+  listDailyFiles(signal?: AbortSignal): Promise<UlsDailyFile[]>;
 }
 
 /** Constructor options. `client`, `openArchive`, `tempDir`, and `now` are the test seams. */
@@ -121,9 +123,6 @@ export interface RefreshResult {
   generation: string;
   result: SyncResult;
 }
-
-/** A daily refresh only trusts the seven-day window when the checkpoint is at most six days old. */
-const MAX_CHECKPOINT_AGE_MS = 6 * 24 * 60 * 60 * 1000;
 
 /** Rows per staging transaction. */
 const STAGE_BATCH = 20_000;
@@ -244,7 +243,9 @@ export class UlsIngester {
    * Daily refresh of the published generation: applies every `daily/l_*.zip` whose
    * `Last-Modified` is newer than the checkpoint and not yet applied, oldest first, each in
    * one transaction. A file whose code belongs to a weekly group the generation does not hold
-   * is skipped before its HEAD ({@link DAILY_CODE_GROUPS}); an unmapped code always applies.
+   * is skipped before metadata resolution ({@link DAILY_CODE_GROUPS}); an unmapped code stays eligible.
+   * Listing timestamps avoid HEAD when unambiguous. Publication-day coverage is validated
+   * before the sync runner starts; a possible post-checkpoint gap is `stale_checkpoint`.
    * Stops at the first failure with the checkpoint at the last applied file.
    * A generation carrying the rebuild-required mark is never refreshed: that fails with a
    * conflict carrying `reason: rebuild_required`.
@@ -269,8 +270,21 @@ export class UlsIngester {
           );
         }
         const checkpoint = await this.refreshCheckpoint(store);
+        let pending: UlsRemoteFile[];
+        try {
+          pending = await this.pendingDailyFiles(store, checkpoint, signal);
+        } catch (error) {
+          signal.throwIfAborted();
+          await store.writeState({
+            status: 'error',
+            checkpoint,
+            startedAt: toIsoSeconds(this.now()),
+            error: error instanceof Error ? error.message : String(error),
+          });
+          throw error;
+        }
         const mirror = this.defineMirror(store, (ctx) =>
-          this.refreshPages(ctx, store, checkpoint, applied),
+          this.refreshPages(ctx, store, pending, applied),
         );
         const result = await mirror.runSync({ mode: 'refresh', signal });
         this.logger.info?.('Daily refresh complete', {
@@ -285,26 +299,21 @@ export class UlsIngester {
   }
 
   /**
-   * The checkpoint a daily refresh starts from. A missing or stale one fails here, before the
-   * sync runner starts, so the stale case the HTTP scheduler handles logs no runner error. The
-   * failure is still recorded in the sync state as the runner would record it (the completion
-   * marker survives), so `coverage` reports it while the index stays ready.
+   * The checkpoint a daily refresh starts from. A missing checkpoint fails before metadata
+   * resolution; publication-day coverage is checked after metadata is available. Preflight
+   * failures preserve the completion marker, so coverage reports them while the index stays ready.
    */
   private async refreshCheckpoint(store: MirrorStore): Promise<string> {
     const { checkpoint } = await store.readState();
-    if (checkpoint && this.now() - Date.parse(checkpoint) <= MAX_CHECKPOINT_AGE_MS) {
+    if (checkpoint) {
       return checkpoint;
     }
-    const failure = checkpoint
-      ? conflict(
-          `The index checkpoint ${checkpoint} is more than six days old, so the seven-day daily window may have rolled past unapplied files; run mirror:init to rebuild the index.`,
-          { checkpoint, reason: 'stale_checkpoint' },
-        )
-      : conflict('The published index has no checkpoint; run mirror:init to rebuild it.');
+    const failure = conflict(
+      'The published index has no checkpoint; run mirror:init to rebuild it.',
+    );
     await store.writeState({
       status: 'error',
       startedAt: toIsoSeconds(this.now()),
-      ...(checkpoint && { checkpoint }),
       error: failure.message,
     });
     throw failure;
@@ -579,12 +588,11 @@ export class UlsIngester {
 
   // --- Daily refresh --------------------------------------------------------------------
 
-  private async *refreshPages(
-    ctx: SyncContext,
+  private async pendingDailyFiles(
     store: MirrorStore,
     checkpoint: string,
-    applied: string[],
-  ): AsyncGenerator<SyncPage> {
+    signal: AbortSignal,
+  ): Promise<UlsRemoteFile[]> {
     const db = await store.raw();
     configureIngestConnection(db);
     const recorded = readIngestRows(db, 'daily');
@@ -595,9 +603,12 @@ export class UlsIngester {
     );
 
     const pending: UlsRemoteFile[] = [];
+    const resolved: UlsRemoteFile[] = [];
     const skippedCodes = new Set<string>();
     let skipped = 0;
-    for (const name of await this.client.listDailyFiles(ctx.signal)) {
+    for (const entry of await this.client.listDailyFiles(signal)) {
+      signal.throwIfAborted();
+      const { name } = entry;
       const code = dailyFileCode(name);
       const group = code === undefined ? undefined : DAILY_CODE_GROUPS.get(code);
       if (code !== undefined && group !== undefined && !held.has(group)) {
@@ -606,11 +617,18 @@ export class UlsIngester {
         continue;
       }
       const path = dailyZipPath(name);
-      const head = await this.client.head(path, ctx.signal);
-      if (!head || head.lastModified <= checkpoint) continue;
+      const head =
+        entry.lastModified === undefined
+          ? await this.client.head(path, signal)
+          : { path, lastModified: entry.lastModified };
+      if (!head) continue;
+      resolved.push(head);
+      if (head.lastModified <= checkpoint) continue;
       if (recorded.get(path)?.last_modified === head.lastModified) continue;
       pending.push(head);
     }
+    signal.throwIfAborted();
+    this.assertDailyCoverage(resolved, checkpoint);
     pending.sort(
       (a, b) => a.lastModified.localeCompare(b.lastModified) || a.path.localeCompare(b.path),
     );
@@ -620,13 +638,61 @@ export class UlsIngester {
       skipped,
       skippedCodes: [...skippedCodes].sort(),
     });
+    return pending;
+  }
 
+  private async *refreshPages(
+    ctx: SyncContext,
+    store: MirrorStore,
+    pending: readonly UlsRemoteFile[],
+    applied: string[],
+  ): AsyncGenerator<SyncPage> {
+    const db = await store.raw();
+    configureIngestConnection(db);
     for (const file of pending) {
       const counts = await this.applyDaily(db, file, ctx.signal);
       applied.push(file.path);
       yield { records: [], checkpoint: counts.createdAt };
     }
     recomputeSummaries(db);
+  }
+
+  /** Reject only evidence of a missing post-checkpoint day or a possibly overwritten slot. */
+  private assertDailyCoverage(files: readonly UlsRemoteFile[], checkpoint: string): void {
+    const checkpointDate = easternDate(checkpoint);
+    const datesByCode = new Map<string, Set<string>>();
+    for (const file of files) {
+      const code = dailyFileCode(basename(file.path));
+      if (code === undefined) continue;
+      const date = easternDate(file.lastModified);
+      const dates = datesByCode.get(code) ?? new Set<string>();
+      dates.add(date);
+      datesByCode.set(code, dates);
+    }
+    const stale = () =>
+      conflict(
+        `The daily listing cannot cover every publication after checkpoint ${checkpoint}; retry mirror:init after a newer weekly snapshot is published.`,
+        { checkpoint, reason: 'stale_checkpoint' },
+      );
+    for (const [code, dates] of datesByCode) {
+      const ordered = [...dates].sort();
+      const last = ordered.at(-1) as string;
+      /**
+       * The overwritten predecessor's hour is unavailable. Cover its whole Eastern date
+       * instead of guessing a fixed UTC offset or the previous week's publication hour.
+       */
+      if (shiftDate(last, -7) >= checkpointDate) throw stale();
+      const group = DAILY_CODE_GROUPS.get(code);
+      const first = group === undefined ? (ordered[0] as string) : shiftDate(checkpointDate, 1);
+      const end = last;
+      for (
+        let date = first > checkpointDate ? first : shiftDate(checkpointDate, 1);
+        date <= end;
+        date = shiftDate(date, 1)
+      ) {
+        if (!dates.has(date)) throw stale();
+      }
+    }
   }
 
   /** Apply one daily file: replace, by USI, every record set it carries. */

@@ -18,6 +18,7 @@ import {
   DAILY_REQUEST_DEADLINE_MS,
   dailyZipPath,
   MAX_DOWNLOAD_BYTES,
+  parseDailyListing,
   UlsBulkClient,
   WEEKLY_DOWNLOAD_DEADLINE_MS,
   weeklyZipPath,
@@ -129,6 +130,49 @@ describe('path helpers', () => {
 });
 
 describe('listDailyFiles', () => {
+  it('matches paired captured FCC rows and HEAD timestamps without inferring weekdays', () => {
+    expect(
+      parseDailyListing(
+        `<a href="l_pg_mon.zip">l_pg_mon.zip</a>  2026-10-20 08:02:36   212\n<a href="l_mw_fri.zip">l_mw_fri.zip</a>  2026-10-24 04:01:56   109134\n<a href="l_rb_sat.zip">l_rb_sat.zip</a>  2026-10-25 09:03:52   212`,
+      ),
+    ).toEqual([
+      { name: 'l_mw_fri.zip', lastModified: '2026-10-24T08:01:56Z' },
+      { name: 'l_pg_mon.zip', lastModified: '2026-10-20T12:02:36Z' },
+      { name: 'l_rb_sat.zip', lastModified: '2026-10-25T13:03:52Z' },
+    ]);
+  });
+
+  it('keeps malformed rows and conflicting duplicates unresolved without borrowing another row time', () => {
+    expect(
+      parseDailyListing(
+        `<a href="l_pg_mon.zip"> 2026-10-20 08:00:00\n<a href="l_pg_tue.zip">l_pg_tue.zip</a>  2026-11-01 01:30:00 212\n<a href="l_pg_wed.zip">l_pg_wed.zip</a>  2026-03-08 02:30:00 212\n<a href="l_pg_thu.zip">l_pg_thu.zip</a>  2026-02-30 12:00:00 212\n<a href="l_pg_fri.zip">l_pg_fri.zip</a>  2026-10-20 08:00:00 212\n<a href="l_pg_fri.zip">l_pg_fri.zip</a>  2026-10-21 08:00:00 212\n<a href="l_pg_fri.zip">l_pg_fri.zip</a>  2026-10-21 08:00:00 212`,
+      ),
+    ).toEqual([
+      { name: 'l_pg_fri.zip' },
+      { name: 'l_pg_mon.zip' },
+      { name: 'l_pg_thu.zip' },
+      { name: 'l_pg_tue.zip' },
+      { name: 'l_pg_wed.zip' },
+    ]);
+  });
+  it('resolves a displayed Eastern timestamp without issuing HEAD', async () => {
+    http.route({
+      match: `${BASE}/daily/`,
+      respond: () =>
+        new Response('<a href="l_pg_mon.zip">l_pg_mon.zip</a>  2026-10-20 08:02:36   212'),
+    });
+    expect(await drive(makeClient().listDailyFiles())).toEqual([
+      { name: 'l_pg_mon.zip', lastModified: '2026-10-20T12:02:36Z' },
+    ]);
+    expect(http.calls).toHaveLength(1);
+  });
+  it('retains a linked filename without a timestamp for HEAD fallback', async () => {
+    http.route({
+      match: `${BASE}/daily/`,
+      respond: () => new Response('<a href="l_pg_mon.zip">l_pg_mon.zip</a> no timestamp'),
+    });
+    expect(await drive(makeClient().listDailyFiles())).toEqual([{ name: 'l_pg_mon.zip' }]);
+  });
   const listing = `
     <html><body><pre>
     <a href="../">Parent</a>
@@ -145,9 +189,9 @@ describe('listDailyFiles', () => {
   it('keeps only license daily zips, deduped and sorted', async () => {
     http.route({ method: 'GET', match: `${BASE}/daily/`, respond: () => new Response(listing) });
     expect(await drive(makeClient().listDailyFiles())).toEqual([
-      'l_am_mon.zip',
-      'l_gmrs_sun.zip',
-      'l_pg_tue.zip',
+      { name: 'l_am_mon.zip' },
+      { name: 'l_gmrs_sun.zip' },
+      { name: 'l_pg_tue.zip' },
     ]);
   });
 
@@ -427,7 +471,7 @@ describe('retry behavior', () => {
       match: `${BASE}/daily/`,
       respond: sequence(status(500), () => new Response('<a href="l_am_mon.zip">')),
     });
-    expect(await drive(makeClient().listDailyFiles())).toEqual(['l_am_mon.zip']);
+    expect(await drive(makeClient().listDailyFiles())).toEqual([{ name: 'l_am_mon.zip' }]);
     expect(http.calls).toHaveLength(2);
   });
 
@@ -436,7 +480,7 @@ describe('retry behavior', () => {
       match: `${BASE}/daily/`,
       respond: sequence(status(503), status(408), () => new Response('<a href="l_am_mon.zip">')),
     });
-    expect(await drive(makeClient().listDailyFiles())).toEqual(['l_am_mon.zip']);
+    expect(await drive(makeClient().listDailyFiles())).toEqual([{ name: 'l_am_mon.zip' }]);
     expect(http.calls).toHaveLength(3);
   });
 
@@ -461,7 +505,7 @@ describe('retry behavior', () => {
           : new Response('<a href="l_am_mon.zip">');
       },
     });
-    expect(await drive(makeClient().listDailyFiles())).toEqual(['l_am_mon.zip']);
+    expect(await drive(makeClient().listDailyFiles())).toEqual([{ name: 'l_am_mon.zip' }]);
     expect(times).toHaveLength(2);
     expect((times[1] ?? 0) - (times[0] ?? 0)).toBeGreaterThanOrEqual(7000);
   });
@@ -471,7 +515,7 @@ describe('retry behavior', () => {
       match: `${BASE}/daily/`,
       respond: sequence(status(429), () => new Response('<a href="l_am_mon.zip">')),
     });
-    expect(await drive(makeClient().listDailyFiles())).toEqual(['l_am_mon.zip']);
+    expect(await drive(makeClient().listDailyFiles())).toEqual([{ name: 'l_am_mon.zip' }]);
     expect(http.calls).toHaveLength(2);
   });
 
@@ -501,7 +545,9 @@ describe('retry behavior', () => {
       if (calls === 1) throw new TypeError('fetch failed');
       return new Response('<a href="l_am_mon.zip">');
     }) as typeof globalThis.fetch;
-    expect(await drive(makeClient({ fetch: flaky }).listDailyFiles())).toEqual(['l_am_mon.zip']);
+    expect(await drive(makeClient({ fetch: flaky }).listDailyFiles())).toEqual([
+      { name: 'l_am_mon.zip' },
+    ]);
     expect(calls).toBe(2);
   });
 

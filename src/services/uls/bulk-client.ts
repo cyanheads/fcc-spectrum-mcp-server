@@ -21,6 +21,7 @@ import {
 } from '@cyanheads/mcp-ts-core/utils';
 import type { ServiceGroup } from './codes.js';
 import { toIsoSeconds } from './dat.js';
+import { parseEasternTime } from './eastern-time.js';
 
 /** Total budget for one weekly snapshot download, retries included. */
 export const WEEKLY_DOWNLOAD_DEADLINE_MS = 20 * 60_000;
@@ -70,6 +71,41 @@ export interface UlsRemoteFile {
   sizeBytes?: number;
 }
 
+/** A linked daily file; unresolved wall times require HEAD before use. */
+export interface UlsDailyFile {
+  lastModified?: string;
+  name: string;
+}
+
+/** Parse each link independently; malformed timestamps never discard a linked filename. */
+export function parseDailyListing(html: string): UlsDailyFile[] {
+  const files = new Map<string, UlsDailyFile>();
+  for (const line of html.split('\n')) {
+    const links = [...line.matchAll(/href="(l_[a-z0-9]+_[a-z]+\.zip)"/gi)];
+    for (let index = 0; index < links.length; index++) {
+      const link = links[index];
+      if (!link?.[1]) continue;
+      const name = link[1];
+      const tail = line.slice(link.index + link[0].length, links[index + 1]?.index ?? line.length);
+      const close = tail.indexOf('</a>');
+      const wall =
+        close < 0
+          ? undefined
+          : /^[ \t]*(\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2})(?:[ \t\r]|$)/.exec(
+              tail.slice(close + 4),
+            )?.[1];
+      const lastModified = wall === undefined ? undefined : parseEasternTime(wall);
+      const previous = files.get(name);
+      files.set(name, {
+        name,
+        ...(lastModified !== undefined &&
+          (!previous || previous.lastModified === lastModified) && { lastModified }),
+      });
+    }
+  }
+  return [...files.values()].sort((a, b) => a.name.localeCompare(b.name));
+}
+
 /** A completed download. */
 export interface UlsDownload extends UlsRemoteFile {
   /** Where the zip was written. */
@@ -102,19 +138,15 @@ export class UlsBulkClient {
     });
   }
 
-  /** Names of the daily license incrementals (`l_*.zip`) the `daily/` listing links. */
-  listDailyFiles(signal?: AbortSignal): Promise<string[]> {
+  /** Linked daily incrementals, with UTC metadata when their Eastern wall time is unambiguous. */
+  listDailyFiles(signal?: AbortSignal): Promise<UlsDailyFile[]> {
     const path = 'daily/';
     return this.withRetry('listDailyFiles', DAILY_REQUEST_DEADLINE_MS, signal, async (attempt) => {
       const response = await this.request(path, 'GET', attempt);
       if (response === 'missing')
         throw notFound(`The ULS bulk host has no ${path} listing.`, { path });
       const html = await response.text();
-      const names = new Set<string>();
-      for (const match of html.matchAll(/href="(l_[a-z0-9]+_[a-z]+\.zip)"/gi)) {
-        if (match[1]) names.add(match[1]);
-      }
-      return [...names].sort();
+      return parseDailyListing(html);
     });
   }
 

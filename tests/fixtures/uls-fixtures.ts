@@ -11,7 +11,7 @@
 import { writeFile } from 'node:fs/promises';
 import { crc32, deflateRawSync } from 'node:zlib';
 import { serviceUnavailable } from '@cyanheads/mcp-ts-core/errors';
-import type { UlsDownload, UlsRemoteFile } from '@/services/uls/bulk-client.js';
+import type { UlsDailyFile, UlsDownload, UlsRemoteFile } from '@/services/uls/bulk-client.js';
 import { RECORD_FIELD_COUNTS, type RecordType } from '@/services/uls/dat.js';
 import type { IngestClient } from '@/services/uls/ingest.js';
 
@@ -2675,13 +2675,13 @@ export class FakeIngestClient implements IngestClient {
     return this.calls.filter((call) => call.method === 'download' && call.path === path).length;
   }
 
-  async head(path: string): Promise<UlsRemoteFile | null> {
+  async head(path: string, _signal?: AbortSignal): Promise<UlsRemoteFile | null> {
     this.calls.push({ method: 'head', path });
     const file = this.files.get(path);
     return file ? { path, lastModified: file.lastModified, sizeBytes: file.zip.length } : null;
   }
 
-  async download(path: string, destination: string): Promise<UlsDownload> {
+  async download(path: string, destination: string, _signal?: AbortSignal): Promise<UlsDownload> {
     this.calls.push({ method: 'download', path });
     const file = this.files.get(path);
     if (!file || this.failDownloads.has(path)) {
@@ -2697,9 +2697,9 @@ export class FakeIngestClient implements IngestClient {
     };
   }
 
-  async listDailyFiles(): Promise<string[]> {
+  async listDailyFiles(): Promise<UlsDailyFile[]> {
     this.calls.push({ method: 'list' });
-    return [...this.daily];
+    return this.daily.map((name) => ({ name }));
   }
 }
 

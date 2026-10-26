@@ -23,6 +23,7 @@ import {
   type MockInstance,
   vi,
 } from 'vitest';
+import { UlsBulkClient } from '@/services/uls/bulk-client.js';
 import { UlsIngester } from '@/services/uls/ingest.js';
 import { type IngestJobKind, type JobRecord, runIngestJob } from '@/services/uls/ingest-job.js';
 import { LOCK_FILE, POINTER_FILE, writePointer } from '@/services/uls/schema.js';
@@ -38,7 +39,7 @@ import {
 const BASE_URL = 'https://uls.invalid/download/pub/uls';
 const SERVER_PID = 4242;
 
-/** The weekly snapshot checkpoint is 2026-09-27; this is 13 days later, past the 6-day window. */
+/** A job clock well past the weekly fixture; gap decisions use publication metadata. */
 const STALE_NOW = '2026-10-10T17:00:00Z';
 
 let records: JobRecord[];
@@ -141,6 +142,47 @@ describe('published generation', () => {
     await fixture.dispose();
   });
 
+  it('does not report a skipped rebuild as recovery from a daily gap', async () => {
+    vi.spyOn(UlsIngester.prototype, 'refresh').mockRejectedValue(
+      conflict(
+        'Daily coverage is missing; retry mirror:init after a newer weekly snapshot is published.',
+        { reason: 'stale_checkpoint' },
+      ),
+    );
+    vi.spyOn(UlsIngester.prototype, 'rebuild').mockResolvedValue({
+      status: 'skipped',
+      generation: FIXTURE_GENERATION,
+    });
+    expect(await run('refresh', fixture.mirrorDir)).toBe(false);
+    expect(failure()).toMatchObject({ data: { reason: 'stale_checkpoint' } });
+  });
+
+  it('retries a daily gap once after a real rebuild and stops if coverage is still missing', async () => {
+    const refresh = vi
+      .spyOn(UlsIngester.prototype, 'refresh')
+      .mockRejectedValue(conflict('Daily coverage is missing.', { reason: 'stale_checkpoint' }));
+    const rebuild = vi
+      .spyOn(UlsIngester.prototype, 'rebuild')
+      .mockResolvedValue({ status: 'rebuilt', generation: FIXTURE_GENERATION });
+    expect(await run('refresh', fixture.mirrorDir)).toBe(false);
+    expect(refresh).toHaveBeenCalledTimes(2);
+    expect(rebuild).toHaveBeenCalledTimes(1);
+    expect(failure()).toMatchObject({ data: { reason: 'stale_checkpoint' } });
+  });
+
+  it('does not start fallback after a cancelled refresh', async () => {
+    const controller = new AbortController();
+    const reason = new Error('cancel refresh');
+    vi.spyOn(UlsIngester.prototype, 'refresh').mockImplementation(async () => {
+      controller.abort(reason);
+      throw conflict('Daily coverage is missing.', { reason: 'stale_checkpoint' });
+    });
+    const rebuild = vi.spyOn(UlsIngester.prototype, 'rebuild');
+    expect(await run('refresh', fixture.mirrorDir, controller.signal)).toBe(false);
+    expect(rebuild).not.toHaveBeenCalled();
+    expect(failure()).toMatchObject({ message: 'cancel refresh' });
+  });
+
   it.each([
     ['rebuild', 'weekly rebuild'],
     ['refresh', 'daily refresh'],
@@ -185,16 +227,19 @@ describe('published generation', () => {
   it('runs the weekly rebuild instead when the checkpoint is past the daily window', async () => {
     vi.useFakeTimers({ toFake: ['Date'] });
     vi.setSystemTime(new Date(STALE_NOW));
+    vi.spyOn(UlsIngester.prototype, 'refresh').mockRejectedValue(
+      conflict('Daily coverage is missing.', { reason: 'stale_checkpoint' }),
+    );
     const rebuild = vi
       .spyOn(UlsIngester.prototype, 'rebuild')
       .mockResolvedValue({ status: 'skipped', generation: FIXTURE_GENERATION });
     const signal = new AbortController().signal;
-    expect(await run('refresh', fixture.mirrorDir, signal)).toBe(true);
+    expect(await run('refresh', fixture.mirrorDir, signal)).toBe(false);
 
     expect(lines()).toEqual([
       [
         'notice',
-        'The index checkpoint is older than the daily window; running the weekly rebuild instead.',
+        'The daily listing cannot cover the index checkpoint; running the weekly rebuild instead.',
       ],
       ['info', 'Scheduled ULS weekly rebuild skipped'],
     ]);
@@ -204,7 +249,7 @@ describe('published generation', () => {
       generation: FIXTURE_GENERATION,
     });
     // The handled fallback writes nothing at error level, the sync runner included.
-    expect(failure()).toBeUndefined();
+    expect(failure()).toMatchObject({ data: { reason: 'stale_checkpoint' } });
     expect(fetchSpy).not.toHaveBeenCalled();
     expect(await fixture.service().ready()).toBe(true);
   });
@@ -213,6 +258,7 @@ describe('published generation', () => {
     await writeFile(lockPath, '{"pid":');
     vi.useFakeTimers({ toFake: ['Date'] });
     vi.setSystemTime(new Date(STALE_NOW));
+    vi.spyOn(UlsBulkClient.prototype, 'listDailyFiles').mockResolvedValue([]);
     vi.spyOn(UlsIngester.prototype, 'rebuild').mockResolvedValue({
       status: 'skipped',
       generation: FIXTURE_GENERATION,
@@ -268,9 +314,10 @@ describe('published generation', () => {
   });
 
   it('runs the weekly rebuild instead when the published index needs a rebuild', async () => {
-    vi.spyOn(UlsIngester.prototype, 'refresh').mockRejectedValue(
-      conflict('Rebuild required.', { reason: 'rebuild_required' }),
-    );
+    const refresh = vi
+      .spyOn(UlsIngester.prototype, 'refresh')
+      .mockRejectedValueOnce(conflict('Rebuild required.', { reason: 'rebuild_required' }))
+      .mockResolvedValue({ generation: FIXTURE_GENERATION, applied: [], result: {} as never });
     const rebuild = vi
       .spyOn(UlsIngester.prototype, 'rebuild')
       .mockResolvedValue({ status: 'rebuilt', generation: FIXTURE_GENERATION });
@@ -282,8 +329,10 @@ describe('published generation', () => {
         'The published index was built by an earlier version of this server; running the weekly rebuild instead.',
       ],
       ['info', 'Scheduled ULS weekly rebuild rebuilt'],
+      ['info', 'Scheduled ULS daily refresh complete'],
     ]);
     expect(rebuild).toHaveBeenCalledTimes(1);
+    expect(refresh).toHaveBeenCalledTimes(2);
     expect(failure()).toBeUndefined();
   });
 

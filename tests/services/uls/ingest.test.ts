@@ -954,6 +954,136 @@ describe('daily refresh', () => {
     await Promise.all(services.splice(0).map((service) => service.close()));
   });
 
+  it('accepts a Saturday refresh from Sunday when every subsequent publication day remains', async () => {
+    await built();
+    client.withDaily(
+      Object.fromEntries(
+        ['sat', 'sun', 'mon', 'tue', 'wed', 'thu', 'fri'].flatMap((day, index) => {
+          const created = new Date(Date.parse('2026-09-27T12:00:00Z') + index * 86_400_000)
+            .toISOString()
+            .replace('.000Z', 'Z');
+          return ['pg', 'mi'].map((code) => [`l_${code}_${day}.zip`, emptyDaily(created)]);
+        }),
+      ),
+    );
+    const result = await refresh(at('2026-10-03T20:00:00Z'));
+    expect(result.applied).toHaveLength(12);
+    expect(result.applied[0]).toBe('daily/l_mi_sun.zip');
+  });
+
+  it('uses listing times for selection but download metadata and counts for persistence', async () => {
+    const dbPath = await built();
+    client.withDaily({ 'l_pg_mon.zip': DAILY_PG_MON, 'l_mi_mon.zip': DAILY_MI_MON });
+    client.listDailyFiles = async () => [
+      { name: 'l_pg_mon.zip', lastModified: '2026-09-28T12:01:09Z' },
+      { name: 'l_mi_mon.zip' },
+      { name: 'l_mw_mon.zip', lastModified: '2026-09-28T12:03:00Z' },
+    ];
+    const result = await refresh();
+    expect(result.applied).toEqual(['daily/l_pg_mon.zip', 'daily/l_mi_mon.zip']);
+    expect(
+      client.calls.filter((call) => call.method === 'head' && call.path?.startsWith('daily/')),
+    ).toEqual([{ method: 'head', path: 'daily/l_mi_mon.zip' }]);
+    expect(await checkpoint(dbPath)).toBe(DAILY_MI_MON.countsCreated);
+    await readDb(dbPath, (db) => {
+      expect(
+        db
+          .prepare<{ last_modified: string }>(
+            'SELECT last_modified FROM ingest_files WHERE path = ?',
+          )
+          .get('daily/l_pg_mon.zip')?.last_modified,
+      ).toBe(DAILY_PG_MON.lastModified);
+      expect(
+        db
+          .prepare<{ n: number }>('SELECT count(*) AS n FROM ingest_files WHERE path = ?')
+          .get('daily/l_mw_mon.zip')?.n,
+      ).toBe(0);
+    });
+  });
+
+  it('rejects a missing post-checkpoint day before applying any file', async () => {
+    await built();
+    client.withDaily({ 'l_pg_tue.zip': DAILY_PG_TUE });
+    await expect(refresh()).rejects.toMatchObject({ data: { reason: 'stale_checkpoint' } });
+    expect(client.downloads('daily/l_pg_tue.zip')).toBe(0);
+  });
+
+  it('does not require pre-checkpoint rows or historical files for a new unknown code', async () => {
+    const dbPath = await built();
+    client.withDaily({ 'l_pg_mon.zip': DAILY_PG_MON });
+    await refresh();
+    client.withDaily({
+      'l_pg_tue.zip': DAILY_PG_TUE,
+      'l_zz_tue.zip': emptyDaily('2026-09-29T12:01:00Z'),
+    });
+    const result = await refresh();
+    expect(result.applied).toEqual(['daily/l_pg_tue.zip', 'daily/l_zz_tue.zip']);
+    expect(await checkpoint(dbPath)).toBe('2026-09-29T12:01:00Z');
+  });
+
+  it.each([
+    ['2026-03-08T13:00:00Z', '2026-03-14T12:00:00Z', false],
+    ['2026-03-08T13:00:00Z', '2026-03-15T12:00:00Z', true],
+    ['2026-11-01T14:00:00Z', '2026-11-07T13:00:00Z', false],
+    ['2026-11-01T14:00:00Z', '2026-11-08T13:00:00Z', true],
+  ])(
+    'bounds rotation using Eastern calendar dates across DST (%s, %s)',
+    async (start, latest, stale) => {
+      const dbPath = await built();
+      const store = createUlsStore(dbPath);
+      await store.writeState({ status: 'complete', checkpoint: start });
+      await store.close();
+      const first = Date.parse(`${start.slice(0, 10)}T12:00:00Z`);
+      const end = Date.parse(latest);
+      const days = Math.round((end - first) / 86_400_000);
+      client.withDaily(
+        Object.fromEntries(
+          Array.from({ length: days }, (_, index) => {
+            const date = new Date(first + (index + 1) * 86_400_000)
+              .toISOString()
+              .replace('.000Z', 'Z');
+            return [`l_pg_day${String.fromCharCode(97 + index)}.zip`, emptyDaily(date)];
+          }),
+        ),
+      );
+      if (stale)
+        await expect(refresh(end)).rejects.toMatchObject({ data: { reason: 'stale_checkpoint' } });
+      else expect((await refresh(end)).applied).toHaveLength(days);
+    },
+  );
+
+  it('honors cancellation during HEAD fallback without applying files', async () => {
+    await built();
+    client.withDaily({ 'l_pg_mon.zip': DAILY_PG_MON });
+    const controller = new AbortController();
+    const reason = new Error('cancel metadata');
+    client.head = async (_path, signal) => {
+      controller.abort(reason);
+      signal?.throwIfAborted();
+      throw new Error('unreachable');
+    };
+    await expect(
+      fixtureIngester(mirror, { client, groups: ['paging', 'mdsitfs'] }).refresh(controller.signal),
+    ).rejects.toBe(reason);
+    expect(client.downloads('daily/l_pg_mon.zip')).toBe(0);
+  });
+
+  it('honors cancellation during download without moving the checkpoint', async () => {
+    const dbPath = await built();
+    client.withDaily({ 'l_pg_mon.zip': DAILY_PG_MON });
+    const controller = new AbortController();
+    const reason = new Error('cancel download');
+    client.download = async (_path, _destination, signal) => {
+      controller.abort(reason);
+      signal?.throwIfAborted();
+      throw new Error('unreachable');
+    };
+    await expect(
+      fixtureIngester(mirror, { client, groups: ['paging', 'mdsitfs'] }).refresh(controller.signal),
+    ).rejects.toBe(reason);
+    expect(await checkpoint(dbPath)).toBe(PAGING_WEEKLY.countsCreated);
+  });
+
   it('fails with a conflict when no generation is published', async () => {
     mirror = await tempMirror();
     client = new FakeIngestClient();
@@ -984,9 +1114,9 @@ describe('daily refresh', () => {
     expect(existsSync(join(mirror.mirrorDir, LOCK_FILE))).toBe(false);
   });
 
-  it('fails on a checkpoint older than six days and reports it while the index stays ready', async () => {
+  it('rejects a potentially overwritten post-checkpoint slot while the index stays ready', async () => {
     const dbPath = await built();
-    client.withDaily({ 'l_pg_mon.zip': DAILY_PG_MON });
+    client.withDaily({ 'l_pg_sat.zip': emptyDaily('2026-10-04T12:00:00Z') });
     const errors: unknown[][] = [];
     const stale = fixtureIngester(mirror, {
       client,
@@ -998,7 +1128,7 @@ describe('daily refresh', () => {
       code: JsonRpcErrorCode.Conflict,
       data: { reason: 'stale_checkpoint', checkpoint: '2026-09-27T13:38:53Z' },
     });
-    expect(client.calls.filter((call) => call.method === 'list')).toEqual([]);
+    expect(client.calls.filter((call) => call.method === 'list')).toHaveLength(1);
     // A failure the scheduler handles: recorded in the sync state, never logged as an error.
     expect(errors).toEqual([]);
     const store = createUlsStore(dbPath);
@@ -1007,7 +1137,7 @@ describe('daily refresh', () => {
         status: 'error',
         checkpoint: '2026-09-27T13:38:53Z',
         completedAt: expect.any(String),
-        error: expect.stringContaining('more than six days old'),
+        error: expect.stringContaining('daily listing cannot cover'),
       });
     } finally {
       await store.close();
@@ -1023,7 +1153,7 @@ describe('daily refresh', () => {
     expect(await service.ready()).toBe(true);
     const coverage = await service.coverage();
     expect(coverage.index).toMatchObject({ ready: true, status: 'ready' });
-    expect(coverage.index.error).toContain('more than six days old');
+    expect(coverage.index.error).toContain('daily listing cannot cover');
   });
 
   it('replaces record sets by USI, skips unindexed codes, and keeps lease links whole', async () => {
@@ -1142,6 +1272,8 @@ describe('daily refresh', () => {
 
   it('never applies a file older than the checkpoint; an empty day still advances it', async () => {
     const dbPath = await built();
+    client.withDaily({ 'l_pg_mon.zip': emptyDaily('2026-09-28T12:00:00Z') });
+    await refresh();
     client.withDaily({ 'l_pg_sun.zip': DAILY_PG_SUN, 'l_pg_tue.zip': DAILY_PG_TUE });
     const result = await refresh();
     expect(result.applied).toEqual(['daily/l_pg_tue.zip']);

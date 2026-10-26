@@ -115,13 +115,22 @@ async function refresh(ingester: UlsIngester, log: JobLog, signal: AbortSignal):
     });
   } catch (err) {
     const reason = reasonOf(err);
+    signal.throwIfAborted();
     if (reason !== 'stale_checkpoint' && reason !== 'rebuild_required') throw err;
     log.notice(
       reason === 'stale_checkpoint'
-        ? 'The index checkpoint is older than the daily window; running the weekly rebuild instead.'
+        ? 'The daily listing cannot cover the index checkpoint; running the weekly rebuild instead.'
         : 'The published index was built by an earlier version of this server; running the weekly rebuild instead.',
     );
-    await rebuild(ingester, log, signal);
+    const outcome = await ingester.rebuild(signal);
+    log.info(`Scheduled ULS weekly rebuild ${outcome.status}`, { generation: outcome.generation });
+    if (outcome.status === 'skipped') throw err;
+    signal.throwIfAborted();
+    const refreshed = await ingester.refresh(signal);
+    log.info('Scheduled ULS daily refresh complete', {
+      generation: refreshed.generation,
+      applied: refreshed.applied.length,
+    });
   }
 }
 
