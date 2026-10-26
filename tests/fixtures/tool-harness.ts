@@ -7,6 +7,7 @@
  */
 
 import type { runToolContract } from '@cyanheads/mcp-ts-core/testing';
+import MarkdownIt from 'markdown-it';
 import { expect } from 'vitest';
 import type { ServiceGroup } from '@/services/uls/codes.js';
 import {
@@ -123,24 +124,50 @@ export function expectDeclaredError(
 /** Registry text as an inline markdown slot shows it: CR/LF runs flattened to one space. */
 const flattened = (text: string) => text.replace(/[\r\n]+/g, ' ');
 
+/** CommonMark with tables, as clients render the complete document. HTML stays enabled to expose injection. */
+export const markdown = new MarkdownIt('commonmark', { html: true }).enable('table');
+
+/** Visible text from the parsed document, including code literals and table cells. */
+export function renderedText(document: string): string {
+  return markdown
+    .parse(document, {})
+    .flatMap((token) => {
+      if (token.children)
+        return token.children
+          .map((child) =>
+            child.type === 'softbreak' || child.type === 'hardbreak'
+              ? '\n'
+              : child.type === 'text' || child.type === 'code_inline'
+                ? child.content
+                : '',
+          )
+          .join('');
+      return token.type === 'fence' || token.type === 'code_block' ? token.content : [];
+    })
+    .join('\n');
+}
+
 /**
  * Assert that `rendered` carries every string and number in `value`, recursively. Strings
  * are compared as an inline slot renders them. Booleans and nulls are asserted by callers,
  * since each tool words them its own way.
  */
 export function expectCarries(rendered: string, value: unknown, path = '$'): void {
-  if (typeof value === 'string') {
-    expect(rendered, path).toContain(flattened(value));
-  } else if (typeof value === 'number') {
-    expect(rendered, path).toContain(String(value));
-  } else if (Array.isArray(value)) {
-    value.forEach((item, i) => {
-      expectCarries(rendered, item, `${path}[${i}]`);
-    });
-  } else if (value !== null && typeof value === 'object') {
-    for (const [key, item] of Object.entries(value))
-      expectCarries(rendered, item, `${path}.${key}`);
+  const visible = renderedText(rendered);
+  function visit(item: unknown, itemPath: string): void {
+    if (typeof item === 'string') {
+      expect(visible, itemPath).toContain(flattened(item));
+    } else if (typeof item === 'number') {
+      expect(visible, itemPath).toContain(String(item));
+    } else if (Array.isArray(item)) {
+      item.forEach((child, i) => {
+        visit(child, `${itemPath}[${i}]`);
+      });
+    } else if (item !== null && typeof item === 'object') {
+      for (const [key, child] of Object.entries(item)) visit(child, `${itemPath}.${key}`);
+    }
   }
+  visit(value, path);
 }
 
 /** The single text block a `format()` call renders. */

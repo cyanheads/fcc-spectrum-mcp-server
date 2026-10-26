@@ -7,6 +7,7 @@
 
 import { tool, z } from '@cyanheads/mcp-ts-core';
 import { JsonRpcErrorCode } from '@cyanheads/mcp-ts-core/errors';
+import { escapeMarkdownInline } from '@cyanheads/mcp-ts-core/utils';
 import { cell, yesNo } from '@/mcp-server/tools/format-helpers.js';
 import { blankAsUnset, caseFolded } from '@/mcp-server/tools/input-schemas.js';
 import {
@@ -314,7 +315,11 @@ export const listReference = tool('fcc_spectrum_list_reference', {
       if (index.antennaCoverageIncomplete) lines.push('**Antenna coverage incomplete:** Yes.');
       if (index.pathCoverageIncomplete) lines.push('**Path coverage incomplete:** Yes.');
       if (index.error) {
-        lines.push('**Last error:**', ...index.error.split(/\r?\n/).map((line) => `> ${line}`));
+        lines.push(
+          '**Last error:**',
+          ...index.error.split(/\r\n|\r|\n/).map((line) => `> ${escapeMarkdownInline(line)}`),
+          '',
+        );
       }
     }
 

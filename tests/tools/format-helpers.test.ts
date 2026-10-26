@@ -18,34 +18,63 @@ import {
   stateSourceText,
   yesNo,
 } from '@/mcp-server/tools/format-helpers.js';
+import { markdown, renderedText } from '../fixtures/tool-harness.js';
 
 describe('inline', () => {
+  it.each([
+    ['emphasis', 'ARKANSAS, STATE OF**GOV**'],
+    ['code and underscores', 'Acme *RF* _West_ `HQ`'],
+    ['links and HTML', '[Acme](https://x.test) ![x](y) <b>West</b>'],
+    ['backslashes and pipes', 'A\\*B \\[C] | D'],
+    ['trailing heading hashes', 'Filed #'],
+    ['reference definition', '[label]: https://x.test'],
+    ['edge whitespace', '\u00a0 Filed \t'],
+  ])('preserves literal %s throughout a parsed document', (_label, value) => {
+    const document = `## ${inline(value)}\n\n- **Registry:** ${inline(value)}\n\n> ${inline(value)}\n\n| Filed |\n| --- |\n| ${cell(value)} |\n\nAfter.`;
+    const visible = renderedText(document);
+    expect(visible.split(value)).toHaveLength(5);
+    const html = markdown.render(document);
+    expect(html).not.toMatch(/<(?:a |img |em>|code>|b>)/);
+    expect(html).toContain('<p>After.</p>');
+  });
+  it('preserves CR/LF flattening and authored formatting in a complete document', () => {
+    const document = `## Registry\n\n- **Name:** ${inline('Radio\r\nClub')}\n\n| Code | Label |\n| --- | --- |\n| A | ${cell('Line\r\nTwo | East')} |`;
+    expect(renderedText(document)).toBe(
+      'Registry\nName: Radio Club\nCode\nLabel\nA\nLine Two | East',
+    );
+    expect(
+      markdown.parse(document, {}).filter((token) => token.type === 'heading_open'),
+    ).toHaveLength(1);
+  });
   it.each([
     ['a CR', 'Carriage\rReturn', 'Carriage Return'],
     ['an LF', 'Line\nFeed', 'Line Feed'],
     ['a CRLF run', 'One\r\n\r\nTwo', 'One Two'],
     ['plain text', 'No breaks | here', 'No breaks | here'],
   ])('flattens %s to one space', (_label, input, expected) => {
-    expect(inline(input)).toBe(expected);
+    expect(renderedText(inline(input))).toBe(expected);
   });
 
   it.each([
-    ['a link', '[Acme](https://x.test)', '\\[Acme\\](https://x.test)'],
-    ['an image', '![x](https://x.test/p.png)', '!\\[x\\](https://x.test/p.png)'],
-    ['a reference link', '[Acme][1]', '\\[Acme\\]\\[1\\]'],
-    ['an HTML tag', '<img src=x onerror=y>', '\\<img src=x onerror=y\\>'],
-    ['an autolink', '<https://x.test>', '\\<https://x.test\\>'],
-  ])('makes %s inert', (_label, input, expected) => {
-    expect(inline(input)).toBe(expected);
+    ['a link', '[Acme](https://x.test)'],
+    ['an image', '![x](https://x.test/p.png)'],
+    ['a reference link', '[Acme][1]'],
+    ['an HTML tag', '<img src=x onerror=y>'],
+    ['an autolink', '<https://x.test>'],
+  ])('makes %s inert', (_label, input) => {
+    expect(renderedText(inline(input))).toBe(input);
+    expect(markdown.render(inline(input))).not.toMatch(/<(?:a |img |b>)/);
   });
 
   it('escapes the backslashes before a bracket, so a filed backslash cannot cancel the escape', () => {
-    expect(inline('\\[Acme](https://x.test)')).toBe('\\\\\\[Acme\\](https://x.test)');
-    expect(inline('\\\\<b>')).toBe('\\\\\\\\\\<b\\>');
+    expect(renderedText(inline('\\[Acme](https://x.test)'))).toBe('\\[Acme](https://x.test)');
+    expect(renderedText(inline('\\\\<b>'))).toBe('\\\\<b>');
   });
 
-  it('leaves parentheses, exclamation marks, backticks, and other backslashes as filed', () => {
-    expect(inline('Acme (West) Radio! `HQ` C:\\dir')).toBe('Acme (West) Radio! `HQ` C:\\dir');
+  it('renders parentheses, exclamation marks, backticks, and backslashes as filed', () => {
+    expect(renderedText(inline('Acme (West) Radio! `HQ` C:\\dir'))).toBe(
+      'Acme (West) Radio! `HQ` C:\\dir',
+    );
   });
 });
 
@@ -56,7 +85,7 @@ describe('cell', () => {
 
   it('escapes a backslash before the pipe, so an escaped pipe stays escaped', () => {
     expect(cell('A\\|B')).toBe('A\\\\\\|B');
-    expect(cell('C:\\dir')).toBe('C:\\\\dir');
+    expect(renderedText(cell('C:\\dir'))).toBe('C:\\dir');
   });
 
   it('flattens CR/LF as well', () => {
@@ -65,7 +94,8 @@ describe('cell', () => {
 
   it('makes link, image, and HTML syntax inert', () => {
     expect(cell('![x](https://x.test)')).toBe('!\\[x\\](https://x.test)');
-    expect(cell('<b>Acme</b>')).toBe('\\<b\\>Acme\\</b\\>');
+    expect(renderedText(cell('<b>Acme</b>'))).toBe('<b>Acme</b>');
+    expect(markdown.render(cell('<b>Acme</b>'))).not.toContain('<b>');
     expect(cell('\\[Acme](y)')).toBe('\\\\\\[Acme\\](y)');
   });
 });
@@ -118,6 +148,15 @@ describe('bandText', () => {
 });
 
 describe('renderAppliedFilters', () => {
+  it('preserves caller text literally without activating Markdown', () => {
+    const document = renderAppliedFilters({
+      licensee: '*Radio* `HQ` [link](https://x.test)\\path',
+    });
+    expect(renderedText(document)).toBe(
+      'Applied filters: licensee="*Radio* `HQ` [link](https://x.test)\\\\path"',
+    );
+    expect(markdown.render(document)).not.toMatch(/<(?:a |em>|code>)/);
+  });
   it('JSON-quotes strings, prints numbers bare, and drops undefined values', () => {
     expect(
       renderAppliedFilters({
@@ -131,7 +170,7 @@ describe('renderAppliedFilters', () => {
 
   it('keeps free text with CR/LF and quotes on one line', () => {
     const rendered = renderAppliedFilters({ licensee: 'Acme "Radio"\r\nCo' });
-    expect(rendered).toBe('**Applied filters:** licensee="Acme \\"Radio\\"\\r\\nCo"');
+    expect(renderedText(rendered)).toBe('Applied filters: licensee="Acme \\"Radio\\"\\r\\nCo"');
     expect(rendered).not.toMatch(/[\r\n]/);
   });
 

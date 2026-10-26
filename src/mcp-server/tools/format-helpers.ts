@@ -1,27 +1,23 @@
 /**
  * @fileoverview Markdown helpers shared by the tools' `format()` functions: flattening
- * upstream-authored text for inline slots and escaping its link, image, and HTML syntax,
+ * upstream-authored text for inline slots and preserving its literal CommonMark rendering,
  * escaping table cells, and rendering the values every data tool repeats (callsigns,
  * licensee names, state sources, frequency bands, applied filters, option lists).
  * @module mcp-server/tools/format-helpers
  */
 
+import { escapeMarkdownInline } from '@cyanheads/mcp-ts-core/utils';
+
 const flatten = (text: string) => text.replace(/[\r\n]+/g, ' ');
 
 /**
- * Registry text for an inline markdown slot: CR/LF runs flattened to one space, and `[`, `]`,
- * `<`, and `>` backslash-escaped so a filed name renders as text, never as a link, image, or
- * HTML. A backslash run right before one of them is doubled, so a filed backslash cannot
- * cancel the escape. Everything else stays as filed, so names read cleanly as raw text.
+ * Registry text rendered literally in an inline Markdown slot, with CR/LF runs flattened
+ * to one space. Server-authored Markdown stays outside this boundary.
  */
-export const inline = (text: string) =>
-  flatten(text).replace(
-    /(\\*)([[\]<>])/g,
-    (_match, slashes: string, char: string) => `${slashes}${slashes}\\${char}`,
-  );
+export const inline = (text: string) => escapeMarkdownInline(flatten(text));
 
-/** Registry text for a markdown table cell: every backslash, pipe, bracket, and angle bracket escaped. */
-export const cell = (text: string) => flatten(text).replace(/[\\|[\]<>]/g, '\\$&');
+/** Registry text rendered literally in a Markdown table cell, with CR/LF runs flattened. */
+export const cell = inline;
 
 /** A boolean as `yes`/`no`. */
 export const yesNo = (value: boolean) => (value ? 'yes' : 'no');
@@ -49,12 +45,15 @@ export function bandText(lowMhz: number, highMhz?: number): string {
 
 /**
  * One markdown line for an `appliedFilters` enrichment object. Caller-supplied strings are
- * JSON-quoted, so free text stays visibly delimited and cannot break the line.
+ * JSON-quoted and escaped, so free text stays visibly delimited and renders literally.
  */
 export function renderAppliedFilters(filters: Readonly<Record<string, unknown>>): string {
   const parts = Object.entries(filters)
     .filter(([, value]) => value !== undefined)
-    .map(([key, value]) => `${key}=${typeof value === 'string' ? JSON.stringify(value) : value}`);
+    .map(
+      ([key, value]) =>
+        `${key}=${typeof value === 'string' ? inline(JSON.stringify(value)) : value}`,
+    );
   return `**Applied filters:** ${parts.length ? parts.join(' · ') : 'none'}`;
 }
 

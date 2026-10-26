@@ -16,6 +16,7 @@ import { listReference } from '@/mcp-server/tools/definitions/list-reference.too
 import { LICENSE_STATUSES, RADIO_SERVICES } from '@/services/uls/codes.js';
 import { createUlsStore, LOCK_FILE, POINTER_FILE } from '@/services/uls/schema.js';
 import { initUlsIndexService, PATH_COVERAGE_NOTICE } from '@/services/uls/uls-index-service.js';
+import { markdown, renderedText } from '../fixtures/tool-harness.js';
 import {
   buildFixtureIndex,
   FIXTURE_GROUPS,
@@ -475,6 +476,31 @@ describe('incomplete path coverage', () => {
 });
 
 describe('format()', () => {
+  it('keeps each error line literal and terminates the quote before later output', () => {
+    const error =
+      '## source **failed**\r- retry\n1. instruction\r\n[label]: https://x.test\n\n[follow][label]';
+    const output: Output = {
+      topic: 'coverage',
+      index: { ready: false, status: 'none', error },
+      redactIndividuals: true,
+    };
+    const rendered = formatText(output);
+    expect(output.index?.error).toBe(error);
+    expect(renderedText(rendered)).toContain(
+      '## source **failed**\n- retry\n1. instruction\n[label]: https://x.test\n[follow][label]',
+    );
+    const tokens = markdown.parse(rendered, {});
+    expect(tokens.filter((token) => token.type === 'heading_open')).toHaveLength(1);
+    expect(
+      tokens.some(
+        (token) => token.type === 'bullet_list_open' || token.type === 'ordered_list_open',
+      ),
+    ).toBe(false);
+    expect(markdown.render(rendered)).not.toContain('<a ');
+    expect(markdown.render(rendered)).toContain(
+      '</blockquote>\n<p><strong>Redact individuals:</strong> yes</p>',
+    );
+  });
   /** The text of the one block `format()` renders. */
   const formatText = (output: Output): string => {
     const blocks = listReference.format?.(output) ?? [];
@@ -509,7 +535,7 @@ describe('format()', () => {
       groups: [{ group: 'paging', indexed: false }],
       redactIndividuals: true,
     });
-    expect(rendered).toContain('**Last error:**\n> first line\n> ## not a heading\n> third');
+    expect(renderedText(rendered)).toContain('first line\n## not a heading\nthird');
     expect(rendered).toContain('| paging | no | — | — | — | — |');
     expect(rendered).toContain('**Redact individuals:** yes');
   });

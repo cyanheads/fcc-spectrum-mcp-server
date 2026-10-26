@@ -30,6 +30,7 @@ import {
   expectDeclaredError,
   formattedText,
   releaseIndex,
+  renderedText,
   successOf,
   useIndex,
 } from '../fixtures/tool-harness.js';
@@ -595,7 +596,7 @@ describe('warm index', () => {
       expect(structured.notice).toBeUndefined();
       const rendered = contractText(result);
       for (const field of [
-        `**dataAsOf:** ${DATA_AS_OF}`,
+        `**dataAsOf:** \`${DATA_AS_OF}\``,
         '**truncated:** false',
         '**shown:** 0',
         '**cap:** 100',
@@ -1588,6 +1589,25 @@ describe('format()', () => {
     ],
   };
 
+  it('renders nested antenna and site text literally without changing the structured record', () => {
+    const value = '*Filed* `HQ` [label](https://x.test) #';
+    const nested = {
+      ...location,
+      name: value,
+      antennas: [{ antennaNumber: 1, polarization: value, make: value, frequencies: [] }],
+    };
+    const result: Output = {
+      found: true,
+      license: { ...license, amateur: { trusteeCallsign: value, previousCallsign: value } },
+      locations: [nested],
+      otherCallsignRecords: [],
+    };
+    const document = formattedText(getLicense.format?.(result));
+    expect(result.locations?.[0]?.antennas[0]?.polarization).toBe(value);
+    expect(result.license?.amateur?.trusteeCallsign).toBe(value);
+    expect(renderedText(document).split(value)).toHaveLength(6);
+  });
+
   it('flattens CR/LF in every registry text slot so each stays on its line', () => {
     const rendered = formattedText(
       getLicense.format?.({
@@ -1697,8 +1717,8 @@ describe('format()', () => {
       }),
     );
     const row = rendered.split('\n').find((line) => line.startsWith('| 6175 '));
-    expect(row).toBe(
-      '| 6175 | 6180 | 30 | FX\\|O | 1 | 2 | 55.5 | Acme\\|Radio M\\\\1 | 30M0D7W, 10\\|M0 |',
+    expect(renderedText(rendered)).toContain(
+      '6175\n6180\n30\nFX|O\n1\n2\n55.5\nAcme|Radio M\\1\n30M0D7W, 10|M0',
     );
     expect(row?.split(/(?<!\\)\|/)).toHaveLength(11);
   });

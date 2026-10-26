@@ -99,12 +99,13 @@ describe('.env preload', () => {
 });
 
 describe('createApp() options', () => {
-  it('registers every tool and resource definition, no prompts, and a stateless session', async () => {
+  it('registers every definition, published skills, no prompts, and a stateless session', async () => {
     const { options, tools, resources } = await loadIndex();
     expect(options).toMatchObject({
       name: 'fcc-spectrum-mcp-server',
       title: 'fcc-spectrum-mcp-server',
       prompts: [],
+      skills: 'skills',
       sessionMode: 'stateless',
     });
     expect(options.tools).toBe(tools.allToolDefinitions);

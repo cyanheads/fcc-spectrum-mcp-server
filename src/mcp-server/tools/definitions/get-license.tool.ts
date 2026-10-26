@@ -764,9 +764,9 @@ function licenseLines(license: z.infer<typeof LicenseSchema>): string[] {
     const fields = [
       amateur.operatorClass &&
         `**Operator class:** ${amateur.operatorClass}${amateur.operatorClassLabel ? ` (${amateur.operatorClassLabel})` : ''}`,
-      amateur.trusteeCallsign && `**Trustee callsign:** ${amateur.trusteeCallsign}`,
+      amateur.trusteeCallsign && `**Trustee callsign:** ${inline(amateur.trusteeCallsign)}`,
       trustee && `**Trustee name:** ${trustee}`,
-      amateur.previousCallsign && `**Previous callsign:** ${amateur.previousCallsign}`,
+      amateur.previousCallsign && `**Previous callsign:** ${inline(amateur.previousCallsign)}`,
     ].filter(Boolean);
     if (fields.length) lines.push(fields.join(' · '));
   }
@@ -864,7 +864,7 @@ function locationLines(location: z.infer<typeof LocationSchema>): string[] {
         : `Antenna ${antenna.antennaNumber}`;
     lines.push(
       '',
-      `**${heading}**${part('Type', antenna.antennaTypeCode)}${part('Height to tip m', antenna.heightToTipM)}${part('Height to center m', antenna.heightToCenterM)}${part('HAAT m', antenna.haatM)}${part('Azimuth °', antenna.azimuthDeg)}${part('Gain dBi', antenna.gainDbi)}${part('Beamwidth °', antenna.beamwidthDeg)}${part('Polarization', antenna.polarization)}${part('Make', antenna.make && inline(antenna.make))}${part('Model', antenna.model && inline(antenna.model))}${part('Filed records', antenna.recordCount && `${antenna.recordCount} (fields that differ between them are omitted)`)}`,
+      `**${heading}**${part('Type', antenna.antennaTypeCode)}${part('Height to tip m', antenna.heightToTipM)}${part('Height to center m', antenna.heightToCenterM)}${part('HAAT m', antenna.haatM)}${part('Azimuth °', antenna.azimuthDeg)}${part('Gain dBi', antenna.gainDbi)}${part('Beamwidth °', antenna.beamwidthDeg)}${part('Polarization', antenna.polarization && inline(antenna.polarization))}${part('Make', antenna.make && inline(antenna.make))}${part('Model', antenna.model && inline(antenna.model))}${part('Filed records', antenna.recordCount && `${antenna.recordCount} (fields that differ between them are omitted)`)}`,
     );
     if (antenna.frequencies.length) {
       lines.push(

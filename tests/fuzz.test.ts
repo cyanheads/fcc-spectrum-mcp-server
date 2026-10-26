@@ -13,10 +13,18 @@ import { licenseResource } from '@/mcp-server/resources/definitions/license.reso
 import { findTransmitters } from '@/mcp-server/tools/definitions/find-transmitters.tool.js';
 import { getLicense } from '@/mcp-server/tools/definitions/get-license.tool.js';
 import { allToolDefinitions } from '@/mcp-server/tools/definitions/index.js';
+import { listReference } from '@/mcp-server/tools/definitions/list-reference.tool.js';
 import { searchFrequencies } from '@/mcp-server/tools/definitions/search-frequencies.tool.js';
 import { searchLicenses } from '@/mcp-server/tools/definitions/search-licenses.tool.js';
 import { createUlsStore } from '@/services/uls/schema.js';
-import { contractText, releaseIndex, useIndex } from './fixtures/tool-harness.js';
+import {
+  contractText,
+  dms,
+  markdown,
+  releaseIndex,
+  renderedText,
+  useIndex,
+} from './fixtures/tool-harness.js';
 import { DATA_QUALITY_WEEKLY } from './fixtures/uls-fixtures.js';
 import { buildFixtureIndex, type FixtureIndex } from './fixtures/uls-index.js';
 
@@ -33,6 +41,81 @@ afterAll(async () => {
 });
 
 describe('fuzz', () => {
+  it('preserves registry literals on both surfaces through every data-tool formatter', async () => {
+    const literal = 'ARKANSAS, STATE OF**GOV** `HQ` [name](https://x.test)';
+    const special = await buildFixtureIndex();
+    const store = createUlsStore(join(special.mirrorDir, special.generation));
+    try {
+      (await store.raw())
+        .prepare('UPDATE licenses SET licensee_name = ?, is_individual = 0')
+        .run(literal);
+      await store.close();
+      await useIndex(special.mirrorDir);
+      const cases = [
+        [searchLicenses, { callsign: 'KZZ901', limit: 1 }],
+        [getLicense, { usi: '1001', max_frequencies: 1 }],
+        [
+          findTransmitters,
+          {
+            latitude: dms(47, 36, 22.3),
+            longitude: dms(122, 19, 55.6, true),
+            radius_km: 5,
+            limit: 1,
+          },
+        ],
+        [searchFrequencies, { frequency_low: 2496, frequency_high: 2530, limit: 1 }],
+      ] as const;
+      for (const [definition, input] of cases) {
+        const result = await runToolContract(definition, input);
+        expect(result.isError, definition.name).toBeFalsy();
+        expect(JSON.stringify(result.structuredContent), definition.name).toContain(literal);
+        expect(renderedText(contractText(result)), definition.name).toContain(literal);
+        expect(markdown.render(contractText(result))).not.toContain('<a ');
+      }
+    } finally {
+      await store.close();
+      await releaseIndex();
+      await special.dispose();
+      await useIndex(fixture.mirrorDir);
+    }
+  });
+
+  it('preserves caller filters on an empty page without activating their Markdown', async () => {
+    const licensee = '*NO MATCH* `HQ` [site](https://x.test)';
+    const result = await runToolContract(searchLicenses, { licensee });
+    expect(result.isError).toBeFalsy();
+    expect(result.structuredContent).toMatchObject({ licenses: [], appliedFilters: { licensee } });
+    expect(renderedText(contractText(result))).toContain(
+      'licensee="*NO MATCH* `HQ` [site](https://x.test)"',
+    );
+    expect(markdown.render(contractText(result))).not.toMatch(/<(?:a |em>|code>HQ)/);
+  });
+
+  it('renders persisted ingest errors literally through the coverage contract', async () => {
+    const error = '## source *failed*\n- retry\r\n[label]: https://x.test\n\n[follow][label]';
+    const store = createUlsStore(join(fixture.mirrorDir, fixture.generation));
+    const original = await store.readState();
+    try {
+      await store.writeState({ ...original, status: 'error', error });
+      const result = await runToolContract(listReference, { topic: 'coverage' });
+      expect(result.isError).toBeFalsy();
+      expect(result.structuredContent).toMatchObject({ index: { error } });
+      const document = contractText(result);
+      expect(renderedText(document)).toContain(
+        '## source *failed*\n- retry\n[label]: https://x.test',
+      );
+      expect(markdown.render(document)).not.toContain('<a ');
+      expect(
+        markdown
+          .parse(document, {})
+          .filter((token) => token.type === 'heading_open')
+          .map((token) => token.tag),
+      ).toEqual(['h2', 'h3']);
+    } finally {
+      await store.writeState(original);
+      await store.close();
+    }
+  });
   it.each(allToolDefinitions.map((definition) => [definition.name, definition] as const))(
     '%s survives valid and adversarial inputs',
     async (_name, definition) => {

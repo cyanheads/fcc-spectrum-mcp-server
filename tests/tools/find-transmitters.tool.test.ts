@@ -29,6 +29,7 @@ import {
   formattedText,
   type PageEnrichment,
   releaseIndex,
+  renderedText,
   successOf,
   useIndex,
 } from '../fixtures/tool-harness.js';
@@ -629,7 +630,7 @@ describe('warm index', () => {
       expect(structured.nextCursor).toBeUndefined();
       const rendered = contractText(result);
       expect(rendered).toContain('No sites matched.');
-      expect(rendered).toContain(`**dataAsOf:** ${DATA_AS_OF}`);
+      expect(rendered).toContain(`**dataAsOf:** \`${DATA_AS_OF}\``);
       expect(rendered).toContain(
         `**Search center:** ${PORTLAND.latitude}, ${PORTLAND.longitude} · radius 5 km`,
       );
@@ -946,7 +947,7 @@ describe('format()', () => {
   it('escapes | and \\ in the station-class and emission cells', () => {
     const rendered = formattedText(findTransmitters.format?.({ sites: [site] }));
     const row = rendered.split('\n').find((line) => line.startsWith('| 152.24 '));
-    expect(row).toBe('| 152.24 | — | 0.0112 | FB\\|2, FX\\\\O | 250 | 55.5 | 11K2F3E, 10\\|M0 |');
+    expect(renderedText(rendered)).toContain('FB|2, FX\\O\n250\n55.5\n11K2F3E, 10|M0');
     expect(row?.split(/(?<!\\)\|/)).toHaveLength(9);
   });
 

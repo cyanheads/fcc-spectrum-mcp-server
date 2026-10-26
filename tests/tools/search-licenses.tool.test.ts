@@ -24,6 +24,7 @@ import {
   formattedText,
   type PageEnrichment,
   releaseIndex,
+  renderedText,
   successOf,
   useIndex,
 } from '../fixtures/tool-harness.js';
@@ -424,7 +425,7 @@ describe('warm index', () => {
       expect(structured.nextCursor).toBeUndefined();
       const rendered = contractText(result);
       expect(rendered).toContain('No records matched.');
-      expect(rendered).toContain(`**dataAsOf:** ${DATA_AS_OF}`);
+      expect(rendered).toContain(`**dataAsOf:** \`${DATA_AS_OF}\``);
       expect(rendered).toContain('**Applied filters:** callsign="KZZ000" · status="A"');
       expect(rendered).toContain('**0 total**');
       expect(rendered).toContain(`> ${structured.notice}`);
@@ -498,7 +499,7 @@ describe('warm index', () => {
       const rendered = formattedText(searchLicenses.format?.({ licenses: [license] }));
       expect(rendered).not.toMatch(/\r/);
       const lines = rendered.split('\n');
-      expect(lines).toContain('- **Licensee:** Acme Radio | Relay Co · **Redacted:** no');
+      expect(renderedText(rendered)).toContain('Licensee: Acme Radio | Relay Co · Redacted: no');
       expect(lines).toContain(
         '- **Status:** A (Active) · **Service:** CD (Paging and Radiotelephone) · **Group:** paging · **Lease:** no',
       );

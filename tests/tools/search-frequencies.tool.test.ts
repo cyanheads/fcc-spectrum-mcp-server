@@ -27,6 +27,7 @@ import {
   formattedText,
   type PageEnrichment,
   releaseIndex,
+  renderedText,
   successOf,
   useIndex,
 } from '../fixtures/tool-harness.js';
@@ -706,7 +707,7 @@ describe('warm index', () => {
       expect(structured.nextCursor).toBeUndefined();
       const rendered = contractText(result);
       expect(rendered).toContain('No authorizations matched.');
-      expect(rendered).toContain(`**dataAsOf:** ${DATA_AS_OF}`);
+      expect(rendered).toContain(`**dataAsOf:** \`${DATA_AS_OF}\``);
       expect(rendered).toContain(
         '**Applied filters:** frequency_low_mhz=100 · frequency_high_mhz=100 · kind="both" · status="A"',
       );
@@ -1195,8 +1196,8 @@ describe('format()', () => {
 
   it('escapes | and \\ in the station-class and emission values', () => {
     const rendered = formattedText(searchFrequencies.format?.({ assignments: [site] }));
-    expect(rendered.split('\n')).toContain(
-      '- **Bandwidth:** 0.0112 MHz · **Station classes:** FB\\|2, FX\\\\O · **Max ERP:** 250 W · **Emissions:** 11K2F3E, 10\\|M0',
+    expect(renderedText(rendered)).toContain(
+      'Bandwidth: 0.0112 MHz · Station classes: FB|2, FX\\O · Max ERP: 250 W · Emissions: 11K2F3E, 10|M0',
     );
   });
 
