@@ -1,6 +1,6 @@
 # fcc-spectrum-mcp-server - Directory Structure
 
-Generated on: 2026-10-26 06:36:20
+Generated on: 2026-10-26 06:59:12
 
 ```text
 fcc-spectrum-mcp-server/
@@ -26,6 +26,7 @@ fcc-spectrum-mcp-server/
 ├── changelog/
 │   ├── 0.1.x/
 │   ├── 0.2.x/
+│   ├── 0.3.x/
 │   └── template.md
 ├── docs/
 │   └── design.md

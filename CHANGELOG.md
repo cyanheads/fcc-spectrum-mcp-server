@@ -2,6 +2,10 @@
 
 All notable changes to this project. Each entry links to its full per-version file in [changelog/](changelog/).
 
+## [0.3.0](changelog/0.3.x/0.3.0.md) — 2026-10-25
+
+Daily refresh uses FCC listing timestamps and publication-day coverage, preserves literal registry text, and serves a guide for multi-step ULS investigations.
+
 ## [0.2.1](changelog/0.2.x/0.2.1.md) — 2026-10-25
 
 License lookups list microwave paths with receive-site coordinates and receiver callsigns, the daily refresh skips files for service groups the index does not hold, and the mirror CLI ships compiled so npm and .mcpb installs can build their index.
