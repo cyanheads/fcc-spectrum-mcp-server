@@ -1,9 +1,11 @@
 /**
  * @fileoverview Tests for the scheduled ingest job's logic, run in-process through
- * `runIngestJob()`: the skip while no generation is published, the skip on a held ingest lock,
- * the stale-checkpoint and rebuild-required fallbacks from the daily refresh to the weekly
- * rebuild, the completion lines, failures written as a failure record, the ingester's log lines
- * written as log records, the abort signal, and the server PID passed to the ingester. Ingester
+ * `runIngestJob()`: the skip while no generation is published, the skips on a held ingest lock
+ * and on a held sync lease (a real one, then the run that takes it over once it lapses), the
+ * stale-checkpoint and rebuild-required fallbacks from the daily refresh to the weekly rebuild,
+ * the completion lines, failures written as a failure record, the ingester's log lines written
+ * as log records, the abort signal and the stop it reports, and the server PID passed to the
+ * ingester. Ingester
  * calls that would reach the bulk host are spied; `fetch` throws if called. The job as a child
  * process is covered in `ingest-schedule.test.ts`.
  * @module tests/services/uls/ingest-job.test
@@ -26,13 +28,15 @@ import {
 import { UlsBulkClient } from '@/services/uls/bulk-client.js';
 import { UlsIngester } from '@/services/uls/ingest.js';
 import { type IngestJobKind, type JobRecord, runIngestJob } from '@/services/uls/ingest-job.js';
-import { LOCK_FILE, POINTER_FILE, writePointer } from '@/services/uls/schema.js';
+import { createUlsStore, LOCK_FILE, POINTER_FILE, writePointer } from '@/services/uls/schema.js';
 import {
   buildFixtureIndex,
   FIXTURE_GENERATION,
   FIXTURE_GROUPS,
   type FixtureIndex,
   makeTempMirror,
+  SYNC_LEASE_TTL_MS,
+  SYNC_LOCKED_MESSAGE,
   type TempMirror,
 } from '../../fixtures/uls-index.js';
 
@@ -41,6 +45,8 @@ const SERVER_PID = 4242;
 
 /** A job clock well past the weekly fixture; gap decisions use publication metadata. */
 const STALE_NOW = '2026-10-10T17:00:00Z';
+
+const syncLocked = () => conflict(SYNC_LOCKED_MESSAGE, { reason: 'sync_locked' });
 
 let records: JobRecord[];
 let fetchSpy: MockInstance;
@@ -152,6 +158,7 @@ describe('published generation', () => {
     vi.spyOn(UlsIngester.prototype, 'rebuild').mockResolvedValue({
       status: 'skipped',
       generation: FIXTURE_GENERATION,
+      licenses: {},
     });
     expect(await run('refresh', fixture.mirrorDir)).toBe(false);
     expect(failure()).toMatchObject({ data: { reason: 'stale_checkpoint' } });
@@ -163,24 +170,91 @@ describe('published generation', () => {
       .mockRejectedValue(conflict('Daily coverage is missing.', { reason: 'stale_checkpoint' }));
     const rebuild = vi
       .spyOn(UlsIngester.prototype, 'rebuild')
-      .mockResolvedValue({ status: 'rebuilt', generation: FIXTURE_GENERATION });
+      .mockResolvedValue({ status: 'rebuilt', generation: FIXTURE_GENERATION, licenses: {} });
     expect(await run('refresh', fixture.mirrorDir)).toBe(false);
     expect(refresh).toHaveBeenCalledTimes(2);
     expect(rebuild).toHaveBeenCalledTimes(1);
     expect(failure()).toMatchObject({ data: { reason: 'stale_checkpoint' } });
   });
 
-  it('does not start fallback after a cancelled refresh', async () => {
+  it('reports a refresh stopped by its signal as a stop, without starting the fallback', async () => {
     const controller = new AbortController();
-    const reason = new Error('cancel refresh');
     vi.spyOn(UlsIngester.prototype, 'refresh').mockImplementation(async () => {
-      controller.abort(reason);
+      controller.abort(new Error('cancel refresh'));
       throw conflict('Daily coverage is missing.', { reason: 'stale_checkpoint' });
     });
     const rebuild = vi.spyOn(UlsIngester.prototype, 'rebuild');
-    expect(await run('refresh', fixture.mirrorDir, controller.signal)).toBe(false);
+    expect(await run('refresh', fixture.mirrorDir, controller.signal)).toBe(true);
     expect(rebuild).not.toHaveBeenCalled();
-    expect(failure()).toMatchObject({ message: 'cancel refresh' });
+    const message =
+      'Scheduled ULS daily refresh stopped before it finished; the next run resumes from its saved progress.';
+    expect(lines()).toEqual([['notice', message]]);
+    expect(fieldsOf(message)).toEqual({ reason: 'cancel refresh' });
+    expect(failure()).toBeUndefined();
+  });
+
+  it.each([
+    ['rebuild', 'weekly rebuild'],
+    ['refresh', 'daily refresh'],
+  ] as const)(
+    'skips the %s with a notice when another process holds the sync lease',
+    async (kind, label) => {
+      vi.spyOn(UlsIngester.prototype, kind).mockRejectedValue(syncLocked());
+      expect(await run(kind, fixture.mirrorDir)).toBe(true);
+
+      const message = `Scheduled ULS ${label} skipped: another process is syncing the index.`;
+      expect(lines()).toEqual([['notice', message]]);
+      expect(fieldsOf(message)).toEqual({ message: SYNC_LOCKED_MESSAGE });
+      expect(failure()).toBeUndefined();
+    },
+  );
+
+  it('skips a daily-gap fallback whose rebuild finds the sync lease held', async () => {
+    const refresh = vi
+      .spyOn(UlsIngester.prototype, 'refresh')
+      .mockRejectedValue(conflict('Daily coverage is missing.', { reason: 'stale_checkpoint' }));
+    vi.spyOn(UlsIngester.prototype, 'rebuild').mockRejectedValue(syncLocked());
+    expect(await run('refresh', fixture.mirrorDir)).toBe(true);
+
+    expect(lines()).toEqual([
+      [
+        'notice',
+        'The daily listing cannot cover the index checkpoint; running the weekly rebuild instead.',
+      ],
+      ['notice', 'Scheduled ULS daily refresh skipped: another process is syncing the index.'],
+    ]);
+    expect(refresh).toHaveBeenCalledTimes(1);
+    expect(failure()).toBeUndefined();
+  });
+
+  it('skips a refresh while another process holds the sync lease, and runs once that lease lapses', async () => {
+    vi.spyOn(UlsBulkClient.prototype, 'listDailyFiles').mockResolvedValue([]);
+    const store = createUlsStore(join(fixture.mirrorDir, FIXTURE_GENERATION));
+    const held = await store.syncLease?.claim('a process that stopped renewing', SYNC_LEASE_TTL_MS);
+    try {
+      if (!held) throw new Error('The published fixture generation has no free sync lease.');
+      expect(await run('refresh', fixture.mirrorDir)).toBe(true);
+      const message = 'Scheduled ULS daily refresh skipped: another process is syncing the index.';
+      expect(lines().at(-1)).toEqual(['notice', message]);
+      expect(fieldsOf(message)).toEqual({ message: SYNC_LOCKED_MESSAGE });
+      expect(lines().filter(([level]) => level === 'error')).toEqual([]);
+      expect(failure()).toBeUndefined();
+      // The ingest lock is released and the other holder keeps its lease.
+      await expect(readFile(lockPath, 'utf8')).rejects.toMatchObject({ code: 'ENOENT' });
+      expect(await store.syncLease?.renew(held)).toBe(true);
+
+      records = [];
+      vi.useFakeTimers({ toFake: ['Date'] });
+      vi.setSystemTime(Date.now() + SYNC_LEASE_TTL_MS + 1000);
+      expect(await run('refresh', fixture.mirrorDir)).toBe(true);
+      expect(lines()).toContainEqual(['info', 'Scheduled ULS daily refresh complete']);
+      expect(failure()).toBeUndefined();
+      // The run took the lapsed lease over, so the old holder no longer holds it.
+      expect(await store.syncLease?.renew(held)).toBe(false);
+    } finally {
+      if (held) await store.syncLease?.release(held);
+      await store.close();
+    }
   });
 
   it.each([
@@ -232,7 +306,7 @@ describe('published generation', () => {
     );
     const rebuild = vi
       .spyOn(UlsIngester.prototype, 'rebuild')
-      .mockResolvedValue({ status: 'skipped', generation: FIXTURE_GENERATION });
+      .mockResolvedValue({ status: 'skipped', generation: FIXTURE_GENERATION, licenses: {} });
     const signal = new AbortController().signal;
     expect(await run('refresh', fixture.mirrorDir, signal)).toBe(false);
 
@@ -262,6 +336,7 @@ describe('published generation', () => {
     vi.spyOn(UlsIngester.prototype, 'rebuild').mockResolvedValue({
       status: 'skipped',
       generation: FIXTURE_GENERATION,
+      licenses: {},
     });
     await run('refresh', fixture.mirrorDir);
 
@@ -281,6 +356,7 @@ describe('published generation', () => {
       generation: FIXTURE_GENERATION,
       applied: ['daily/l_pg_mon.zip', 'daily/l_mk_mon.zip'],
       result: {} as never,
+      licenses: {},
     });
     const rebuild = vi.spyOn(UlsIngester.prototype, 'rebuild');
     expect(await run('refresh', fixture.mirrorDir)).toBe(true);
@@ -317,10 +393,15 @@ describe('published generation', () => {
     const refresh = vi
       .spyOn(UlsIngester.prototype, 'refresh')
       .mockRejectedValueOnce(conflict('Rebuild required.', { reason: 'rebuild_required' }))
-      .mockResolvedValue({ generation: FIXTURE_GENERATION, applied: [], result: {} as never });
+      .mockResolvedValue({
+        generation: FIXTURE_GENERATION,
+        applied: [],
+        result: {} as never,
+        licenses: {},
+      });
     const rebuild = vi
       .spyOn(UlsIngester.prototype, 'rebuild')
-      .mockResolvedValue({ status: 'rebuilt', generation: FIXTURE_GENERATION });
+      .mockResolvedValue({ status: 'rebuilt', generation: FIXTURE_GENERATION, licenses: {} });
     expect(await run('refresh', fixture.mirrorDir)).toBe(true);
 
     expect(lines()).toEqual([
@@ -353,7 +434,7 @@ describe('published generation', () => {
   it('logs the rebuild outcome and the published generation', async () => {
     const rebuild = vi
       .spyOn(UlsIngester.prototype, 'rebuild')
-      .mockResolvedValue({ status: 'rebuilt', generation: FIXTURE_GENERATION });
+      .mockResolvedValue({ status: 'rebuilt', generation: FIXTURE_GENERATION, licenses: {} });
     expect(await run('rebuild', fixture.mirrorDir)).toBe(true);
     expect(rebuild).toHaveBeenCalledTimes(1);
     expect(lines()).toEqual([['info', 'Scheduled ULS weekly rebuild rebuilt']]);
@@ -380,7 +461,7 @@ describe('published generation', () => {
     expect(failure()).toEqual({ type: 'failure', message: 'disk full' });
   });
 
-  it('passes the abort signal to the ingester and fails with its reason once aborted', async () => {
+  it('passes the abort signal to the ingester and reports a stop, not a failure, once aborted', async () => {
     const rebuild = vi.spyOn(UlsIngester.prototype, 'rebuild').mockImplementation(
       (signal?: AbortSignal) =>
         new Promise((_resolve, reject) => {
@@ -392,7 +473,27 @@ describe('published generation', () => {
     await vi.waitFor(() => expect(rebuild).toHaveBeenCalled());
     controller.abort(new Error('Interrupted by SIGTERM'));
 
-    expect(await outcome).toBe(false);
-    expect(failure()).toMatchObject({ message: 'Interrupted by SIGTERM' });
+    expect(await outcome).toBe(true);
+    const message =
+      'Scheduled ULS weekly rebuild stopped before it finished; the next run resumes from its saved progress.';
+    expect(lines()).toEqual([['notice', message]]);
+    expect(fieldsOf(message)).toEqual({ reason: 'Interrupted by SIGTERM' });
+    expect(failure()).toBeUndefined();
+  });
+
+  it('reports a stop even when the aborted ingester rejects with an error of its own', async () => {
+    const controller = new AbortController();
+    vi.spyOn(UlsIngester.prototype, 'rebuild').mockImplementation(async () => {
+      controller.abort(new Error('Interrupted by SIGINT'));
+      throw serviceUnavailable('The download stream closed.');
+    });
+    expect(await run('rebuild', fixture.mirrorDir, controller.signal)).toBe(true);
+    expect(lines()).toEqual([
+      [
+        'notice',
+        'Scheduled ULS weekly rebuild stopped before it finished; the next run resumes from its saved progress.',
+      ],
+    ]);
+    expect(failure()).toBeUndefined();
   });
 });

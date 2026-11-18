@@ -3,7 +3,9 @@
  * derived site states, the live-status rule, emissions joined on `freq_seq_id`, market
  * blocks, summaries, per-type line statistics, and what is never ingested), the resume rule,
  * rebuild triggers and generation naming (a retired generation is never reused), the ingest
- * lock, the daily replace-by-USI refresh (band bounds widened per file), and `marketStates`. Every upstream byte comes from the fixture zips through the fake client.
+ * lock, the daily replace-by-USI refresh (band bounds widened per file), the license records
+ * each result reports per group or daily file (a resumed, skipped, and empty run included), and
+ * `marketStates`. Every upstream byte comes from the fixture zips through the fake client.
  * @module tests/services/uls/ingest.test
  */
 
@@ -107,11 +109,15 @@ describe('rebuild content (all three groups)', () => {
   let client: FakeIngestClient;
   let result: RebuildResult;
   let dbPath: string;
+  const info: [string, unknown][] = [];
 
   beforeAll(async () => {
     mirror = await tempMirror();
     client = new FakeIngestClient().withWeekly(FIXTURE_GROUPS);
-    result = await fixtureIngester(mirror, { client }).rebuild();
+    result = await fixtureIngester(mirror, {
+      client,
+      logger: { info: (message, data) => info.push([message, data]) },
+    }).rebuild();
     dbPath = join(mirror.mirrorDir, result.generation);
   });
 
@@ -122,6 +128,28 @@ describe('rebuild content (all three groups)', () => {
       file: FIXTURE_GENERATION,
       publishedAt: '2026-09-29T20:00:00Z',
     });
+  });
+
+  it('logs the license records each group loaded', () => {
+    expect(info.filter(([message]) => message === 'Loaded license records')).toEqual([
+      ['Loaded license records', { group: 'paging', records: 8 }],
+      ['Loaded license records', { group: 'mdsitfs', records: 8 }],
+      ['Loaded license records', { group: 'amat', records: 3 }],
+    ]);
+  });
+
+  it('reports the runner totals without its write counters, and the license records of each group', () => {
+    const counts = { pagesFetched: 10, total: 19 };
+    const licenses = { paging: 8, mdsitfs: 8, amat: 3 };
+    expect(result).toEqual({
+      status: 'rebuilt',
+      generation: FIXTURE_GENERATION,
+      result: counts,
+      licenses,
+    });
+    expect(info.filter(([message]) => message === 'Published index generation')).toEqual([
+      ['Published index generation', { generation: FIXTURE_GENERATION, ...counts, licenses }],
+    ]);
   });
 
   it('downloads each snapshot once and records the earliest counts time as the checkpoint', async () => {
@@ -581,6 +609,8 @@ describe('resume rule', () => {
 
     const rerun = await ingester.rebuild();
     expect(rerun.status).toBe('rebuilt');
+    // The records step is not replayed; its count comes from the stored line statistics.
+    expect(rerun.licenses).toEqual({ mdsitfs: 8 });
     expect(client.downloads('complete/l_mdsitfs.zip')).toBe(1);
     await readDb(join(mirror.mirrorDir, rerun.generation), (db) => {
       expect(count(db, 'SELECT count(*) AS n FROM licenses')).toBe(8);
@@ -631,7 +661,11 @@ describe('resume rule', () => {
     }
 
     const rerun = await ingester.rebuild();
-    expect(rerun).toMatchObject({ status: 'rebuilt', generation: 'fcc-uls-20260927T134047Z.db' });
+    expect(rerun).toMatchObject({
+      status: 'rebuilt',
+      generation: 'fcc-uls-20260927T134047Z.db',
+      licenses: { mdsitfs: 8 },
+    });
     expect(client.downloads('complete/l_mdsitfs.zip')).toBe(1);
     await readDb(target, (db) => {
       expect(count(db, 'SELECT count(*) AS n FROM licenses')).toBe(8);
@@ -639,6 +673,30 @@ describe('resume rule', () => {
       expect(count(db, 'SELECT count(*) AS n FROM locations')).toBe(3);
       expect(count(db, 'SELECT count(*) AS n FROM market_blocks')).toBe(6);
     });
+  });
+
+  it('reports every group on a resumed build, the ones loaded before the interruption included', async () => {
+    const mirror = await tempMirror();
+    const client = new FakeIngestClient().withWeekly(['paging', 'mdsitfs']);
+    let crashed = false;
+    const published: unknown[] = [];
+    const logger = {
+      info: (message: string, data?: unknown) => {
+        if (message === 'Published index generation') published.push(data);
+        const group = (data as { group?: string } | undefined)?.group;
+        if (message === 'Loaded license records' && group === 'mdsitfs' && !crashed) {
+          crashed = true;
+          throw new Error('Crashed after the second group loaded its records.');
+        }
+      },
+    };
+    const ingester = fixtureIngester(mirror, { client, groups: ['paging', 'mdsitfs'], logger });
+    await expect(ingester.rebuild()).rejects.toThrow('Crashed after the second group');
+
+    const rerun = await ingester.rebuild();
+    // Neither group's records step runs again: paging finished, mdsitfs resumes at technical.
+    expect(rerun.licenses).toEqual({ paging: 8, mdsitfs: 8 });
+    expect(published).toEqual([expect.objectContaining({ licenses: { paging: 8, mdsitfs: 8 } })]);
   });
 
   it('discards a partial build an earlier schema started instead of resuming it', async () => {
@@ -724,7 +782,7 @@ describe('rebuild triggers and naming', () => {
     const ingester = fixtureIngester(mirror, { client, groups: ['paging'] });
     const first = await ingester.rebuild();
     const second = await ingester.rebuild();
-    expect(second).toEqual({ status: 'skipped', generation: first.generation });
+    expect(second).toEqual({ status: 'skipped', generation: first.generation, licenses: {} });
     expect(client.downloads('complete/l_paging.zip')).toBe(1);
   });
 
@@ -1161,6 +1219,9 @@ describe('daily refresh', () => {
     client.withDaily({ 'l_mi_mon.zip': DAILY_MI_MON, 'l_pg_mon.zip': DAILY_PG_MON });
     const result = await refresh();
     expect(result.applied).toEqual(['daily/l_pg_mon.zip', 'daily/l_mi_mon.zip']);
+    // 1101's code is in no indexed group, so l_pg_mon writes three of its four headers.
+    expect(result.licenses).toEqual({ 'daily/l_pg_mon.zip': 3, 'daily/l_mi_mon.zip': 2 });
+    expect(result.result).toEqual({ pagesFetched: 2, total: 17 });
     expect(await checkpoint(dbPath)).toBe('2026-09-28T12:02:00Z');
 
     await readDb(dbPath, (db) => {
@@ -1256,7 +1317,14 @@ describe('daily refresh', () => {
       '2002',
       '2004',
     ]);
-    expect(lease.found && lease.license.leasedFrom).toEqual([{ callsign: 'KZZ801', usi: '2001' }]);
+    expect(lease.found && lease.license.leasedFrom).toEqual([
+      {
+        callsign: 'KZZ801',
+        usi: '2001',
+        licenseeName: 'Sample Broadband Inc',
+        licenseeRedacted: false,
+      },
+    ]);
     expect((await service.coverage()).index.lastDailyApplied).toBe('2026-09-28T12:02:00Z');
   });
 
@@ -1267,6 +1335,7 @@ describe('daily refresh', () => {
     const downloadsBefore = client.calls.filter((call) => call.method === 'download').length;
     const rerun = await refresh();
     expect(rerun.applied).toEqual([]);
+    expect(rerun.licenses).toEqual({});
     expect(client.calls.filter((call) => call.method === 'download').length).toBe(downloadsBefore);
   });
 
@@ -1277,6 +1346,8 @@ describe('daily refresh', () => {
     client.withDaily({ 'l_pg_sun.zip': DAILY_PG_SUN, 'l_pg_tue.zip': DAILY_PG_TUE });
     const result = await refresh();
     expect(result.applied).toEqual(['daily/l_pg_tue.zip']);
+    // A file carrying no HD records writes no license.
+    expect(result.licenses).toEqual({ 'daily/l_pg_tue.zip': 0 });
     expect(client.downloads('daily/l_pg_sun.zip')).toBe(0);
     expect(await checkpoint(dbPath)).toBe('2026-09-29T12:00:05Z');
     await readDb(dbPath, (db) => {

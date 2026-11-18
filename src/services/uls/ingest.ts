@@ -106,12 +106,24 @@ export interface UlsIngesterOptions {
   tempDir?: string;
 }
 
+/**
+ * The sync runner's totals: pages the ingest yielded and the index's license count. The
+ * runner's `recordsApplied` and `tombstonesApplied` count only `applyBatch` writes, and every
+ * row here goes through the raw handle, so they are left out.
+ */
+export type IngestTotals = Pick<SyncResult, 'pagesFetched' | 'total'>;
+
 /** Outcome of {@link UlsIngester.rebuild}. */
 export interface RebuildResult {
   /** The published generation file after the call. */
   generation: string;
+  /**
+   * License records written, by service group in build order, groups loaded before an
+   * interrupted run included; empty when the rebuild was skipped.
+   */
+  licenses: Record<string, number>;
   /** Runner totals when a rebuild ran. */
-  result?: SyncResult;
+  result?: IngestTotals;
   /** `skipped` when no selected snapshot is newer than the published generation. */
   status: 'rebuilt' | 'skipped';
 }
@@ -121,7 +133,9 @@ export interface RefreshResult {
   /** Daily files applied, oldest first. */
   applied: string[];
   generation: string;
-  result: SyncResult;
+  /** License records written, by daily file path in apply order; empty when none applied. */
+  licenses: Record<string, number>;
+  result: IngestTotals;
 }
 
 /** Rows per staging transaction. */
@@ -204,7 +218,7 @@ export class UlsIngester {
         this.logger.info?.('Every selected snapshot is already indexed; rebuild skipped.', {
           generation: pointer.file,
         });
-        return { status: 'skipped', generation: pointer.file };
+        return { status: 'skipped', generation: pointer.file, licenses: {} };
       }
 
       const target = targetGeneration(remote, pointer);
@@ -226,13 +240,19 @@ export class UlsIngester {
       const store = createUlsStore(join(this.mirrorDir, target));
       const mirror = this.defineMirror(store, (ctx) => this.initPages(ctx, store));
       try {
-        const result = await mirror.runSync({ mode: 'init', signal });
+        const { pagesFetched, total } = await mirror.runSync({ mode: 'init', signal });
+        const licenses = weeklyLicenses(await store.raw(), this.services);
         await writePointer(this.mirrorDir, {
           file: target,
           publishedAt: toIsoSeconds(this.now()),
         });
-        this.logger.info?.('Published index generation', { generation: target, ...result });
-        return { status: 'rebuilt', generation: target, result };
+        this.logger.info?.('Published index generation', {
+          generation: target,
+          pagesFetched,
+          total,
+          licenses,
+        });
+        return { status: 'rebuilt', generation: target, result: { pagesFetched, total }, licenses };
       } finally {
         await mirror.close();
       }
@@ -260,7 +280,8 @@ export class UlsIngester {
           { mirrorDir: this.mirrorDir },
         );
       }
-      const applied: string[] = [];
+      // License records each applied file wrote, by path, in apply order.
+      const written = new Map<string, number>();
       const store = createUlsStore(join(this.mirrorDir, pointer.file));
       try {
         if (isRebuildRequired(await store.raw())) {
@@ -284,14 +305,20 @@ export class UlsIngester {
           throw error;
         }
         const mirror = this.defineMirror(store, (ctx) =>
-          this.refreshPages(ctx, store, pending, applied),
+          this.refreshPages(ctx, store, pending, written),
         );
-        const result = await mirror.runSync({ mode: 'refresh', signal });
+        const { pagesFetched, total } = await mirror.runSync({ mode: 'refresh', signal });
+        const applied = [...written.keys()];
         this.logger.info?.('Daily refresh complete', {
           generation: pointer.file,
           applied: applied.length,
         });
-        return { generation: pointer.file, applied, result };
+        return {
+          generation: pointer.file,
+          applied,
+          result: { pagesFetched, total },
+          licenses: Object.fromEntries(written),
+        };
       } finally {
         await store.close();
       }
@@ -512,7 +539,7 @@ export class UlsIngester {
         upsertIngestRow(db, next, null);
       });
       dropStaging(db);
-      this.logger.info?.('Loaded license records', { group, records: stats.HD?.kept ?? 0 });
+      this.logger.info?.('Loaded license records', { group, records: licensesWritten(stats) });
       return next;
     } finally {
       await archive.close();
@@ -641,17 +668,18 @@ export class UlsIngester {
     return pending;
   }
 
+  /** Apply `pending` in order, recording each applied file's license records in `written`. */
   private async *refreshPages(
     ctx: SyncContext,
     store: MirrorStore,
     pending: readonly UlsRemoteFile[],
-    applied: string[],
+    written: Map<string, number>,
   ): AsyncGenerator<SyncPage> {
     const db = await store.raw();
     configureIngestConnection(db);
     for (const file of pending) {
-      const counts = await this.applyDaily(db, file, ctx.signal);
-      applied.push(file.path);
+      const { counts, licenses } = await this.applyDaily(db, file, ctx.signal);
+      written.set(file.path, licenses);
       yield { records: [], checkpoint: counts.createdAt };
     }
     recomputeSummaries(db);
@@ -695,12 +723,15 @@ export class UlsIngester {
     }
   }
 
-  /** Apply one daily file: replace, by USI, every record set it carries. */
+  /**
+   * Apply one daily file: replace, by USI, every record set it carries. Returns its `counts`
+   * file and the license records it wrote.
+   */
   private async applyDaily(
     db: SqliteHandle,
     file: UlsRemoteFile,
     signal: AbortSignal,
-  ): Promise<CountsFile> {
+  ): Promise<{ counts: CountsFile; licenses: number }> {
     const download = await this.client.download(file.path, this.tempPath(file.path), signal);
     const archive = await this.openArchive(download.destination);
     try {
@@ -758,12 +789,13 @@ export class UlsIngester {
         );
       });
       dropStaging(db);
+      const licenses = licensesWritten(stats);
       this.logger.info?.('Applied daily file', {
         path: file.path,
-        records: stats.HD?.kept ?? 0,
+        records: licenses,
         created: counts.createdAt,
       });
-      return counts;
+      return { counts, licenses };
     } finally {
       await archive.close();
       await rm(download.destination, { force: true });
@@ -909,6 +941,28 @@ function parseStats(json: string): RecordStats {
 function setKept(stats: RecordStats, type: RecordType, kept: number): void {
   const entry = stats[type];
   if (entry) entry.kept = kept;
+}
+
+/**
+ * License records a file wrote: its `HD` kept count, which the records step sets to the rows
+ * inserted. A file with no `HD.dat` inserts none.
+ */
+function licensesWritten(stats: RecordStats): number {
+  return stats.HD?.kept ?? 0;
+}
+
+/**
+ * License records each group's weekly snapshot wrote, in build order, read from the stored line
+ * statistics so a resumed build counts the groups it loaded before the interruption.
+ */
+function weeklyLicenses(db: SqliteHandle, groups: readonly ServiceGroup[]): Record<string, number> {
+  const weekly = readIngestRows(db, 'weekly');
+  return Object.fromEntries(
+    groups.flatMap((group) => {
+      const row = weekly.get(weeklyZipPath(group));
+      return row ? [[group, licensesWritten(parseStats(row.stats_json))]] : [];
+    }),
+  );
 }
 
 // --- Staging -----------------------------------------------------------------------------
