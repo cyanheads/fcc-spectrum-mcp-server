@@ -2,6 +2,10 @@
 
 All notable changes to this project. Each entry links to its full per-version file in [changelog/](changelog/).
 
+## [0.3.1](changelog/0.3.x/0.3.1.md) — 2026-11-17
+
+Cursors bind to the search that minted them, find_transmitters reaches 230 km, get_license names lessees and lessors, and search_licenses filters by expiration and grant date. mirror:init and mirror:refresh report license counts.
+
 ## [0.3.0](changelog/0.3.x/0.3.0.md) — 2026-10-25
 
 Daily refresh uses FCC listing timestamps and publication-day coverage, preserves literal registry text, and serves a guide for multi-step ULS investigations.

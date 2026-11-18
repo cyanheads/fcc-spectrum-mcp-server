@@ -1,6 +1,6 @@
 # fcc-spectrum-mcp-server - Directory Structure
 
-Generated on: 2026-10-26 06:59:12
+Generated on: 2026-11-18 05:51:07
 
 ```text
 fcc-spectrum-mcp-server/
@@ -149,6 +149,7 @@ fcc-spectrum-mcp-server/
 │   │   ├── mirror-refresh.ts
 │   │   └── mirror-verify.ts
 │   ├── config/
+│   │   ├── load-env.ts
 │   │   └── server-config.ts
 │   ├── mcp-server/
 │   │   ├── resources/
@@ -188,6 +189,7 @@ fcc-spectrum-mcp-server/
 │   └── index.ts
 ├── tests/
 │   ├── cli/
+│   │   ├── mirror-init-refresh.test.ts
 │   │   └── mirror-verify.test.ts
 │   ├── config/
 │   │   └── server-config.test.ts
