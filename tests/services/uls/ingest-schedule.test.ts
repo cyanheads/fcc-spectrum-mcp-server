@@ -4,9 +4,11 @@
  * child process — the built `dist/services/uls/ingest-job.js` on Node or Bun against a loopback
  * bulk host, or a stand-in command. Covers the job's log lines relayed at their levels under the
  * job's context, a non-zero exit, a kill, or a failed spawn logged as the run's failure with the
- * next run unaffected, recovery from a job killed mid-run, the removal at startup of a lock an
- * earlier process with this PID left, and `stopIngestSchedule()` (SIGTERM, then SIGKILL after
- * five seconds; a no-op before start; safe after a half-finished start). The job's own logic is
+ * next run unaffected, recovery from a job killed mid-run (the next run skips on the dead run's
+ * sync lease; one after the lease lapses builds), the removal at startup of a lock an earlier
+ * process with this PID left, and `stopIngestSchedule()` (SIGTERM, which the job reports as a
+ * stop, then SIGKILL after five seconds; a no-op before start; safe after a half-finished
+ * start). The job's own logic is
  * covered in-process in `ingest-job.test.ts`. The built entry is rebuilt first when any file
  * under `src/services/uls/` is newer.
  * @module tests/services/uls/ingest-schedule.test
@@ -32,6 +34,7 @@ import {
   type MockInstance,
   vi,
 } from 'vitest';
+import { type JobRecord, runIngestJob } from '@/services/uls/ingest-job.js';
 import {
   type IngestScheduleOptions,
   startIngestSchedule,
@@ -43,6 +46,8 @@ import {
   buildFixtureIndex,
   type FixtureIndex,
   makeTempMirror,
+  SYNC_LEASE_TTL_MS,
+  SYNC_LOCKED_MESSAGE,
   type TempMirror,
 } from '../../fixtures/uls-index.js';
 
@@ -440,7 +445,7 @@ describe('a job run as a child process', () => {
     expect(messages('info')).toContain(`Job '${REFRESH_ID}' completed successfully.`);
   });
 
-  it('recovers from a job killed mid-run: the next run reclaims its lock and builds', async () => {
+  it('recovers from a job killed mid-run: the next run reclaims its lock and skips while the dead run’s sync lease is live, and a run after the lease lapses builds', async () => {
     host.hang = true;
     await start(fixture.mirrorDir, RUNTIMES.node, host.baseUrl);
     const run = fire(REBUILD_ID);
@@ -459,12 +464,44 @@ describe('a job run as a child process', () => {
     });
     expect((await readPointer(fixture.mirrorDir))?.file).toBe(fixture.generation);
 
+    // The killed run never released the target generation's sync lease, which holds until it expires.
     host.hang = false;
     await fire(REBUILD_ID);
     expect(messages('warning')).toContain(
       'Reclaiming an ingest lock left by a process that is gone.',
     );
-    expect(messages('info')).toContain('Scheduled ULS weekly rebuild rebuilt');
+    const skipped = 'Scheduled ULS weekly rebuild skipped: another process is syncing the index.';
+    expect(callFor('notice', skipped)?.[1]).toMatchObject({
+      extra: { jobId: REBUILD_ID, message: SYNC_LOCKED_MESSAGE },
+    });
+    expect(callsFor('error', 'Scheduled ULS weekly rebuild failed')).toHaveLength(1);
+    expect((await readPointer(fixture.mirrorDir))?.file).toBe(fixture.generation);
+    expect(existsSync(lockPath)).toBe(false);
+
+    // Once the lease lapses, a run takes it over and resumes the build. A child process keeps
+    // its own clock, so this run is in-process with the clock moved past the lease's expiry,
+    // still advancing so the bulk client's pacer releases its requests.
+    vi.useFakeTimers({ toFake: ['Date'], shouldAdvanceTime: true });
+    try {
+      vi.setSystemTime(Date.now() + SYNC_LEASE_TTL_MS + 1000);
+      const records: JobRecord[] = [];
+      const spec = {
+        kind: 'rebuild',
+        baseUrl: host.baseUrl,
+        mirrorDir: fixture.mirrorDir,
+        services: ['paging'],
+        serverPid: process.pid,
+      } as const;
+      expect(
+        await runIngestJob(spec, (record) => records.push(record), new AbortController().signal),
+      ).toBe(true);
+      expect(records).toContainEqual(
+        expect.objectContaining({ level: 'info', message: 'Scheduled ULS weekly rebuild rebuilt' }),
+      );
+      expect(records.filter((record) => record.type === 'failure')).toEqual([]);
+    } finally {
+      vi.useRealTimers();
+    }
     expect(await readPointer(fixture.mirrorDir)).toMatchObject({ file: NEWER_GENERATION });
     expect(existsSync(lockPath)).toBe(false);
   }, 30_000);
@@ -482,7 +519,7 @@ describe('stopIngestSchedule', () => {
     await fixture.dispose();
   });
 
-  it('stops a running job with SIGTERM: it releases the lock and leaves the published generation', async () => {
+  it('stops a running job with SIGTERM: it reports a stop, releases the lock, and leaves the published generation', async () => {
     host.hang = true;
     await start(fixture.mirrorDir, RUNTIMES.node, host.baseUrl);
     const run = fire(REBUILD_ID);
@@ -495,9 +532,15 @@ describe('stopIngestSchedule', () => {
 
     expect(elapsed).toBeLessThan(5000);
     expect(ourJobIds()).toEqual([]);
-    const [, failure, context] = callFor('error', 'Scheduled ULS weekly rebuild failed') ?? [];
-    expect((failure as Error).message).toBe('Interrupted by SIGTERM');
-    expect(context).toMatchObject({ extra: { exitCode: 1, signal: null } });
+    // A stop is not a failure: the runner logs it at info, the job at notice, and it exits 0.
+    expect(messages('error')).toEqual([]);
+    expect(messages('info')).toContain('Mirror sync stopped');
+    const stopped =
+      'Scheduled ULS weekly rebuild stopped before it finished; the next run resumes from its saved progress.';
+    expect(callFor('notice', stopped)?.[1]).toMatchObject({
+      operation: `scheduler:job:${REBUILD_ID}`,
+      extra: { jobId: REBUILD_ID, reason: 'Interrupted by SIGTERM' },
+    });
     expect(existsSync(join(fixture.mirrorDir, LOCK_FILE))).toBe(false);
     expect((await readPointer(fixture.mirrorDir))?.file).toBe(fixture.generation);
     expect(await fixture.service().ready()).toBe(true);

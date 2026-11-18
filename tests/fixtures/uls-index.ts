@@ -28,6 +28,13 @@ export const FIXTURE_GROUPS: readonly FixtureGroup[] = ['paging', 'mdsitfs', 'am
 /** Generation the three fixture groups build into (named from paging's `Last-Modified`). */
 export const FIXTURE_GENERATION = 'fcc-uls-20260927T133855Z.db';
 
+/** The framework's default sync-lease TTL: a holder that stops renewing keeps the lease this long. */
+export const SYNC_LEASE_TTL_MS = 120_000;
+
+/** The rejection `runSync` throws while another run holds the store's sync lease. */
+export const SYNC_LOCKED_MESSAGE =
+  'Mirror sync is already in progress in another process or instance.';
+
 /** A fresh directory under `os.tmpdir()`. */
 export function makeTempDir(prefix: string): Promise<string> {
   return mkdtemp(join(tmpdir(), `fcc-spectrum-${prefix}-`));

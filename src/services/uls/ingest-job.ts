@@ -5,9 +5,10 @@
  * {@link IngestJobSpec} from its first argument and writes one JSON {@link JobRecord} per line
  * to stdout: each log line, which the server relays at its level under the job's context, and
  * a failure record before it exits non-zero. SIGTERM or SIGINT aborts the run, which persists
- * its progress and releases the lock. An unpublished index and a held lock are skips; a daily
- * refresh whose checkpoint has aged past the daily window, or whose index needs a rebuild,
- * runs the weekly rebuild instead.
+ * its progress, releases the lock, and exits zero with a notice: a stop, not a failure. An
+ * unpublished index, a held ingest lock, and a store whose sync lease another process holds
+ * are skips; a daily refresh whose checkpoint has aged past the daily window, or whose index
+ * needs a rebuild, runs the weekly rebuild instead.
  * @module services/uls/ingest-job
  */
 
@@ -58,8 +59,19 @@ const LABELS: Record<IngestJobKind, string> = {
 };
 
 /**
- * Run one scheduled job, writing its log lines through `write`. A skip counts as success.
- * Returns false when the job failed, after writing a failure record.
+ * Failure reasons that skip the run rather than fail it, each with the holder it names: the
+ * ingest lock (another `mirror:*` command or job on this mirror directory), and the store's sync
+ * lease (another process syncing the same generation file, or one killed outright within the
+ * lease's expiry). The next scheduled run tries again.
+ */
+const SKIP_REASONS: ReadonlyMap<unknown, string> = new Map([
+  ['ingest_locked', 'another ingest holds the lock'],
+  ['sync_locked', 'another process is syncing the index'],
+]);
+
+/**
+ * Run one scheduled job, writing its log lines through `write`. A skip, and a run `signal`
+ * stopped, count as success. Returns false when the job failed, after writing a failure record.
  */
 export async function runIngestJob(
   spec: IngestJobSpec,
@@ -88,10 +100,17 @@ export async function runIngestJob(
     else await refresh(ingester, log, signal);
     return true;
   } catch (err) {
-    if (reasonOf(err) === 'ingest_locked') {
-      log.notice(`Scheduled ULS ${label} skipped: another ingest holds the lock.`, {
-        message: (err as Error).message,
-      });
+    // Whatever the run threw on the way out, a run its own signal stopped saved its progress.
+    if (signal.aborted) {
+      log.notice(
+        `Scheduled ULS ${label} stopped before it finished; the next run resumes from its saved progress.`,
+        { reason: messageOf(signal.reason) },
+      );
+      return true;
+    }
+    const skip = SKIP_REASONS.get(reasonOf(err));
+    if (skip) {
+      log.notice(`Scheduled ULS ${label} skipped: ${skip}.`, { message: messageOf(err) });
       return true;
     }
     write(failureRecord(err));
@@ -137,6 +156,10 @@ async function refresh(ingester: UlsIngester, log: JobLog, signal: AbortSignal):
 /** The `data.reason` an ingest failure carries, when it carries one. */
 function reasonOf(err: unknown): unknown {
   return err instanceof McpError ? err.data?.reason : undefined;
+}
+
+function messageOf(value: unknown): string {
+  return value instanceof Error ? value.message : String(value);
 }
 
 /** The failure record for `err`, keeping an `McpError`'s code and data for the server's log. */
