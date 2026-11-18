@@ -35,8 +35,8 @@ US radio spectrum licensing from the FCC's Universal Licensing System, searchabl
 
 | Tool | Description |
 |:---|:---|
-| `fcc_spectrum_search_licenses` | Search licenses and spectrum leases by callsign, licensee name, FRN, market code, radio service, status, or licensee state. |
-| `fcc_spectrum_get_license` | Read one license or lease in full by callsign or USI: licensee, status and dates, locations, antennas, frequencies with emissions, microwave paths, market blocks, and lease links. |
+| `fcc_spectrum_search_licenses` | Search licenses and spectrum leases by callsign, licensee name, FRN, market code, radio service, status, licensee state, or expiration or grant date range. |
+| `fcc_spectrum_get_license` | Read one license or lease in full by callsign or USI: licensee, status and dates, locations, antennas, frequencies with emissions, microwave paths, market blocks, and lease links naming each lessee and parent licensee. |
 | `fcc_spectrum_find_transmitters` | Find FCC-licensed sites within a radius of a coordinate, nearest first, with their filed roles and authorized frequencies. |
 | `fcc_spectrum_search_frequencies` | Find site assignments and market-area spectrum blocks whose occupied band overlaps a frequency or band. |
 | `fcc_spectrum_list_reference` | Decode ULS codes (radio services, station classes, statuses, location and antenna types, applicant types, operator classes) and report index coverage and freshness. |
@@ -54,9 +54,9 @@ License records are also reachable via `fcc_spectrum_get_license`. The [investig
 
 ### `fcc_spectrum_search_licenses` <sub>tool</sub>
 
-- Filters: `callsign`, `licensee` (every word must match the start of a word in the name), `frn`, `market_code` (a geographic-area license's market, matched exactly: `PEA016`, `CMA020`, `D06037`, `NW`; `pea16` reads as `PEA016`), `radio_service`, and `state` (the licensee's mailing state) — at least one required; `status` narrows to `A` (default), `C`, `E`, `L`, `P`, `T`, `X`, or `any`
+- Filters: `callsign`, `licensee` (every word must match the start of a word in the name), `frn`, `market_code` (a geographic-area license's market, matched exactly: `PEA016`, `CMA020`, `D06037`, `NW`; `pea16` reads as `PEA016`), `radio_service`, and `state` (the licensee's mailing state) — at least one required; `status` narrows to `A` (default), `C`, `E`, `L`, `P`, `T`, `X`, or `any`, and `expires_after` / `expires_before` / `granted_after` / `granted_before` (inclusive `YYYY-MM-DD`; a record without that date never matches) narrow by date but are never a search criterion on their own
 - Positive integer `limit` (default 25, capped at 100) with cursor paging; each row carries the `usi` to pass to `fcc_spectrum_get_license`, plus `isLease`, `licenseeRedacted`, and location and frequency counts
-- Typed errors: `no_criteria`, `unknown_radio_service`, `service_not_indexed`, `invalid_cursor`, `index_not_ready`
+- Typed errors: `no_criteria`, `invalid_date_range`, `unknown_radio_service`, `service_not_indexed`, `invalid_cursor`, `index_not_ready`
 
 ---
 
@@ -72,7 +72,7 @@ License records are also reachable via `fcc_spectrum_get_license`. The [investig
 
 ### `fcc_spectrum_find_transmitters` <sub>tool</sub>
 
-- `latitude` / `longitude` as decimal degrees or DMS strings, `radius_km` 0.1–100 (default 5); optional `frequency_low` / `frequency_high` in `unit` (`kHz`, `MHz` default, `GHz`), `radio_service`, `location_type` (one ULS location type code, case-insensitive: `F` keeps fixed sites only, `M` mobile and `T` temporary-fixed areas), and `status` (`A` default, `L`, `X`, or `any` for all three)
+- `latitude` / `longitude` as decimal degrees, `radius_km` 0.1–230 (default 5; 0.1–100 with `FCC_SPECTRUM_WIDE_RADIUS=false`); optional `frequency_low` / `frequency_high` in `unit` (`kHz`, `MHz` default, `GHz`), `radio_service`, `location_type` (one ULS location type code, case-insensitive: `F` keeps fixed sites only, `M` mobile and `T` temporary-fixed areas), and `status` (`A` default, `L`, `X`, or `any` for all three)
 - Sites nearest first, positive integer `limit` (default 25, capped at 100) with cursor paging; each site lists up to `max_frequencies_per_site` frequencies (positive integer, default 10, capped at 50), with `frequencyCount` carrying the full count
 - Each site carries `locationTypeCode`, `locationTypeLabel`, `radiusKm`, `locationClassCode`, and `locationClassLabel` when filed; a mobile or temporary-fixed area is returned at its filed center, and `distanceKm` measures to that center. `location_class` (case-insensitive `C`, `L`, `P`, `R`, or `T`) keeps one FCC class; results describe authorization, not actual on-air activity
 - Typed errors: `invalid_frequency_range`, `unknown_radio_service`, `service_not_indexed`, `invalid_cursor`, `index_not_ready`
@@ -110,7 +110,7 @@ FCC ULS-specific:
 
 - Keyless and local at request time — every query reads the SQLite index; network access is needed only to build and refresh it
 - Occupied-band frequency matching — each assignment's band is widened by the bandwidth parsed from its emission designators, so a query near a wide channel's edge still finds it
-- Spectrum leases are first-class records — `isLease` marks them, the licensee shown is the lessee, and lease links are listed in both directions
+- Spectrum leases are first-class records — `isLease` marks them, the licensee shown is the lessee, and lease links are listed in both directions, each naming its lessee or parent licensee
 - Site state is derived from coordinates when the filing leaves it blank (common for microwave and BRS/EBS), and flagged `stateFromCoordinates`
 - Individual licensees are redacted by default, and contact details are never ingested — see [Individual-licensee redaction](#individual-licensee-redaction)
 
@@ -181,7 +181,7 @@ Keeping it current:
 - **HTTP transport.** The server schedules the weekly rebuild on Sundays at 16:00 and the daily refresh at 17:00, in the process's local time (the Docker image runs in UTC; the FCC publishes snapshots Sunday morning US Eastern). Refresh checks the available daily publication dates for gaps and overwritten files. When they cannot cover the checkpoint, it runs the weekly rebuild and retries refresh; if no newer snapshot is available, the job reports failure until recovery is possible. Neither job runs until `mirror:init` has published a first index. Each job runs in a child process on the server's runtime, so queries and `/healthz` keep answering while it writes, and its log lines appear in the server log; on shutdown a running job is stopped and resumes at the next run.
 - **stdio.** Nothing is scheduled. Run `mirror:refresh` daily and `mirror:init` weekly from cron or another scheduler; daily files never remove licenses, so removals arrive with the weekly rebuild.
 - **Disk.** A rebuild writes a new generation beside the one being served, so leave room for a second index plus the largest zip (about 420 MB). Older generations are deleted at the start of the next rebuild.
-- **Concurrency.** An ingest lock lets one `mirror:init`, `mirror:refresh`, or scheduled job write at a time; an interrupted `mirror:init` resumes from its last completed step when rerun.
+- **Concurrency.** An ingest lock lets one `mirror:init`, `mirror:refresh`, or scheduled job write at a time; an interrupted `mirror:init` resumes from its last completed step when rerun. A process killed outright (out of memory, `SIGKILL`) keeps its index file's sync lease for up to two minutes: a `mirror:*` command on that file fails with `Mirror sync is already in progress in another process or instance.` until then, and a scheduled job skips its run.
 
 ## Configuration
 
@@ -191,6 +191,7 @@ Keeping it current:
 | `FCC_SPECTRUM_SERVICES` | Comma-separated weekly service groups to index, case-insensitive. Opt-in: `gmrs`, `ship`, `aircr`. An unknown name fails startup and lists the valid set. | `LMpriv,LMcomm,LMbcast,micro,cell,market,paging,coast,mdsitfs,amat` |
 | `FCC_SPECTRUM_REDACT_INDIVIDUALS` | Redact individual licensees and trustee names and exclude individuals from name search. Only `false`, `0`, `no`, or `off` disables it. | `true` |
 | `FCC_SPECTRUM_BASE_URL` | ULS bulk file host root, read only when building or refreshing the index. | `https://data.fcc.gov/download/pub/uls` |
+| `FCC_SPECTRUM_WIDE_RADIUS` | Let `fcc_spectrum_find_transmitters` search a `radius_km` up to 230 km; `false` restores the 100 km ceiling. Accepts `true`/`false`, `yes`/`no`, `on`/`off`, `y`/`n`, `enabled`/`disabled`, or `1`/`0`, in any case; any other value fails startup. | `true` |
 | `MCP_TRANSPORT_TYPE` | Transport: `stdio` or `http`. | `stdio` |
 | `MCP_SESSION_MODE` | Session mode: `auto` (resolves to stateful), `stateful`, or `stateless`. | `stateless` |
 | `MCP_HTTP_PORT` | Port for the HTTP server. | `3010` |
@@ -228,6 +229,7 @@ ULS records name the person behind many licenses, amateur and otherwise: individ
 
 - A record is an individual's when its applicant type is `I`, or blank in the amateur and GMRS services. A blank type or type `H` (Other) in any service also counts when the filing carries a person's name parts, or when the licensee name contains no organization word (`Inc`, `County`, `Church`, `Wireless`, …), so an organization named without one is redacted too. Its licensee name is then `null` with `licenseeRedacted: true`, and its licensee city, its sites' street addresses, and its site names are omitted, since some individuals file their own name as a site name.
 - Trustee names are withheld on every license, since a trustee is always a person.
+- Lease links withhold an individual counterparty's name the same way: a lease's `lesseeName` and a parent's `licenseeName` are `null` with `lesseeRedacted` / `licenseeRedacted: true`.
 - Licensee name search excludes individuals, and the response `notice` says so. A callsign, USI, or FRN lookup still returns the record, redacted.
 - Site coordinates, city, county, state, and technical data stay: they are the spectrum record.
 - Redaction applies when a response is built, so changing the setting needs a restart, not a rebuild.
@@ -253,7 +255,7 @@ Licensee mailing street addresses, ZIP codes, PO boxes, attention lines, phone n
 
 ### Prerequisites
 
-- [Bun v1.4](https://bun.sh/) or higher (or Node.js v24+). `bun:sqlite` is built into Bun; under Node, install `better-sqlite3` beside the server (declared as an optional peer dependency).
+- [Bun v1.4.4](https://bun.sh/) or higher (or Node.js v24+); the index refuses to open on an older Bun. `bun:sqlite` is built into Bun; under Node, install `better-sqlite3` beside the server (declared as an optional peer dependency).
 - Disk for the index at `FCC_SPECTRUM_MIRROR_DIR`: about 1.8 GB on the default groups, plus rebuild room as above.
 - Network access to `data.fcc.gov` when building or refreshing the index. Queries need none.
 
@@ -362,4 +364,10 @@ bun run test
 
 Apache-2.0 — see [LICENSE](LICENSE) for details.
 
-License data comes from the FCC Universal Licensing System (ULS), a US government work in the public domain (17 U.S.C. §105). Credit it as "FCC Universal Licensing System (ULS)" with the `dataAsOf` time each response carries. This project redistributes none of the license data; operators download it from the FCC when building the index. The package does bundle a market-to-state table (`src/services/uls/data/market-states.json`) derived from FCC area definitions — the FCC's county-to-market file `FCCCNTY2K.txt`, its Partial Economic Area county list, and 47 CFR 80.385(a)(3) — which records only the states each market reaches. Basic Trading Areas delineated by the Rand McNally 1992 Commercial Atlas & Marketing Guide, 123rd Edition, at pages 38-39; extended and revised by the Federal Communications Commission, 59 FR 46195 (September 7, 1994). Major Trading Areas delineated by the Rand McNally 1992 Commercial Atlas & Marketing Guide, 123rd Edition, at pages 38-39, extended and excepted by the Federal Communications Commission, 59 FR 14115 (March 25, 1994). This server is independent of the FCC and not endorsed by it.
+License data comes from the FCC Universal Licensing System (ULS), a US government work in the public domain (17 U.S.C. §105). Credit it as "FCC Universal Licensing System (ULS)" with the `dataAsOf` time each response carries. This project redistributes none of the license data; operators download it from the FCC when building the index. This server is independent of the FCC and not endorsed by it.
+
+The package bundles a market-to-state table (`src/services/uls/data/market-states.json`), derived from the FCC's county-to-market file `FCCCNTY2K.txt`, its Partial Economic Area county list, and 47 CFR 80.385(a)(3), which records only the states each market reaches. Its trading-area definitions carry this credit:
+
+> Basic Trading Areas delineated by the Rand McNally 1992 Commercial Atlas & Marketing Guide, 123rd Edition, at pages 38-39; extended and revised by the Federal Communications Commission, 59 FR 46195 (September 7, 1994).
+>
+> Major Trading Areas delineated by the Rand McNally 1992 Commercial Atlas & Marketing Guide, 123rd Edition, at pages 38-39, extended and excepted by the Federal Communications Commission, 59 FR 14115 (March 25, 1994).

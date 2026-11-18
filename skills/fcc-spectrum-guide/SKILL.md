@@ -4,7 +4,7 @@ description: Investigate FCC ULS licenses, nearby sites, spectrum holdings, leas
 license: Apache-2.0
 metadata:
   author: "cyanheads"
-  version: "1.0"
+  version: "1.1"
 ---
 
 ## Scope
@@ -17,12 +17,12 @@ Investigate filed radio authorizations and their relationships. These records do
 - Follow FRNs returned on license records to investigate the same registered licensee without relying on name spelling. Some filings lack an FRN.
 - Take market codes from returned license or spectrum-block records, or use a code supplied by the user. A city name can describe markets of several types; these tools have no market-name resolver. Do not infer a market code from the city name.
 - Keep the license USI alongside location and antenna numbers. A location number can refer to several sites; it is not a globally unique site identifier.
-- A lease's licensee is the lessee. Follow its leasedFrom links for parent licenses and a parent's leases for leasing arrangements, using the returned callsign or USI.
+- A lease's licensee is the lessee. Read counterparty names from the lists: each leases entry names its lessee and each leasedFrom entry its parent's licensee (neither field when the index does not hold the parent). Follow a returned callsign or USI only for the counterparty's own detail. An individual counterparty's name is null with its redacted flag true.
 
 ## Gates
 
 - Before reporting an authorization absent, check coverage with fcc_spectrum_list_reference: confirm the relevant service group is indexed, inspect freshness and notices, and finish the search's pages. A ready index is searchable; it does not certify that every filed technical value is represented.
-- Continue while nextCursor exists, even after an empty frequency-search page. When totalIsLowerBound is true, report totalCount as at least that many, not an exact total.
+- Continue while nextCursor exists, even after an empty frequency-search page. Pass it back with the same inputs; a cursor carried to a different search fails as invalid_cursor. When totalIsLowerBound is true, report totalCount as at least that many, not an exact total.
 - Before treating an empty technical list as evidence, check technicalRetained and coverage notices. Older generations can lack microwave paths or unnumbered antennas until rebuilt. Only active, pending-legal, and term-pending records retain technical detail.
 - Before attributing a frequency to a particular site, check whether the location number is shared. ULS does not identify which of those sites uses each antenna or frequency; leave that attribution unresolved.
 - Before reporting transmitters near a point, inspect filed location class and type. Nearby results can include receivers, passive sites, and operating-area centers. An area's center falling outside the search radius does not establish that its operating area cannot reach the point. Locations without valid coordinates are excluded entirely.

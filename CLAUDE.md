@@ -2,8 +2,8 @@
 
 **Server:** fcc-spectrum-mcp-server
 **Version:** 0.3.0
-**Framework:** [@cyanheads/mcp-ts-core](https://www.npmjs.com/package/@cyanheads/mcp-ts-core) `^0.13.18`
-**Engines:** Bun ≥1.4.0, Node ≥24.0.0
+**Framework:** [@cyanheads/mcp-ts-core](https://www.npmjs.com/package/@cyanheads/mcp-ts-core) `^0.13.22`
+**Engines:** Bun ≥1.4.4, Node ≥24.0.0
 **MCP SDK:** `@modelcontextprotocol/server` ^2.4.0
 **Zod:** ^4.6.7
 
@@ -15,7 +15,7 @@
 
 A keyless FCC radio spectrum licensing server. It indexes the FCC Universal Licensing System (ULS) weekly and daily bulk files into an embedded SQLite index and answers every query from it, with no runtime calls to the FCC. The data is a US government work in the public domain.
 
-**Server-as-source.** The index is built as generation files under `FCC_SPECTRUM_MIRROR_DIR`; `current.json` names the published one and the read path follows it. The first build is an operator step (`mirror:init`, never on startup). Under HTTP the process schedules the weekly rebuild and daily refresh itself (`src/services/uls/ingest-schedule.ts`), each run a child process on the server's runtime executing the compiled `ingest-job.js`, because SQLite calls are synchronous and an ingest step would otherwise block the serving thread for tens of seconds; the server relays the job's log lines and logs a non-zero exit or a kill as the run's failure. Under stdio nothing is spawned; run `mirror:refresh` / `mirror:init` from cron. A cold index (no published generation) fails every tool and resource with the typed `index_not_ready` error, never an empty result. Cursors bind to the generation, so a rebuild invalidates them (`invalid_cursor`).
+**Server-as-source.** The index is built as generation files under `FCC_SPECTRUM_MIRROR_DIR`; `current.json` names the published one and the read path follows it. The first build is an operator step (`mirror:init`, never on startup). Under HTTP the process schedules the weekly rebuild and daily refresh itself (`src/services/uls/ingest-schedule.ts`), each run a child process on the server's runtime executing the compiled `ingest-job.js`, because SQLite calls are synchronous and an ingest step would otherwise block the serving thread for tens of seconds; the server relays the job's log lines and logs a non-zero exit or a kill as the run's failure. Under stdio nothing is spawned; run `mirror:refresh` / `mirror:init` from cron. A cold index (no published generation) fails every tool and resource with the typed `index_not_ready` error, never an empty result. Cursors bind to the generation and to a digest of the search inputs, so a rebuild or a different search invalidates them (`invalid_cursor`).
 
 **Individual-licensee redaction is a first-class, fail-safe feature.** `FCC_SPECTRUM_REDACT_INDIVIDUALS` defaults to on, and only `false`/`0`/`no`/`off` disables it. Redaction happens at read time in one function, `UlsIndexService.redact()`, and individuals are excluded from name search. Contact details (phone, fax, email, ZIP, PO box) are never ingested for anyone. Do not add a read path that bypasses `redact()` or loosens the config parse.
 
@@ -75,7 +75,7 @@ export const searchLicenses = tool('fcc_spectrum_search_licenses', {
     ),
     limit: z.number().int().min(1).default(25).describe('Positive integer records per page; values above 100 are clamped to 100 with a notice.'),
     cursor: cursorSchema.describe('nextCursor from the previous page of the same search; omit for the first page.'),
-    // … licensee, frn, radio_service, status, state
+    // … licensee, frn, radio_service, status, state, expires_after/before, granted_after/before
   }),
   output: z.object({
     licenses: z.array(LicenseSchema).describe('Matching records, …'),
@@ -95,7 +95,7 @@ export const searchLicenses = tool('fcc_spectrum_search_licenses', {
       retryable: false,
       recovery: 'The local ULS index has not been built yet; call fcc_spectrum_list_reference with topic "coverage" to see its build status. …',
     },
-    // … no_criteria, unknown_radio_service, service_not_indexed, invalid_cursor
+    // … no_criteria, invalid_date_range, unknown_radio_service, service_not_indexed, invalid_cursor
   ],
 
   async handler(input, ctx) {
@@ -191,6 +191,7 @@ const ServerConfigSchema = z.object({
     .transform((value) => !REDACTION_OFF.has(value?.trim().toLowerCase() ?? ''))
     .describe('Redact individual licensees; fail-safe (only false/0/no/off disables)'),
   baseUrl: z.url().default('https://data.fcc.gov/download/pub/uls').transform((url) => url.replace(/\/+$/, '')).describe('ULS bulk host root'),
+  wideRadius: z.stringbool().default(true).describe('Accept find_transmitters radius_km up to 230 km; false restores the 100 km ceiling'),
 });
 
 let _config: ServerConfig | undefined;
@@ -200,14 +201,15 @@ export function getServerConfig(): ServerConfig {
     services: 'FCC_SPECTRUM_SERVICES',
     redactIndividuals: 'FCC_SPECTRUM_REDACT_INDIVIDUALS',
     baseUrl: 'FCC_SPECTRUM_BASE_URL',
+    wideRadius: 'FCC_SPECTRUM_WIDE_RADIUS',
   });
   return _config;
 }
 ```
 
-`parseEnvConfig` maps Zod schema paths → env var names so errors name the variable (`FCC_SPECTRUM_SERVICES`) not the path (`services`). Throws `ConfigurationError`, which the framework prints as a clean startup banner. `redactIndividuals` is a privacy control and parses as a string with an explicit off-list rather than `z.stringbool()`, so a typo or an unset variable keeps redaction on instead of throwing or disabling it.
+`parseEnvConfig` maps Zod schema paths → env var names so errors name the variable (`FCC_SPECTRUM_SERVICES`) not the path (`services`). Throws `ConfigurationError`. The server reads its config while modules load (the `radius_km` ceiling, the `instructions` redaction sentence), before `createApp()`, so a bad value exits 1 with that error and its stack, not the framework's startup banner. `redactIndividuals` is a privacy control and parses as a string with an explicit off-list rather than `z.stringbool()`, so a typo or an unset variable keeps redaction on instead of throwing or disabling it.
 
-For other env booleans use `z.stringbool()`, never `z.coerce.boolean()` — `Boolean("false")` is `true`, so a coerced flag can't be disabled through the environment.
+For other env booleans use `z.stringbool()` (`wideRadius`, which takes `true`/`false`, `yes`/`no`, `on`/`off`, `y`/`n`, `enabled`/`disabled`, or `1`/`0` in any case and fails startup on anything else), never `z.coerce.boolean()` — `Boolean("false")` is `true`, so a coerced flag can't be disabled through the environment. `wideRadius` sets the `radius_km` ceiling of `fcc_spectrum_find_transmitters`: 230 km, or 100 km when off.
 
 ### Server identity, session posture, and lifecycle
 
@@ -240,11 +242,11 @@ await createApp({
 });
 ```
 
-`name` and `title` are both the hyphenated machine name; `description` is not passed (it derives from `package.json`). `instructions` is session-level orientation sent on every `initialize`: here it names the source, the tool workflow, the status semantics, and (when redaction is on) the redaction rule. `src/index.ts` loads `./.env` itself because `instructions` reads the redaction setting before `createApp()` runs.
+`name` and `title` are both the hyphenated machine name; `description` is not passed (it derives from `package.json`). `instructions` is session-level orientation sent on every `initialize`: here it names the source, the tool workflow, the status semantics, and (when redaction is on) the redaction rule. `src/index.ts` imports `src/config/load-env.ts` first, which loads `./.env` before any definition evaluates: a definition reads settings as its module loads (the advertised `radius_km` ceiling), `instructions` reads the redaction setting before `createApp()` runs, and `getServerConfig()` caches its first parse. Keep that import first.
 
 `sessionMode: 'stateless'` declares the HTTP session posture in `src/`; `MCP_SESSION_MODE` still wins whenever it carries a meaningful value. Stateless is correct here: every tool is a single-shot read over the local index. Do not add `require: 'stateful'`. `.env.example`, the `Dockerfile`, and the README env table carry `stateless` and must stay in step.
 
-`teardown` runs after the transport stops and before the logger closes, on every shutdown path. It awaits `stopIngestSchedule()` before closing the index, because a job in flight writes to the index the service is about to close: the stop sends a running job process SIGTERM, on which it persists its progress and releases the lock, then SIGKILL after 5 s, inside the framework's 10 s shutdown ceiling. A killed job's rebuild resumes from its last completed step at the next run.
+`teardown` runs after the transport stops and before the logger closes, on every shutdown path. It awaits `stopIngestSchedule()` before closing the index, because a job in flight writes to the index the service is about to close: the stop sends a running job process SIGTERM, on which it persists its progress, releases the lock, and exits reporting a stop rather than a failure, then SIGKILL after 5 s, inside the framework's 10 s shutdown ceiling. A killed job's rebuild resumes from its last completed step at the next run; a run on the same generation file within the framework sync lease's two-minute expiry skips (`sync_locked`).
 
 ---
 
@@ -315,6 +317,7 @@ src/
   index.ts                              # createApp() entry; identity, sessionMode, setup/teardown wiring
   config/
     server-config.ts                    # FCC_SPECTRUM_* env vars (Zod schema)
+    load-env.ts                         # loads ./.env as an import side effect; src/index.ts imports it first
   services/uls/
     uls-index-service.ts                # read path over the published generation; the redact() chokepoint
     types.ts                            # read-model types the tools return
@@ -461,7 +464,7 @@ When you complete a skill's checklist, check the boxes and add a completion time
 
 ## Bundling
 
-`npm run bundle` produces a `.mcpb` extension bundle for one-click install in Claude Desktop. `mcpb pack` reads `.mcpbignore`, not `.gitignore`, so every root path the bundle must not ship — source, tests, docs, caches, logs, agent docs, plugin manifests, gitignored local files — needs a root-anchored line there (`/docs/`, never `docs/`, which also strips `node_modules/*/docs/`); `lint:packaging` names each missing or unanchored line. Root `skills/` ships on purpose. The pack step is followed by `scripts/clean-mcpb.ts`, which prunes dev dependencies (`mcpb clean`) and strips four classes of `node_modules/**` content that root-anchored `.mcpbignore` patterns cannot reach: dependency-shipped agent docs (`framework-skills/`, `skills/`, `.claude/`, `.agents/`, `SKILL.md`); platform-specific native bindings, which would otherwise lock the bundle to the platform it was packed on; node-gyp build output beside a `binding.gyp` (`config.gypi`, Makefiles, `obj.target/`, `.deps/`, object files and debug symbols), which records the packing machine's paths — compiled `*.node` addons stay; and build-only package files — the framework's `changelog/`, `scripts/`, `templates/`, `CLAUDE.md`, `AGENTS.md`, and config bases (`biome.json`, `vitest.config.base.mjs`, `config/tsconfig.base.json`), and `better-sqlite3`'s `deps/` and `src/` C sources. A server using DataCanvas therefore ships a portable bundle without the DuckDB native — `@duckdb/node-api` is an optional peer loaded lazily, so canvas tools report an actionable install hint and every other tool works normally. MCPB is stdio-only — HTTP and Cloudflare Workers deployments are unaffected. Consumers who don't need it can delete `manifest.json` and `.mcpbignore`; `lint:packaging` skips cleanly.
+`npm run bundle` produces a `.mcpb` extension bundle for one-click install in Claude Desktop. `mcpb pack` reads `.mcpbignore`, not `.gitignore`, so every root path the bundle must not ship — source, tests, docs, caches, logs, agent docs, plugin manifests, gitignored local files — needs a root-anchored line there (`/docs/`, never `docs/`, which also strips `node_modules/*/docs/`); `lint:packaging` names each missing or unanchored line. Root `skills/` ships on purpose. The pack step is followed by `scripts/clean-mcpb.ts`, which prunes dev dependencies (`mcpb clean`) and strips four classes of `node_modules/**` content that root-anchored `.mcpbignore` patterns cannot reach: dependency-shipped agent docs — `framework-skills/`, `skills/`, `.claude/`, `.agents/`, `AGENTS.md`, and `CLAUDE.md` at a package's root, and `SKILL.md` anywhere (a `skills/` deeper in a package is runtime code and stays); platform-specific native bindings, which would otherwise lock the bundle to the platform it was packed on; node-gyp build output beside a `binding.gyp` (`config.gypi`, Makefiles, `obj.target/`, `.deps/`, object files and debug symbols), which records the packing machine's paths — compiled `*.node` addons stay; and build-only package files — the framework's `changelog/`, `scripts/`, `templates/`, and config bases (`biome.json`, `vitest.config.base.mjs`, `config/tsconfig.base.json`), and `better-sqlite3`'s `deps/` and `src/` C sources. A server using DataCanvas therefore ships a portable bundle without the DuckDB native — `@duckdb/node-api` is an optional peer loaded lazily, so canvas tools report an actionable install hint and every other tool works normally. MCPB is stdio-only — HTTP and Cloudflare Workers deployments are unaffected. Consumers who don't need it can delete `manifest.json` and `.mcpbignore`; `lint:packaging` skips cleanly.
 
 **Adding an env var requires both files:** `server.json` (registry discovery, `environmentVariables[]`) and `manifest.json` (bundle install UX, `mcp_config.env` + `user_config`). `lint:packaging` (run by `devcheck`) verifies the env var names match, that every `user_config` option is wired into `mcp_config.env` as `"X": "${user_config.X}"` (the host substitutes nothing else — `"${X}"` reaches the server as that literal string), and that an optional string option carries `"default": ""`.
 
