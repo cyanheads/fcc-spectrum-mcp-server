@@ -40,7 +40,8 @@
         "FCC_SPECTRUM_MIRROR_DIR": "${user_config.FCC_SPECTRUM_MIRROR_DIR}",
         "FCC_SPECTRUM_SERVICES": "${user_config.FCC_SPECTRUM_SERVICES}",
         "FCC_SPECTRUM_REDACT_INDIVIDUALS": "${user_config.FCC_SPECTRUM_REDACT_INDIVIDUALS}",
-        "FCC_SPECTRUM_BASE_URL": "${user_config.FCC_SPECTRUM_BASE_URL}"
+        "FCC_SPECTRUM_BASE_URL": "${user_config.FCC_SPECTRUM_BASE_URL}",
+        "FCC_SPECTRUM_WIDE_RADIUS": "${user_config.FCC_SPECTRUM_WIDE_RADIUS}"
       }
     }
   },
@@ -75,6 +76,13 @@
       "type": "string",
       "title": "ULS bulk host",
       "description": "ULS bulk file host root, used only when building or refreshing the index. Blank uses https://data.fcc.gov/download/pub/uls.",
+      "required": false,
+      "default": ""
+    },
+    "FCC_SPECTRUM_WIDE_RADIUS": {
+      "type": "string",
+      "title": "Wide search radius",
+      "description": "Blank or true lets the nearby-site search reach 230 km; false restores its 100 km ceiling. Only true/false, yes/no, on/off, y/n, enabled/disabled, or 1/0 is accepted.",
       "required": false,
       "default": ""
     }

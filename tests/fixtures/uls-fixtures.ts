@@ -1306,6 +1306,104 @@ export function sprawlingPagingWeekly(options: SprawlOptions): FixtureFile {
 }
 
 /**
+ * A paging snapshot of the sites a band search around 152–152.1 MHz must tell apart, each
+ * location n at 47-0n-00 N 122-0n-00 W with one antenna. The active KZZ741 (USI 7401) files
+ * location 1 (transmit class `T`) on 152.05 MHz plus 160 MHz on a 25 kHz emission, location 2
+ * (receive class `R`) on 152.06 MHz, and location 3 (`T`) only on 151.994 MHz on a 10 kHz
+ * emission, so it ends 1 kHz below 152 MHz; the 25 kHz row makes the stored widest band wider
+ * than that one. The pending-legal KZZ742 (USI 7402, status `L`) and term-pending KZZ743
+ * (USI 7403, status `X`) each file location 4 or 5 (`T`) on 152.07 or 152.08 MHz.
+ */
+export const MIXED_SITES_WEEKLY: FixtureFile = {
+  countsCreated: PAGING_WEEKLY.countsCreated,
+  lastModified: PAGING_WEEKLY.lastModified,
+  zip: buildZip([
+    {
+      name: 'counts',
+      data: countsFile('Sun Sep 27 09:38:53 EDT 2026', {
+        HD: 3,
+        EN: 3,
+        LO: 5,
+        AN: 5,
+        FR: 6,
+        EM: 2,
+      }),
+    },
+    {
+      name: 'HD.dat',
+      data: datFile([
+        hd({ usi: 7401, callsign: 'KZZ741', status: 'A', service: 'CD', grant: '01/01/2024' }),
+        hd({ usi: 7402, callsign: 'KZZ742', status: 'L', service: 'CD', grant: '01/01/2024' }),
+        hd({ usi: 7403, callsign: 'KZZ743', status: 'X', service: 'CD', grant: '01/01/2024' }),
+      ]),
+    },
+    {
+      name: 'EN.dat',
+      data: datFile([
+        en({ usi: 7401, name: 'Mixed Sites Paging', state: 'WA', applicantType: 'C' }),
+        en({ usi: 7402, name: 'Pending Legal Paging', state: 'WA', applicantType: 'C' }),
+        en({ usi: 7403, name: 'Term Pending Paging', state: 'WA', applicantType: 'C' }),
+      ]),
+    },
+    {
+      name: 'LO.dat',
+      data: datFile(
+        (
+          [
+            [7401, 1, 'T'],
+            [7401, 2, 'R'],
+            [7401, 3, 'T'],
+            [7402, 4, 'T'],
+            [7403, 5, 'T'],
+          ] as const
+        ).map(([usi, number, locationClass]) =>
+          lo({
+            usi,
+            number,
+            type: 'F',
+            locationClass,
+            lat: [47, number, 0, 'N'],
+            lon: [122, number, 0, 'W'],
+          }),
+        ),
+      ),
+    },
+    {
+      name: 'AN.dat',
+      data: datFile(
+        (
+          [
+            [7401, 1],
+            [7401, 2],
+            [7401, 3],
+            [7402, 4],
+            [7403, 5],
+          ] as const
+        ).map(([usi, location]) => an({ usi, antenna: 1, location, type: 'T' })),
+      ),
+    },
+    {
+      name: 'FR.dat',
+      data: datFile([
+        fr({ usi: 7401, location: 1, antenna: 1, seq: 1, frequency: 152.05 }),
+        fr({ usi: 7401, location: 1, antenna: 1, seq: 2, frequency: 160 }),
+        fr({ usi: 7401, location: 2, antenna: 1, seq: 1, frequency: 152.06 }),
+        fr({ usi: 7401, location: 3, antenna: 1, seq: 1, frequency: 151.994 }),
+        fr({ usi: 7402, location: 4, antenna: 1, seq: 1, frequency: 152.07 }),
+        fr({ usi: 7403, location: 5, antenna: 1, seq: 1, frequency: 152.08 }),
+      ]),
+    },
+    {
+      name: 'EM.dat',
+      data: datFile([
+        em({ usi: 7401, location: 1, antenna: 1, seq: 2, code: '25K0F3E' }),
+        em({ usi: 7401, location: 3, antenna: 1, seq: 1, code: '10K0F3E' }),
+      ]),
+    },
+  ]),
+};
+
+/**
  * A paging snapshot whose one active license, KZZ401 (USI 4001), files `count` distinct
  * frequency rows on one antenna: enough to push a frequency cap to its 1000-row ceiling.
  */
@@ -1627,6 +1725,64 @@ export const INDIVIDUAL_SITES_WEEKLY: FixtureFile = {
       data: datFile([
         fr({ usi: 5201, location: 1, antenna: 1, seq: 1, stationClass: 'FB', frequency: 152.48 }),
         fr({ usi: 5201, location: 2, antenna: 1, seq: 1, stationClass: 'FB', frequency: 152.48 }),
+      ]),
+    },
+  ]),
+};
+
+/**
+ * A paging-slot snapshot of lease parties, no sites: KZZ731 (USI 7301, Harbor Spectrum Holdings
+ * LLC) leases to L000073002 (USI 7302, Dockside Telemetry Inc) and L000073003 (USI 7303, the
+ * individual Jordan J Lessee, applicant type I); the individual Morgan M Parent's KZZ734
+ * (USI 7304) leases to L000073005 (USI 7305, Upriver Paging Co); and the expired L000073006
+ * (USI 7306, Orphaned Lease Partners) is leased from KZZ799 (USI 7399), which the snapshot
+ * does not carry; L000073008 (USI 7308, Riverbend Telemetry LLC) is leased from KZZ737
+ * (USI 7307), which the snapshot carries with no EN row, so no licensee is on file.
+ */
+export const LEASE_PARTIES_WEEKLY: FixtureFile = {
+  countsCreated: PAGING_WEEKLY.countsCreated,
+  lastModified: PAGING_WEEKLY.lastModified,
+  zip: buildZip([
+    { name: 'counts', data: countsFile('Sun Sep 27 09:38:53 EDT 2026', { HD: 8, EN: 7, LL: 5 }) },
+    {
+      name: 'HD.dat',
+      data: datFile([
+        hd({ usi: 7301, callsign: 'KZZ731', status: 'A', service: 'CD', grant: '01/01/2020' }),
+        hd({ usi: 7302, callsign: 'L000073002', status: 'A', service: 'CD', grant: '02/01/2021' }),
+        hd({ usi: 7303, callsign: 'L000073003', status: 'A', service: 'CD', grant: '03/01/2021' }),
+        hd({ usi: 7304, callsign: 'KZZ734', status: 'A', service: 'CD', grant: '04/01/2020' }),
+        hd({ usi: 7305, callsign: 'L000073005', status: 'A', service: 'CD', grant: '05/01/2021' }),
+        hd({ usi: 7306, callsign: 'L000073006', status: 'E', service: 'CD', grant: '06/01/2015' }),
+        hd({ usi: 7307, callsign: 'KZZ737', status: 'A', service: 'CD', grant: '07/01/2020' }),
+        hd({ usi: 7308, callsign: 'L000073008', status: 'A', service: 'CD', grant: '08/01/2021' }),
+      ]),
+    },
+    {
+      name: 'EN.dat',
+      data: datFile([
+        en({ usi: 7301, name: 'Harbor Spectrum Holdings LLC', state: 'WA', applicantType: 'C' }),
+        en({ usi: 7302, name: 'Dockside Telemetry Inc', state: 'WA', applicantType: 'C' }),
+        en({
+          usi: 7303,
+          name: 'Jordan J Lessee',
+          city: 'OLYMPIA',
+          state: 'WA',
+          applicantType: 'I',
+        }),
+        en({ usi: 7304, name: 'Morgan M Parent', city: 'TACOMA', state: 'WA', applicantType: 'I' }),
+        en({ usi: 7305, name: 'Upriver Paging Co', state: 'WA', applicantType: 'C' }),
+        en({ usi: 7306, name: 'Orphaned Lease Partners', state: 'WA', applicantType: 'L' }),
+        en({ usi: 7308, name: 'Riverbend Telemetry LLC', state: 'WA', applicantType: 'C' }),
+      ]),
+    },
+    {
+      name: 'LL.dat',
+      data: datFile([
+        ll({ leaseUsi: 7302, parentCallsign: 'KZZ731', leaseId: 'L000073002', parentUsi: 7301 }),
+        ll({ leaseUsi: 7303, parentCallsign: 'KZZ731', leaseId: 'L000073003', parentUsi: 7301 }),
+        ll({ leaseUsi: 7305, parentCallsign: 'KZZ734', leaseId: 'L000073005', parentUsi: 7304 }),
+        ll({ leaseUsi: 7306, parentCallsign: 'KZZ799', leaseId: 'L000073006', parentUsi: 7399 }),
+        ll({ leaseUsi: 7308, parentCallsign: 'KZZ737', leaseId: 'L000073008', parentUsi: 7307 }),
       ]),
     },
   ]),
@@ -2002,6 +2158,67 @@ export const MARKET_STATES_WEEKLY: FixtureFile = {
       data: datFile(
         [7001, 7002, 7003, 7004, 7005, 7006, 7007, 7008, 7009, 7010].map((usi) =>
           mf({ usi, partition: 1, lower: 704, upper: 710 }),
+        ),
+      ),
+    },
+  ]),
+};
+
+/**
+ * Paging (CD) licenses of one organization, FRN 0009200000, USIs 9201–9208, dated around the
+ * edges of a date-range search (grant, then expiration): KZZ921 2017-06-30, 2027-06-29;
+ * KZZ922 2017-07-01, 2027-06-30; KZZ923 2026-01-15, 2027-07-01; KZZ924 files neither date;
+ * KZZ925 (expired) 2001-02-01, 2011-02-01; KZZ926 2023-03-03 and no expiration; KZZ927 no grant
+ * and 2026-12-31; KZZ928 the leap days 2024-02-29, 2028-02-29. Every name holds "Dated", at
+ * different lengths, so a name search ranks them apart.
+ */
+export const LICENSE_DATES_WEEKLY: FixtureFile = {
+  countsCreated: PAGING_WEEKLY.countsCreated,
+  lastModified: PAGING_WEEKLY.lastModified,
+  zip: buildZip([
+    { name: 'counts', data: countsFile('Sun Sep 27 09:38:53 EDT 2026', { HD: 8, EN: 8 }) },
+    {
+      name: 'HD.dat',
+      data: datFile(
+        (
+          [
+            [9201, 'KZZ921', 'A', '06/30/2017', '06/29/2027'],
+            [9202, 'KZZ922', 'A', '07/01/2017', '06/30/2027'],
+            [9203, 'KZZ923', 'A', '01/15/2026', '07/01/2027'],
+            [9204, 'KZZ924', 'A', undefined, undefined],
+            [9205, 'KZZ925', 'E', '02/01/2001', '02/01/2011'],
+            [9206, 'KZZ926', 'A', '03/03/2023', undefined],
+            [9207, 'KZZ927', 'A', undefined, '12/31/2026'],
+            [9208, 'KZZ928', 'A', '02/29/2024', '02/29/2028'],
+          ] as const
+        ).map(([usi, callsign, status, grant, expired]) =>
+          hd({
+            usi,
+            callsign,
+            status,
+            service: 'CD',
+            ...(grant && { grant }),
+            ...(expired && { expired }),
+          }),
+        ),
+      ),
+    },
+    {
+      name: 'EN.dat',
+      data: datFile(
+        (
+          [
+            [9201, 'Dated Paging'],
+            [9202, 'Dated Paging Company'],
+            [9203, 'Dated Paging Company of the Northwest'],
+            [9204, 'Dated'],
+            [9205, 'Dated Paging Old Stock'],
+            [9206, 'Dated Paging Co'],
+            [9207, 'Dated Radio'],
+            [9208, 'Dated Leap Year Paging'],
+          ] as const
+        ).map(([usi, name]) =>
+          en({ usi, name, state: 'WA', frn: '0009200000', applicantType: 'C' }),
         ),
       ),
     },

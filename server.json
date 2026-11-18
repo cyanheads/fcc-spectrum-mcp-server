@@ -56,6 +56,13 @@
           "format": "string",
           "isRequired": false,
           "default": "https://data.fcc.gov/download/pub/uls"
+        },
+        {
+          "name": "FCC_SPECTRUM_WIDE_RADIUS",
+          "description": "Let fcc_spectrum_find_transmitters search a radius_km up to 230 km; false restores the 100 km ceiling. Accepts true/false, yes/no, on/off, y/n, enabled/disabled, or 1/0, in any case; any other value fails startup.",
+          "format": "string",
+          "isRequired": false,
+          "default": "true"
         }
       ],
       "transport": {
@@ -137,6 +144,13 @@
           "format": "string",
           "isRequired": false,
           "default": "https://data.fcc.gov/download/pub/uls"
+        },
+        {
+          "name": "FCC_SPECTRUM_WIDE_RADIUS",
+          "description": "Let fcc_spectrum_find_transmitters search a radius_km up to 230 km; false restores the 100 km ceiling. Accepts true/false, yes/no, on/off, y/n, enabled/disabled, or 1/0, in any case; any other value fails startup.",
+          "format": "string",
+          "isRequired": false,
+          "default": "true"
         }
       ],
       "transport": {

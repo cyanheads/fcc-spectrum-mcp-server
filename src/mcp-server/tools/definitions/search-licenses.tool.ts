@@ -1,7 +1,8 @@
 /**
  * @fileoverview `fcc_spectrum_search_licenses` — search ULS licenses and spectrum leases
- * by callsign, licensee name, FRN, market code, radio service, status, and licensee state,
- * one row per record with the USI that `fcc_spectrum_get_license` takes.
+ * by callsign, licensee name, FRN, market code, radio service, status, licensee state, and
+ * expiration or grant date range, one row per record with the USI that
+ * `fcc_spectrum_get_license` takes.
  * @module mcp-server/tools/definitions/search-licenses
  */
 
@@ -26,6 +27,18 @@ import {
   stateSchema,
 } from '@/mcp-server/tools/input-schemas.js';
 import { getUlsIndexService, radioServiceLabel } from '@/services/uls/uls-index-service.js';
+
+/** `<verb> <after> through <before>`, or the one bound set; `undefined` when neither is. */
+function dateRangeText(
+  verb: string,
+  after: string | undefined,
+  before: string | undefined,
+): string | undefined {
+  if (after && before) return `${verb} ${after} through ${before}`;
+  if (after) return `${verb} on or after ${after}`;
+  if (before) return `${verb} on or before ${before}`;
+  return;
+}
 
 const LicenseSchema = z
   .object({
@@ -97,7 +110,7 @@ const LicenseSchema = z
 export const searchLicenses = tool('fcc_spectrum_search_licenses', {
   title: 'Search FCC ULS licenses',
   description:
-    'Search FCC ULS licenses and spectrum leases by callsign, licensee name, FCC Registration Number (FRN), market code, radio service, status, and licensee state, returning one row per record with its unique system identifier (USI) for fcc_spectrum_get_license. At least one of callsign, licensee, frn, market_code, radio_service, or state is required; status only narrows. Defaults to active records; pass status "any" to include expired, cancelled, and terminated ones. Licensee name matching is word-based (every word must appear as a word prefix), not fuzzy.',
+    'Search FCC ULS licenses and spectrum leases by callsign, licensee name, FCC Registration Number (FRN), market code, radio service, status, licensee state, and expiration or grant date range, returning one row per record with its unique system identifier (USI) for fcc_spectrum_get_license. At least one of callsign, licensee, frn, market_code, radio_service, or state is required; status and the date bounds only narrow. Defaults to active records; pass status "any" to include expired, cancelled, and terminated ones. Licensee name matching is word-based (every word must appear as a word prefix), not fuzzy.',
   annotations: { readOnlyHint: true, idempotentHint: true, openWorldHint: false },
   input: z.object({
     callsign: blankAsUnset(callsignSchema.optional()).describe(
@@ -120,6 +133,18 @@ export const searchLicenses = tool('fcc_spectrum_search_licenses', {
     ),
     state: blankAsUnset(stateSchema.optional()).describe(
       "Licensee mailing state: a two-letter USPS code (incl. DC, PR, VI, GU, AS, MP) or a full state name. This is the licensee's address, not the site location.",
+    ),
+    expires_after: blankAsUnset(z.iso.date().optional()).describe(
+      'Only records expiring on or after this date, YYYY-MM-DD (inclusive); a record with no expiration date on file never matches.',
+    ),
+    expires_before: blankAsUnset(z.iso.date().optional()).describe(
+      'Only records expiring on or before this date, YYYY-MM-DD (inclusive); a record with no expiration date on file never matches.',
+    ),
+    granted_after: blankAsUnset(z.iso.date().optional()).describe(
+      'Only records granted on or after this date, YYYY-MM-DD (inclusive); a record with no grant date on file never matches.',
+    ),
+    granted_before: blankAsUnset(z.iso.date().optional()).describe(
+      'Only records granted on or before this date, YYYY-MM-DD (inclusive); a record with no grant date on file never matches.',
     ),
     limit: z
       .number()
@@ -159,6 +184,10 @@ export const searchLicenses = tool('fcc_spectrum_search_licenses', {
         radio_service: z.string().optional().describe('Radio service code filter.'),
         status: z.string().describe('Status filter, default included.'),
         state: z.string().optional().describe('Normalized licensee state filter.'),
+        expires_after: z.string().optional().describe('Earliest expiration date matched.'),
+        expires_before: z.string().optional().describe('Latest expiration date matched.'),
+        granted_after: z.string().optional().describe('Earliest grant date matched.'),
+        granted_before: z.string().optional().describe('Latest grant date matched.'),
       })
       .describe('Filters as the server applied them, normalized values and defaults included.'),
     notice: z
@@ -184,6 +213,13 @@ export const searchLicenses = tool('fcc_spectrum_search_licenses', {
         'Provide at least one of callsign, licensee, frn, market_code, radio_service, or state; call fcc_spectrum_list_reference with topic "radio_services" for valid service codes.',
     },
     {
+      reason: 'invalid_date_range',
+      code: JsonRpcErrorCode.ValidationError,
+      when: 'expires_after is later than expires_before, or granted_after is later than granted_before.',
+      recovery:
+        'Keep expires_after on or before expires_before, and granted_after on or before granted_before; equal dates match that one day.',
+    },
+    {
       reason: 'unknown_radio_service',
       code: JsonRpcErrorCode.ValidationError,
       when: 'The radio service code is neither in the FCC code table nor held by the index.',
@@ -200,7 +236,7 @@ export const searchLicenses = tool('fcc_spectrum_search_licenses', {
     {
       reason: 'invalid_cursor',
       code: JsonRpcErrorCode.ValidationError,
-      when: 'The cursor does not decode, belongs to an earlier index generation, or is from a licensee search the daily refresh has since changed.',
+      when: 'The cursor does not decode, belongs to an earlier index generation, was minted for a search with other filters, or is from a licensee search the daily refresh has since changed.',
       severity: 'notice',
       recovery:
         'Call fcc_spectrum_search_licenses again with the same filters and no cursor to start from the first page.',
@@ -221,6 +257,10 @@ export const searchLicenses = tool('fcc_spectrum_search_licenses', {
       ...(input.radio_service && { radio_service: input.radio_service }),
       status: input.status,
       ...(input.state && { state: input.state }),
+      ...(input.expires_after && { expires_after: input.expires_after }),
+      ...(input.expires_before && { expires_before: input.expires_before }),
+      ...(input.granted_after && { granted_after: input.granted_after }),
+      ...(input.granted_before && { granted_before: input.granted_before }),
     };
     ctx.enrich({ dataAsOf, truncated: false, shown: 0, cap: limit, appliedFilters });
     ctx.enrich.total(0);
@@ -234,6 +274,18 @@ export const searchLicenses = tool('fcc_spectrum_search_licenses', {
       !input.state
     ) {
       throw ctx.fail('no_criteria');
+    }
+    for (const [prefix, after, before] of [
+      ['expires', input.expires_after, input.expires_before],
+      ['granted', input.granted_after, input.granted_before],
+    ] as const) {
+      // ISO dates order as text.
+      if (after && before && after > before) {
+        throw ctx.fail(
+          'invalid_date_range',
+          `${prefix}_after (${after}) is later than ${prefix}_before (${before}); no record can match.`,
+        );
+      }
     }
     if (input.radio_service) {
       const code = input.radio_service;
@@ -260,6 +312,10 @@ export const searchLicenses = tool('fcc_spectrum_search_licenses', {
       radioService: input.radio_service,
       status: input.status,
       state: input.state,
+      expiresAfter: input.expires_after,
+      expiresBefore: input.expires_before,
+      grantedAfter: input.granted_after,
+      grantedBefore: input.granted_before,
       limit,
       cursor: input.cursor,
     });
@@ -281,9 +337,18 @@ export const searchLicenses = tool('fcc_spectrum_search_licenses', {
           `Only status ${input.status} records were searched; pass status "any" to search every status.`,
         );
       }
+      const dateRanges = [
+        dateRangeText('expiring', input.expires_after, input.expires_before),
+        dateRangeText('granted', input.granted_after, input.granted_before),
+      ].filter(Boolean);
+      if (dateRanges.length) {
+        fragments.push(
+          `Only records ${dateRanges.join(' and ')} were searched; a record that files no such date never matches, so widen or drop the date bounds.`,
+        );
+      }
       if (input.callsign) {
         fragments.push(
-          `No record carries callsign ${input.callsign} in the indexed service groups; call fcc_spectrum_get_license with this callsign, which reads every status, or fcc_spectrum_list_reference with topic "coverage" to confirm the service group is loaded.`,
+          `No record matching these filters carries callsign ${input.callsign} in the indexed service groups; call fcc_spectrum_get_license with this callsign, which reads every status and takes no other filter, or fcc_spectrum_list_reference with topic "coverage" to confirm the service group is loaded.`,
         );
       }
       if (input.frn) {

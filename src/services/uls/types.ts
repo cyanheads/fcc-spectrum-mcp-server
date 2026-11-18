@@ -72,7 +72,13 @@ export interface LicenseSummary extends LicenseeFields {
 export interface SearchLicensesParams {
   callsign?: string | undefined;
   cursor?: string | undefined;
+  /** Inclusive `YYYY-MM-DD` bounds on the expiration date; a record without one never matches. */
+  expiresAfter?: string | undefined;
+  expiresBefore?: string | undefined;
   frn?: string | undefined;
+  /** Inclusive `YYYY-MM-DD` bounds on the grant date; a record without one never matches. */
+  grantedAfter?: string | undefined;
+  grantedBefore?: string | undefined;
   licensee?: string | undefined;
   limit: number;
   marketCode?: string | undefined;
@@ -204,10 +210,26 @@ export interface LicenseDetail {
   isLease: boolean;
   lastActionDate?: string;
   leaseCount: number;
-  /** Parent licenses this lease is carved from. */
-  leasedFrom: { callsign?: string; usi: string }[];
-  /** One page of the leases carved from this license; `leaseCount` has the total. */
-  leases: { callsign?: string; licenseStatus: string; usi: string }[];
+  /**
+   * Parent licenses this lease is carved from, each with its licensee after redaction; a parent
+   * the index does not hold carries neither name field.
+   */
+  leasedFrom: ({ callsign?: string; usi: string } & (
+    | LicenseeFields
+    | { licenseeName?: never; licenseeRedacted?: never }
+  ))[];
+  /**
+   * One page of the leases carved from this license, each with its lessee after redaction;
+   * `leaseCount` has the total.
+   */
+  leases: {
+    callsign?: string;
+    lesseeName: string | null;
+    /** True when the lessee is an individual whose name is withheld. */
+    lesseeRedacted: boolean;
+    licenseStatus: string;
+    usi: string;
+  }[];
   licensee: {
     applicantType?: string;
     city?: string;

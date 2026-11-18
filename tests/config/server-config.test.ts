@@ -1,7 +1,7 @@
 /**
  * @fileoverview Tests for the server configuration: defaults, service-group parsing,
- * fail-safe redaction, base URL cleanup, and caching. Each case re-imports the module
- * so the lazily cached config starts empty.
+ * fail-safe redaction, the strict wide-radius switch, base URL cleanup, and caching. Each case
+ * re-imports the module so the lazily cached config starts empty.
  * @module tests/config/server-config.test
  */
 
@@ -15,6 +15,7 @@ const ENV_KEYS = [
   'FCC_SPECTRUM_SERVICES',
   'FCC_SPECTRUM_REDACT_INDIVIDUALS',
   'FCC_SPECTRUM_BASE_URL',
+  'FCC_SPECTRUM_WIDE_RADIUS',
 ] as const;
 
 /** Load a fresh `getServerConfig` with the given environment ('' reads as unset). */
@@ -52,6 +53,7 @@ describe('getServerConfig defaults', () => {
     expect(config.redactIndividuals).toBe(true);
     expect(config.baseUrl).toBe('https://data.fcc.gov/download/pub/uls');
     expect(config.mirrorDir).toBe(resolve('.mirror/fcc-uls'));
+    expect(config.wideRadius).toBe(true);
   });
 
   it('resolves a relative mirror directory to an absolute path', async () => {
@@ -131,6 +133,35 @@ describe('FCC_SPECTRUM_REDACT_INDIVIDUALS', () => {
     expect((await loadConfig({ FCC_SPECTRUM_REDACT_INDIVIDUALS: '   ' }))().redactIndividuals).toBe(
       true,
     );
+  });
+});
+
+describe('FCC_SPECTRUM_WIDE_RADIUS', () => {
+  it.each(['false', '0', 'no', 'off', 'FALSE', 'Off'])(
+    'turns the wide radius off for %j',
+    async (value) => {
+      const config = (await loadConfig({ FCC_SPECTRUM_WIDE_RADIUS: value }))();
+      expect(config.wideRadius).toBe(false);
+    },
+  );
+
+  it.each(['true', '1', 'yes', 'on', 'TRUE'])('keeps the wide radius on for %j', async (value) => {
+    const config = (await loadConfig({ FCC_SPECTRUM_WIDE_RADIUS: value }))();
+    expect(config.wideRadius).toBe(true);
+  });
+
+  it.each([
+    ['blank', '   '],
+    ['an unsubstituted host placeholder', `\${user_config.FCC_SPECTRUM_WIDE_RADIUS}`],
+  ])('keeps the wide radius on when the variable is %s', async (_label, value) => {
+    const config = (await loadConfig({ FCC_SPECTRUM_WIDE_RADIUS: value }))();
+    expect(config.wideRadius).toBe(true);
+  });
+
+  it('rejects a value that is not a boolean word, naming the variable', async () => {
+    const error = await configError({ FCC_SPECTRUM_WIDE_RADIUS: 'flase' });
+    expect(error).toMatchObject({ code: JsonRpcErrorCode.ConfigurationError });
+    expect(error.message).toContain('FCC_SPECTRUM_WIDE_RADIUS');
   });
 });
 

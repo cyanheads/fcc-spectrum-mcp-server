@@ -4,25 +4,14 @@
  * @module index
  */
 
+// Stays first: loads ./.env before any definition below reads settings as it loads.
+import '@/config/load-env.js';
 import { createApp } from '@cyanheads/mcp-ts-core';
 import { getServerConfig } from '@/config/server-config.js';
 import { allResourceDefinitions } from '@/mcp-server/resources/definitions/index.js';
 import { allToolDefinitions } from '@/mcp-server/tools/definitions/index.js';
 import { startIngestSchedule, stopIngestSchedule } from '@/services/uls/ingest-schedule.js';
 import { getUlsIndexService, initUlsIndexService } from '@/services/uls/uls-index-service.js';
-
-/**
- * The server instructions below read the redaction setting before createApp() runs. The
- * framework already loads ./.env while its modules evaluate, ahead of this module's body,
- * but that is incidental to its import graph rather than a documented contract, so load it
- * here as well. process.loadEnvFile() never overrides a variable already set, so the repeat
- * load changes nothing.
- */
-try {
-  process.loadEnvFile();
-} catch (err) {
-  if ((err as NodeJS.ErrnoException).code !== 'ENOENT') throw err;
-}
 
 const REDACTION_SENTENCE =
   " Individual licensees' names are redacted and excluded from name search.";

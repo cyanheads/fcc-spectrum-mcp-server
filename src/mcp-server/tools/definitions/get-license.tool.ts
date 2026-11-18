@@ -355,6 +355,19 @@ const LicenseSchema = z
           .object({
             callsign: z.string().optional().describe('Parent license callsign.'),
             usi: z.string().describe('Parent license USI; pass it as usi to read the parent.'),
+            licenseeName: z
+              .string()
+              .nullable()
+              .optional()
+              .describe(
+                "Parent license's licensee name as filed; null when redacted or not on file. Absent, with licenseeRedacted, when the index does not hold the parent license.",
+              ),
+            licenseeRedacted: z
+              .boolean()
+              .optional()
+              .describe(
+                "True when the parent's licensee is an individual whose name is withheld; absent when the index does not hold the parent license.",
+              ),
           })
           .describe('One parent license.'),
       )
@@ -366,6 +379,13 @@ const LicenseSchema = z
             callsign: z.string().optional().describe('Lease ID.'),
             usi: z.string().describe('Lease USI.'),
             licenseStatus: z.string().describe('Lease status code.'),
+            lesseeName: z
+              .string()
+              .nullable()
+              .describe('Lessee name as filed; null when redacted or not on file.'),
+            lesseeRedacted: z
+              .boolean()
+              .describe('True when the lessee is an individual whose name is withheld.'),
           })
           .describe('One lease.'),
       )
@@ -378,7 +398,7 @@ const LicenseSchema = z
 
 export const getLicense = tool('fcc_spectrum_get_license', {
   title: 'Get an FCC ULS license',
-  description: `Fetch one FCC ULS license or spectrum lease in full by callsign or unique system identifier (USI): licensee (the lessee on a lease), status and key dates, its locations with coordinates, elevation, structure height, and ASR number, each location's antennas, each antenna's authorized frequencies with power, ERP/EIRP, station class, transmitter, and emission designators, and the microwave paths it transmits on (receive location and antenna, receive coordinates, receiving callsign); geographic-area licenses list their market and spectrum blocks, and lease links are shown in both directions. Large records are paged: one call lists whole locations up to ${LICENSE_PAGE.sites} sites, ${LICENSE_PAGE.antennas} antennas, and ${LICENSE_PAGE.paths} paths, up to max_frequencies frequency rows, and ${LICENSE_PAGE.leases} leases, and names the location_offset or lease_offset that reads the rest; location_number starts the locations at a location number the search tools return. Technical detail is kept for active, pending-legal, and term-pending records only. A callsign shared by several records returns the active one, else the most recent.`,
+  description: `Fetch one FCC ULS license or spectrum lease in full by callsign or unique system identifier (USI): licensee (the lessee on a lease), status and key dates, its locations with coordinates, elevation, structure height, and ASR number, each location's antennas, each antenna's authorized frequencies with power, ERP/EIRP, station class, transmitter, and emission designators, and the microwave paths it transmits on (receive location and antenna, receive coordinates, receiving callsign); geographic-area licenses list their market and spectrum blocks, and lease links are shown in both directions, naming each lease's lessee and each parent license's licensee. Large records are paged: one call lists whole locations up to ${LICENSE_PAGE.sites} sites, ${LICENSE_PAGE.antennas} antennas, and ${LICENSE_PAGE.paths} paths, up to max_frequencies frequency rows, and ${LICENSE_PAGE.leases} leases, and names the location_offset or lease_offset that reads the rest; location_number starts the locations at a location number the search tools return. Technical detail is kept for active, pending-legal, and term-pending records only. A callsign shared by several records returns the active one, else the most recent.`,
   annotations: { readOnlyHint: true, idempotentHint: true, openWorldHint: false },
   input: z.object({
     callsign: blankAsUnset(callsignSchema.optional()).describe(
@@ -796,9 +816,13 @@ function licenseLines(license: z.infer<typeof LicenseSchema>): string[] {
       }
     }
   }
-  if (license.leasedFrom.length) {
+  for (const parent of license.leasedFrom) {
+    const licensee =
+      parent.licenseeRedacted === undefined
+        ? 'not in the index'
+        : `**Licensee:** ${licenseeText(parent.licenseeName ?? null, parent.licenseeRedacted)}`;
     lines.push(
-      `**Leased from:** ${license.leasedFrom.map((parent) => `${callsignText(parent.callsign)} (USI ${parent.usi})`).join(', ')}`,
+      `**Leased from:** ${callsignText(parent.callsign)} (USI ${parent.usi}) · ${licensee}`,
     );
   }
   lines.push(
@@ -806,7 +830,7 @@ function licenseLines(license: z.infer<typeof LicenseSchema>): string[] {
   );
   for (const lease of license.leases) {
     lines.push(
-      `- ${callsignText(lease.callsign)} · USI ${lease.usi} · status ${lease.licenseStatus}`,
+      `- ${callsignText(lease.callsign)} · USI ${lease.usi} · status ${lease.licenseStatus} · **Lessee:** ${licenseeText(lease.lesseeName, lease.lesseeRedacted)}`,
     );
   }
   return lines;

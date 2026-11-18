@@ -359,6 +359,15 @@ type MarketBlockRow = LicenseHeadRow & {
   upper: number | null;
 };
 
+/** A find_transmitters candidate site: its key and filed coordinates, before the distance test. */
+interface TransmitterCandidate {
+  lat: number;
+  loc: number;
+  lon: number;
+  seq: number;
+  usi: number;
+}
+
 /** Licenses whose licensee name matches an FTS query ({@link ftsQuery}). */
 const LICENSEE_MATCH_SQL = 'l.usi IN (SELECT rowid FROM licenses_fts WHERE licenses_fts MATCH ?)';
 
@@ -448,18 +457,50 @@ function ftsQuery(text: string): string | undefined {
   return terms.length ? terms.join(' ') : undefined;
 }
 
-function encodeCursor(generation: string, tag: string, key: CursorKey): string {
-  return Buffer.from(JSON.stringify([generation, tag, ...key])).toString('base64url');
+/**
+ * An {@link ftsQuery} folded as the licensee index's tokenizer (`unicode61 remove_diacritics 2`)
+ * folds it, so licensee inputs that search the same rows share a cursor digest: ASCII case, and
+ * the diacritics of letters with an ASCII base (`É` reads as `e`). Every other letter is kept as
+ * written, so a variant the tokenizer would also fold (`Æ`/`æ`) fails the cursor rather than
+ * risking one it would not (`Ϳ`/`ϳ`). The one known overreach is `Ǡ`/`ǡ`, which fold to `a`.
+ */
+function tokenizerFolded(query: string): string {
+  return query
+    .normalize('NFD')
+    .replace(/([A-Za-z])[̀-ͯ]+/g, '$1')
+    .normalize('NFC')
+    .replace(/[A-Z]+/g, (letters) => letters.toLowerCase());
 }
 
 /**
- * Decode a cursor minted for this generation and query shape; `undefined` when it does
- * not decode, belongs to another generation (a rebuild happened), or has the wrong shape.
+ * The digest a cursor carries of the search that minted it: the first 128 bits of SHA-256 over
+ * `inputs` as JSON, base64url (22 characters). `inputs` lists, in a fixed order per search, the
+ * normalized values that select or order its rows; the page size and per-row budgets stay out,
+ * so they can change between pages.
+ */
+async function inputDigest(inputs: readonly (string | number | undefined)[]): Promise<string> {
+  const hash = await crypto.subtle.digest(
+    'SHA-256',
+    new TextEncoder().encode(JSON.stringify(inputs)),
+  );
+  return Buffer.from(hash, 0, 16).toString('base64url');
+}
+
+function encodeCursor(generation: string, tag: string, digest: string, key: CursorKey): string {
+  return Buffer.from(JSON.stringify([generation, tag, digest, ...key])).toString('base64url');
+}
+
+/**
+ * Decode a cursor minted for this generation, query shape, and input digest; `undefined` when it
+ * does not decode, belongs to another generation (a rebuild happened), carries another search's
+ * digest, or has the wrong shape. A cursor minted before cursors carried a digest
+ * (`[generation, tag, ...key]`) still decodes on its generation and shape alone.
  */
 function decodeCursor(
   cursor: string,
   generation: string,
   tag: string,
+  digest: string,
   shape: readonly ('number' | 'string' | 'string?')[],
 ): (string | number | null)[] | undefined {
   let parsed: unknown;
@@ -469,7 +510,9 @@ function decodeCursor(
     return;
   }
   if (!Array.isArray(parsed) || parsed[0] !== generation || parsed[1] !== tag) return;
-  const key = parsed.slice(2) as unknown[];
+  const bound = parsed.length === shape.length + 3;
+  if (bound && parsed[2] !== digest) return;
+  const key = parsed.slice(bound ? 3 : 2) as unknown[];
   if (key.length !== shape.length) return;
   const valid = key.every((value, i) => {
     const kind = shape[i];
@@ -848,12 +891,27 @@ export class UlsIndexService {
   /**
    * Search licenses and leases. With `licensee`, rows rank by FTS bm25 then USI, and
    * individual records are excluded while redaction is on; otherwise they sort by callsign
-   * then USI. Keyset-paginated with a generation-bound cursor; a rank-order cursor is also
-   * bound to the daily files applied, since each one shifts the corpus statistics bm25 scores
-   * from.
+   * then USI. Keyset-paginated with a cursor bound to the generation and the search inputs; a
+   * rank-order cursor is also bound to the daily files applied, since each one shifts the
+   * corpus statistics bm25 scores from.
    */
   async searchLicenses(params: SearchLicensesParams): Promise<PageResult<LicenseSummary>> {
     const { db, id } = await this.requireGeneration();
+    const match = params.licensee === undefined ? undefined : ftsQuery(params.licensee);
+    const digest = await inputDigest([
+      'licenses',
+      params.callsign,
+      match && tokenizerFolded(match),
+      params.frn,
+      params.marketCode,
+      params.radioService,
+      params.status,
+      params.state,
+      params.expiresAfter,
+      params.expiresBefore,
+      params.grantedAfter,
+      params.grantedBefore,
+    ]);
     const where: string[] = [];
     const args: SqlValue[] = [];
     const filter = (clause: string, value: SqlValue) => {
@@ -866,11 +924,15 @@ export class UlsIndexService {
     if (params.radioService) filter('l.radio_service_code = ?', params.radioService);
     if (params.status !== 'any') filter('l.license_status = ?', params.status);
     if (params.state) filter('l.licensee_state = ?', params.state);
+    // Dates are stored as ISO `YYYY-MM-DD` text or NULL, so text comparison is exact and NULL never matches.
+    if (params.expiresAfter) filter('l.expired_date >= ?', params.expiresAfter);
+    if (params.expiresBefore) filter('l.expired_date <= ?', params.expiresBefore);
+    if (params.grantedAfter) filter('l.grant_date >= ?', params.grantedAfter);
+    if (params.grantedBefore) filter('l.grant_date <= ?', params.grantedBefore);
 
     if (params.licensee === undefined)
-      return this.searchByCallsignOrder(db, id, params, where, args);
+      return this.searchByCallsignOrder(db, id, digest, params, where, args);
 
-    const match = ftsQuery(params.licensee);
     if (!match) return { ok: true, rows: [], total: 0 };
     if (this.redactIndividuals) where.push('l.is_individual = 0');
     const base = `FROM licenses_fts JOIN licenses l ON l.usi = licenses_fts.rowid
@@ -882,7 +944,7 @@ export class UlsIndexService {
     let keyset = '';
     const keysetArgs: SqlValue[] = [];
     if (params.cursor) {
-      const key = decodeCursor(params.cursor, scoreState, 'r', ['number', 'number']);
+      const key = decodeCursor(params.cursor, scoreState, 'r', digest, ['number', 'number']);
       if (!key) return { ok: false, reason: 'invalid_cursor' };
       keyset = 'WHERE (score, usi) > (?, ?)';
       keysetArgs.push(...(key as number[]));
@@ -901,13 +963,14 @@ export class UlsIndexService {
       total,
       rows: this.licenseSummaries(db, rows.slice(0, params.limit)),
       ...(rows.length > params.limit &&
-        last && { nextCursor: encodeCursor(scoreState, 'r', [last.score, last.usi]) }),
+        last && { nextCursor: encodeCursor(scoreState, 'r', digest, [last.score, last.usi]) }),
     };
   }
 
   private searchByCallsignOrder(
     db: SqliteHandle,
     id: string,
+    digest: string,
     params: SearchLicensesParams,
     where: string[],
     args: SqlValue[],
@@ -922,7 +985,7 @@ export class UlsIndexService {
     const pageWhere = [...where];
     const pageArgs = [...args];
     if (params.cursor) {
-      const key = decodeCursor(params.cursor, id, 'c', ['string?', 'number']);
+      const key = decodeCursor(params.cursor, id, 'c', digest, ['string?', 'number']);
       if (!key) return { ok: false, reason: 'invalid_cursor' };
       const [callsign, usi] = key as [string | null, number];
       // ULS files a few old records without a callsign; they sort first (NULL) in callsign order.
@@ -947,7 +1010,7 @@ export class UlsIndexService {
       rows: this.licenseSummaries(db, rows.slice(0, params.limit)),
       ...(rows.length > params.limit &&
         last && {
-          nextCursor: encodeCursor(id, 'c', [last.callsign ?? null, last.usi] as CursorKey),
+          nextCursor: encodeCursor(id, 'c', digest, [last.callsign ?? null, last.usi] as CursorKey),
         }),
     };
   }
@@ -1202,7 +1265,8 @@ export class UlsIndexService {
 
   /**
    * The license record with one page of its leases from `leaseOffset`, in lease-ID order,
-   * and the offset of the next page when more follow.
+   * and the offset of the next page when more follow. Each lease names its lessee and each
+   * parent its licensee, through {@link redact}.
    */
   private licenseDetail(
     db: SqliteHandle,
@@ -1210,9 +1274,16 @@ export class UlsIndexService {
     leaseOffset: number,
   ): { license: LicenseDetail; nextLeaseOffset?: number } {
     const shown = this.redact(row);
+    // `is_individual` is NOT NULL in `licenses`, so a null one means the parent has no row.
     const leasedFrom = db
-      .prepare<{ callsign: string | null; usi: number }>(
-        `SELECT COALESCE(ll.parent_callsign, p.callsign) AS callsign, ll.parent_usi AS usi
+      .prepare<{
+        callsign: string | null;
+        is_individual: number | null;
+        licensee_name: string | null;
+        usi: number;
+      }>(
+        `SELECT COALESCE(ll.parent_callsign, p.callsign) AS callsign, ll.parent_usi AS usi,
+           p.licensee_name, p.is_individual
          FROM lease_links ll LEFT JOIN licenses p ON p.usi = ll.parent_usi
          WHERE ll.lease_usi = ? ORDER BY ll.parent_usi`,
       )
@@ -1223,9 +1294,11 @@ export class UlsIndexService {
         .get(row.usi)?.n ?? 0;
     // One row past the page says whether another page follows.
     const leaseRows = db
-      .prepare<{ callsign: string | null; license_status: string; usi: number }>(
-        `SELECT l.callsign, l.usi, l.license_status FROM lease_links ll
-         JOIN licenses l ON l.usi = ll.lease_usi
+      .prepare<
+        Pick<LicenseRow, 'callsign' | 'is_individual' | 'license_status' | 'licensee_name' | 'usi'>
+      >(
+        `SELECT l.callsign, l.usi, l.license_status, l.licensee_name, l.is_individual
+         FROM lease_links ll JOIN licenses l ON l.usi = ll.lease_usi
          WHERE ll.parent_usi = ? ORDER BY l.callsign, l.usi LIMIT ? OFFSET ?`,
       )
       .all(row.usi, LICENSE_PAGE.leases + 1, leaseOffset);
@@ -1293,15 +1366,22 @@ export class UlsIndexService {
           })),
         },
       }),
-      leasedFrom: leasedFrom.map((parent) => ({
-        ...opt('callsign', parent.callsign),
-        usi: String(parent.usi),
-      })),
-      leases: leases.map((lease) => ({
-        ...opt('callsign', lease.callsign),
-        usi: String(lease.usi),
-        licenseStatus: lease.license_status,
-      })),
+      leasedFrom: leasedFrom.map(({ callsign, usi, licensee_name, is_individual }) => {
+        const parent = { ...opt('callsign', callsign), usi: String(usi) };
+        if (is_individual === null) return parent;
+        const { licenseeName, licenseeRedacted } = this.redact({ is_individual, licensee_name });
+        return { ...parent, licenseeName, licenseeRedacted };
+      }),
+      leases: leases.map((lease) => {
+        const lessee = this.redact(lease);
+        return {
+          ...opt('callsign', lease.callsign),
+          usi: String(lease.usi),
+          licenseStatus: lease.license_status,
+          lesseeName: lessee.licenseeName,
+          lesseeRedacted: lessee.licenseeRedacted,
+        };
+      }),
       leaseCount,
     };
     return leaseRows.length > LICENSE_PAGE.leases
@@ -1450,8 +1530,8 @@ export class UlsIndexService {
   // --- find_transmitters ----------------------------------------------------------------
 
   /**
-   * FCC-licensed sites within `radiusKm` of a point, nearest first: a bounding-box query on
-   * `locations(lat, lon)`, then haversine distance in JS, keyset-paginated on
+   * FCC-licensed sites within `radiusKm` of a point, nearest first: the candidates in a bounding
+   * box ({@link transmitterCandidates}), then haversine distance in JS, keyset-paginated on
    * `(distance, usi, location_number, site_seq)`. A mobile or temporary-fixed area is filed as
    * a center and a radius of operation, so it is a site at its center, matched and ranked by
    * the center's distance. With a band, only sites authorized on an overlapping frequency
@@ -1461,46 +1541,31 @@ export class UlsIndexService {
    */
   async findTransmitters(params: FindTransmittersParams): Promise<PageResult<TransmitterSite>> {
     const { db, id } = await this.requireGeneration();
+    const digest = await inputDigest([
+      'transmitters',
+      params.latitude,
+      params.longitude,
+      params.radiusKm,
+      params.band?.lowMhz,
+      params.band?.highMhz,
+      params.radioService,
+      params.locationType,
+      params.locationClass,
+      params.status,
+    ]);
     let after: CursorKey | undefined;
     if (params.cursor) {
-      const key = decodeCursor(params.cursor, id, 't', ['number', 'number', 'number', 'number']);
+      const key = decodeCursor(params.cursor, id, 't', digest, [
+        'number',
+        'number',
+        'number',
+        'number',
+      ]);
       if (!key) return { ok: false, reason: 'invalid_cursor' };
       after = key as CursorKey;
     }
-    const box = boundingBox(params.latitude, params.longitude, params.radiusKm);
-    const statuses = liveStatuses(params.status);
-    const where = [
-      'lo.lat BETWEEN ? AND ?',
-      `(${box.lon.map(() => 'lo.lon BETWEEN ? AND ?').join(' OR ')})`,
-      `l.license_status IN (${statuses.map(() => '?').join(', ')})`,
-    ];
-    const args: SqlValue[] = [...box.lat, ...box.lon.flat(), ...statuses];
-    if (params.radioService) {
-      where.push('l.radio_service_code = ?');
-      args.push(params.radioService);
-    }
-    if (params.locationType) {
-      where.push('lo.location_type = ?');
-      args.push(params.locationType);
-    }
-    if (params.locationClass) {
-      where.push('lo.location_class = ?');
-      args.push(params.locationClass);
-    }
     const overlap = params.band && this.overlapArgs(params.band);
-    if (overlap) {
-      where.push(
-        `EXISTS (SELECT 1 FROM frequencies f WHERE f.usi = lo.usi
-           AND f.location_number = lo.location_number AND f.occ_low <= ? AND f.occ_high >= ?)`,
-      );
-      args.push(overlap.high, overlap.low);
-    }
-    const candidates = db
-      .prepare<{ lat: number; loc: number; lon: number; seq: number; usi: number }>(
-        `SELECT lo.usi, lo.location_number AS loc, lo.site_seq AS seq, lo.lat, lo.lon
-         FROM locations lo JOIN licenses l ON l.usi = lo.usi WHERE ${where.join(' AND ')}`,
-      )
-      .all(...args);
+    const candidates = this.transmitterCandidates(db, params, overlap);
 
     const siteKey = (site: { distance: number; loc: number; seq: number; usi: number }) => [
       site.distance,
@@ -1572,8 +1637,79 @@ export class UlsIndexService {
       rows,
       total: inRange.length,
       ...(remaining.length > params.limit &&
-        last && { nextCursor: encodeCursor(id, 't', siteKey(last)) }),
+        last && { nextCursor: encodeCursor(id, 't', digest, siteKey(last)) }),
     };
+  }
+
+  /**
+   * The sites in the search's bounding box that pass its filters, before the distance test. A
+   * band whose index cover (the count `searchFrequencies` takes) fits `exactCap` drives the read
+   * from its overlapping assignments through `frequencies_band`; otherwise, and with no band, the
+   * box drives it through `locations_coords`, testing each site's assignments for an overlap.
+   * Both read the same sites; the cover, not the band's width, says which costs less.
+   */
+  private transmitterCandidates(
+    db: SqliteHandle,
+    params: FindTransmittersParams,
+    overlap: { high: number; low: number } | undefined,
+  ): TransmitterCandidate[] {
+    const box = boundingBox(params.latitude, params.longitude, params.radiusKm);
+    const statuses = liveStatuses(params.status);
+    const conditions = [
+      condition('lo.lat BETWEEN ? AND ?', ...box.lat),
+      condition(`(${box.lon.map(() => 'lo.lon BETWEEN ? AND ?').join(' OR ')})`, ...box.lon.flat()),
+      condition(`l.license_status IN (${placeholders(statuses.length)})`, ...statuses),
+      ...(params.radioService ? [condition('l.radio_service_code = ?', params.radioService)] : []),
+      ...(params.locationType ? [condition('lo.location_type = ?', params.locationType)] : []),
+      ...(params.locationClass ? [condition('lo.location_class = ?', params.locationClass)] : []),
+    ];
+    let driver: 'band_index' | 'bounding_box' = 'bounding_box';
+    let source = condition('locations lo JOIN licenses l ON l.usi = lo.usi');
+    if (overlap) {
+      const { exactCap } = this.frequencySearch;
+      const ranges = classRanges(
+        readMetaNumber(db, META_KEYS.maxSiteBand),
+        (bound) => overlap.low - bound,
+        overlap.high,
+      );
+      if (coverCount(db, 'frequencies', 'occ_low', ranges, exactCap + 1) <= exactCap) {
+        driver = 'band_index';
+        const assigned = [
+          condition('+f.occ_low <= ?', overlap.high),
+          condition('f.occ_high >= ?', overlap.low),
+          rangeCondition('f', 'occ_low', ranges),
+        ];
+        source = condition(
+          `(SELECT DISTINCT f.usi, f.location_number FROM frequencies f WHERE ${whereSql(assigned)}) m
+           CROSS JOIN locations lo ON lo.usi = m.usi AND lo.location_number = m.location_number
+           CROSS JOIN licenses l ON l.usi = lo.usi`,
+          ...whereArgs(assigned),
+        );
+      } else {
+        conditions.push(
+          condition(
+            `EXISTS (SELECT 1 FROM frequencies f WHERE f.usi = lo.usi
+               AND f.location_number = lo.location_number AND f.occ_low <= ? AND f.occ_high >= ?)`,
+            overlap.high,
+            overlap.low,
+          ),
+        );
+      }
+    }
+    const candidates = db
+      .prepare<TransmitterCandidate>(
+        `SELECT lo.usi, lo.location_number AS loc, lo.site_seq AS seq, lo.lat, lo.lon
+         FROM ${source.sql} WHERE ${whereSql(conditions)}`,
+      )
+      .all(...source.args, ...whereArgs(conditions));
+    logger.debug(
+      'Transmitter search candidates read.',
+      requestContextService.createRequestContext({
+        operation: 'UlsIndexService.findTransmitters',
+        additionalContext: { driver, candidates: candidates.length },
+      }),
+    );
+    return candidates;
   }
 
   // --- search_frequencies ---------------------------------------------------------------
@@ -1593,9 +1729,22 @@ export class UlsIndexService {
     params: SearchFrequenciesParams,
   ): Promise<PageResult<FrequencyAssignment>> {
     const { db, id } = await this.requireGeneration();
+    const match = params.licensee === undefined ? undefined : ftsQuery(params.licensee);
+    const digest = await inputDigest([
+      'frequencies',
+      params.band.lowMhz,
+      params.band.highMhz,
+      params.kind,
+      params.state,
+      params.radioService,
+      match && tokenizerFolded(match),
+      params.frn,
+      params.marketCode,
+      params.status,
+    ]);
     let after: number[] | undefined;
     if (params.cursor) {
-      const key = decodeCursor(params.cursor, id, 'f', [
+      const key = decodeCursor(params.cursor, id, 'f', digest, [
         'number',
         'number',
         'number',
@@ -1605,7 +1754,6 @@ export class UlsIndexService {
       if (!key) return { ok: false, reason: 'invalid_cursor' };
       after = key as number[];
     }
-    const match = params.licensee === undefined ? undefined : ftsQuery(params.licensee);
     if (params.licensee !== undefined && !match) return { ok: true, rows: [], total: 0 };
 
     const statuses = liveStatuses(params.status);
@@ -1680,7 +1828,7 @@ export class UlsIndexService {
       rows: page.map((entry) => entry.row),
       total: sides.reduce((sum, side) => sum + side.total, 0),
       ...(sides.some((side) => side.lowerBound) && { totalIsLowerBound: true }),
-      ...(next && { nextCursor: encodeCursor(id, 'f', next) }),
+      ...(next && { nextCursor: encodeCursor(id, 'f', digest, next) }),
     };
   }
 

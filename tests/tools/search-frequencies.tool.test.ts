@@ -493,6 +493,81 @@ describe('warm index', () => {
     });
   });
 
+  describe('cursors and search inputs', () => {
+    /** The page the first page of `input` continues to under `next`. */
+    const continued = async (
+      input: Record<string, unknown>,
+      next: Record<string, unknown>,
+    ): Promise<Page> => {
+      const first = page(await run(input));
+      expect(first.nextCursor).toEqual(expect.any(String));
+      return page(await run({ ...next, cursor: first.nextCursor }));
+    };
+
+    it.each<[string, Record<string, unknown>]>([
+      ['the band in kHz', { frequency_low: 2496000, frequency_high: 2530000, unit: 'khz' }],
+      ['the band in GHz', { frequency_low: 2.496, frequency_high: 2.53, unit: 'GHz' }],
+      [
+        'the default kind, status, and unit passed',
+        { ...BRS, kind: ' BOTH ', status: 'active', unit: 'MHz' },
+      ],
+      ['a state name for its code', { ...BRS, state: 'North Dakota' }],
+    ])('continues a search with %s', async (_label, equivalent) => {
+      const base = equivalent.state ? { ...BRS, state: 'ND' } : BRS;
+      const expected = await continued({ ...base, limit: 2 }, { ...base, limit: 2 });
+      const actual = await continued({ ...base, limit: 2 }, { ...equivalent, limit: 2 });
+      expect(actual.assignments.length).toBeGreaterThan(0);
+      expect(rowIds(actual.assignments)).toEqual(rowIds(expected.assignments));
+      expect(actual.totalCount).toBe(expected.totalCount);
+    });
+
+    it('continues a single-frequency search given frequency_high equal to frequency_low', async () => {
+      const single = { frequency_low: 2500, limit: 1 };
+      const next = await continued(single, { ...single, frequency_high: 2500 });
+      expect(rowIds(next.assignments)).toEqual(['m2002@2496']);
+    });
+
+    it('continues a name search given other case and spacing', async () => {
+      const named = { ...BRS, licensee: 'Sample Broadband', limit: 2 };
+      const expected = await continued(named, named);
+      const actual = await continued(named, { ...named, licensee: '  sample  BROADBAND ' });
+      expect(actual.assignments).toHaveLength(2);
+      expect(rowIds(actual.assignments)).toEqual(rowIds(expected.assignments));
+    });
+
+    it('continues at another limit', async () => {
+      const next = await continued({ ...BRS, limit: 2 }, { ...BRS, limit: 3 });
+      expect(rowIds(next.assignments)).toEqual(BRS_ORDER.slice(2, 5));
+    });
+
+    it.each<[string, Record<string, unknown>]>([
+      ['another band', { frequency_low: 2496, frequency_high: 2600 }],
+      ['another kind', { ...BRS, kind: 'market' }],
+      ['another status', { ...BRS, status: 'any' }],
+    ])(
+      'fails invalid_cursor on both surfaces for a cursor carried to %s',
+      async (_label, other) => {
+        const first = page(await run({ ...BRS, limit: 2 }));
+        expectDeclaredError(
+          searchFrequencies,
+          await run({ ...other, limit: 2, cursor: first.nextCursor }),
+          'invalid_cursor',
+        );
+      },
+    );
+
+    it('names the input mismatch in the invalid_cursor contract and keeps its recovery', () => {
+      expect(searchFrequencies.errors?.find((entry) => entry.reason === 'invalid_cursor')).toEqual({
+        reason: 'invalid_cursor',
+        code: JsonRpcErrorCode.ValidationError,
+        when: 'The cursor does not decode, belongs to an earlier index generation, or was minted for a search with another band or filter.',
+        severity: 'notice',
+        recovery:
+          'Call fcc_spectrum_search_frequencies again with the same inputs and no cursor to start from the first page.',
+      });
+    });
+  });
+
   describe('band walk', () => {
     it('says the scan stopped partway on a short page with a cursor, never that nothing matched', async () => {
       await useIndex(fixture.mirrorDir, {

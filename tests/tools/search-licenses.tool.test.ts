@@ -7,6 +7,7 @@
  * @module tests/tools/search-licenses.tool.test
  */
 
+import { z } from '@cyanheads/mcp-ts-core';
 import { JsonRpcErrorCode } from '@cyanheads/mcp-ts-core/errors';
 import { runToolContract } from '@cyanheads/mcp-ts-core/testing';
 import { afterAll, beforeAll, beforeEach, describe, expect, it } from 'vitest';
@@ -28,7 +29,11 @@ import {
   successOf,
   useIndex,
 } from '../fixtures/tool-harness.js';
-import { carrierNamesWeekly, MARKET_CODES_WEEKLY } from '../fixtures/uls-fixtures.js';
+import {
+  carrierNamesWeekly,
+  LICENSE_DATES_WEEKLY,
+  MARKET_CODES_WEEKLY,
+} from '../fixtures/uls-fixtures.js';
 import {
   buildFixtureIndex,
   type FixtureIndex,
@@ -329,11 +334,94 @@ describe('warm index', () => {
     });
   });
 
+  describe('cursors and search inputs', () => {
+    /** The page the first page of `input` continues to under `next`. */
+    const continued = async (
+      input: Record<string, unknown>,
+      next: Record<string, unknown>,
+    ): Promise<Page> => {
+      const first = page(await run(input));
+      expect(first.nextCursor).toEqual(expect.any(String));
+      return page(await run({ ...next, cursor: first.nextCursor }));
+    };
+
+    it.each<[string, Record<string, unknown>, Record<string, unknown>, string[]]>([
+      [
+        'a state name for its code and the default status passed',
+        { state: 'WA', limit: 1 },
+        { state: 'Washington', status: 'active', limit: 1 },
+        ['1003'],
+      ],
+      [
+        'an unpadded FRN for the padded one',
+        { frn: '0001234567', status: 'any', limit: 1 },
+        { frn: '123-4567', status: 'ANY', limit: 1 },
+        ['1005'],
+      ],
+      [
+        'a callsign in another case with a portable suffix',
+        { callsign: 'KZZ901', status: 'any', limit: 1 },
+        { callsign: 'kzz901/4', status: 'any', limit: 1 },
+        ['1005'],
+      ],
+      [
+        'another limit',
+        { radio_service: 'CD', status: 'any', limit: 3 },
+        { radio_service: 'CD', status: 'any', limit: 4 },
+        PAGING_ORDER.slice(3),
+      ],
+    ])('continues a search given %s', async (_label, input, equivalent, expected) => {
+      expect(usis((await continued(input, equivalent)).licenses)).toEqual(expected);
+    });
+
+    it('continues a name search given other case and spacing', async () => {
+      const named = { licensee: 'paging', status: 'any', limit: 2 };
+      const expected = await continued(named, named);
+      const actual = await continued(named, { ...named, licensee: '  PAGING ' });
+      expect(actual.licenses).toHaveLength(2);
+      expect(usis(actual.licenses)).toEqual(usis(expected.licenses));
+    });
+
+    it.each<[string, Record<string, unknown>, Record<string, unknown>]>([
+      [
+        'another status',
+        { radio_service: 'CD', status: 'any', limit: 3 },
+        { radio_service: 'CD', status: 'A', limit: 3 },
+      ],
+      [
+        'other name words',
+        { licensee: 'paging', status: 'any', limit: 2 },
+        { licensee: 'example', status: 'any', limit: 2 },
+      ],
+    ])(
+      'fails invalid_cursor on both surfaces for a cursor carried to %s',
+      async (_label, input, other) => {
+        const first = page(await run(input));
+        expectDeclaredError(
+          searchLicenses,
+          await run({ ...other, cursor: first.nextCursor }),
+          'invalid_cursor',
+        );
+      },
+    );
+
+    it('names the input mismatch in the invalid_cursor contract and keeps its recovery', () => {
+      expect(searchLicenses.errors?.find((entry) => entry.reason === 'invalid_cursor')).toEqual({
+        reason: 'invalid_cursor',
+        code: JsonRpcErrorCode.ValidationError,
+        when: 'The cursor does not decode, belongs to an earlier index generation, was minted for a search with other filters, or is from a licensee search the daily refresh has since changed.',
+        severity: 'notice',
+        recovery:
+          'Call fcc_spectrum_search_licenses again with the same filters and no cursor to start from the first page.',
+      });
+    });
+  });
+
   describe('notices', () => {
     it('explains a zero-hit callsign search under the default status', async () => {
       const result = page(await run({ callsign: 'KZZ000' }));
       expect(result.notice).toBe(
-        `${ACTIVE_ONLY} No record carries callsign KZZ000 in the indexed service groups; call fcc_spectrum_get_license with this callsign, which reads every status, or fcc_spectrum_list_reference with topic "coverage" to confirm the service group is loaded.`,
+        `${ACTIVE_ONLY} No record matching these filters carries callsign KZZ000 in the indexed service groups; call fcc_spectrum_get_license with this callsign, which reads every status and takes no other filter, or fcc_spectrum_list_reference with topic "coverage" to confirm the service group is loaded.`,
       );
     });
 
@@ -674,4 +762,212 @@ describe('market codes', () => {
       expect(error.message).toContain('market_code: Invalid string: must match pattern');
     },
   );
+});
+
+describe('expiration and grant date bounds', () => {
+  let dated: FixtureIndex;
+  beforeAll(async () => {
+    dated = await buildFixtureIndex({
+      groups: ['paging'],
+      weekly: { paging: LICENSE_DATES_WEEKLY },
+    });
+  });
+  beforeEach(async () => {
+    await useIndex(dated.mirrorDir, { services: ['paging'] });
+  });
+  afterAll(async () => {
+    await releaseIndex();
+    await dated.dispose();
+  });
+
+  /** FRN 0009200000 holds every record of the dated fixture, USIs 9201–9208. */
+  const FRN = { frn: '9200000' };
+  const BOUNDS = ['expires_after', 'expires_before', 'granted_after', 'granted_before'] as const;
+
+  it('keeps active records expiring by a date on both surfaces, echoing the bound', async () => {
+    const result = await run({ ...FRN, expires_before: '2027-06-30' });
+    const structured = page(result);
+    expect(structured).toMatchObject({
+      totalCount: 3,
+      shown: 3,
+      truncated: false,
+      appliedFilters: { frn: '0009200000', status: 'A', expires_before: '2027-06-30' },
+    });
+    expect(usis(structured.licenses)).toEqual(['9201', '9202', '9207']);
+    expect(structured.licenses.map((license) => license.expiredDate)).toEqual([
+      '2027-06-29',
+      '2027-06-30',
+      '2026-12-31',
+    ]);
+    expect(structured.notice).toBeUndefined();
+    const rendered = contractText(result);
+    expect(rendered).toContain(
+      '**Applied filters:** frn="0009200000" · status="A" · expires_before="2027-06-30"',
+    );
+    expectCarries(rendered, structured.licenses);
+  });
+
+  it('applies every bound inclusively, alone and paired, and echoes each', async () => {
+    const result = page(
+      await run({
+        ...FRN,
+        status: 'any',
+        expires_after: '2027-06-30',
+        expires_before: '2028-02-29',
+        granted_after: '2017-07-01',
+        granted_before: '2024-02-29',
+      }),
+    );
+    expect(usis(result.licenses)).toEqual(['9202', '9208']);
+    expect(result.appliedFilters).toEqual({
+      frn: '0009200000',
+      status: 'any',
+      expires_after: '2027-06-30',
+      expires_before: '2028-02-29',
+      granted_after: '2017-07-01',
+      granted_before: '2024-02-29',
+    });
+    expect(
+      usis(
+        page(await run({ ...FRN, granted_after: '2017-06-30', granted_before: '2017-06-30' }))
+          .licenses,
+      ),
+    ).toEqual(['9201']);
+  });
+
+  it('never matches a record without the bounded date', async () => {
+    const expiring = page(await run({ ...FRN, status: 'any', expires_after: '1900-01-01' }));
+    expect(usis(expiring.licenses)).not.toContain('9204');
+    expect(usis(expiring.licenses)).not.toContain('9206');
+    expect(expiring.totalCount).toBe(6);
+    const granted = page(await run({ ...FRN, status: 'any', granted_before: '2099-12-31' }));
+    expect(usis(granted.licenses)).not.toContain('9204');
+    expect(usis(granted.licenses)).not.toContain('9207');
+    expect(granted.totalCount).toBe(6);
+  });
+
+  it('keeps relevance order and an exact total on a bounded name search', async () => {
+    const ranked = page(await run({ licensee: 'dated', limit: 100 })).licenses;
+    const result = page(await run({ licensee: 'dated', expires_before: '2027-06-30' }));
+    expect(result.totalCount).toBe(3);
+    expect(usis(result.licenses)).toEqual(
+      usis(ranked).filter((usi) => ['9201', '9202', '9207'].includes(usi)),
+    );
+  });
+
+  it('pages a bounded search, and fails invalid_cursor when a bound changes between pages', async () => {
+    const input = { ...FRN, status: 'any', granted_after: '2017-07-01', limit: 2 };
+    const one = page(await run(input));
+    expect(one).toMatchObject({ totalCount: 4, shown: 2, truncated: true });
+    const two = page(await run({ ...input, limit: 3, cursor: one.nextCursor }));
+    expect(usis([...one.licenses, ...two.licenses])).toEqual(['9202', '9203', '9206', '9208']);
+    for (const changed of [
+      { granted_after: '2017-07-02' },
+      { granted_after: undefined },
+      { expires_before: '2099-12-31' },
+    ]) {
+      expectDeclaredError(
+        searchLicenses,
+        await run({ ...input, ...changed, cursor: one.nextCursor }),
+        'invalid_cursor',
+      );
+    }
+  });
+
+  it.each(BOUNDS)('fails no_criteria with %s and no search field', async (bound) => {
+    const error = expectDeclaredError(
+      searchLicenses,
+      await run({ [bound]: '2027-06-30', status: 'any' }),
+      'no_criteria',
+    );
+    expect(error.code).toBe(JsonRpcErrorCode.ValidationError);
+  });
+
+  it.each([
+    ['expires', { expires_after: '2027-07-01', expires_before: '2027-06-30' }],
+    ['granted', { granted_after: '2017-07-01', granted_before: '2017-06-30' }],
+  ])('fails invalid_date_range when %s_after is later than %s_before', async (prefix, range) => {
+    const result = await run({ ...FRN, ...range });
+    const error = expectDeclaredError(searchLicenses, result, 'invalid_date_range');
+    expect(error.code).toBe(JsonRpcErrorCode.ValidationError);
+    const [after, before] = Object.values(range);
+    expect(error.message).toBe(
+      `${prefix}_after (${after}) is later than ${prefix}_before (${before}); no record can match.`,
+    );
+    // Equal bounds match that one day.
+    expect(page(await run({ ...FRN, ...range, [`${prefix}_after`]: before })).totalCount).toBe(1);
+  });
+
+  it('says how the bounds narrowed a search that finds nothing', async () => {
+    const result = await run({
+      ...FRN,
+      expires_after: '2030-01-01',
+      granted_after: '2017-01-01',
+      granted_before: '2017-12-31',
+    });
+    const structured = page(result);
+    expect(structured.totalCount).toBe(0);
+    const fragment =
+      'Only records expiring on or after 2030-01-01 and granted 2017-01-01 through 2017-12-31 were searched; a record that files no such date never matches, so widen or drop the date bounds.';
+    expect(structured.notice).toBe(
+      `Only active records were searched; pass status "any" to include expired, cancelled, and terminated licenses. ${fragment} No record matching these filters carries FRN 0009200000; some licensees file no FRN, so also search by licensee name.`,
+    );
+    expect(contractText(result)).toContain(fragment);
+  });
+
+  it.each([
+    [
+      'a date bound',
+      { callsign: 'KZZ921', expires_before: '2027-06-28' },
+      'Only records expiring on or before 2027-06-28 were searched; a record that files no such date never matches, so widen or drop the date bounds. ',
+    ],
+    ['the default status', { callsign: 'KZZ925' }, ''],
+  ])(
+    'keeps the zero-hit callsign fragment true when %s excludes an indexed callsign',
+    async (_label, input, dateFragment) => {
+      // The callsign is indexed: with no status or date bound the same search finds it.
+      expect(page(await run({ callsign: input.callsign, status: 'any' })).totalCount).toBe(1);
+      const result = await run(input);
+      const structured = page(result);
+      expect(structured.totalCount).toBe(0);
+      const fragment = `No record matching these filters carries callsign ${input.callsign} in the indexed service groups; call fcc_spectrum_get_license with this callsign, which reads every status and takes no other filter, or fcc_spectrum_list_reference with topic "coverage" to confirm the service group is loaded.`;
+      expect(structured.notice).toBe(`${ACTIVE_ONLY} ${dateFragment}${fragment}`);
+      expect(contractText(result)).toContain(fragment);
+    },
+  );
+
+  it.each(BOUNDS)('reads a blank %s as unset', async (bound) => {
+    const result = page(await run({ ...FRN, [bound]: '  ' }));
+    expect(result.appliedFilters).toEqual({ frn: '0009200000', status: 'A' });
+    expect(result.totalCount).toBe(7);
+  });
+
+  it.each(
+    BOUNDS.flatMap((bound) =>
+      ['2027-02-30', '2027-6-30', '06/30/2027', '2027-06-30T00:00:00Z'].map(
+        (value) => [bound, value] as const,
+      ),
+    ),
+  )('rejects %s %j with InvalidParams', async (bound, value) => {
+    const error = errorOf(await run({ ...FRN, [bound]: value }));
+    expect(error.code).toBe(JsonRpcErrorCode.InvalidParams);
+    expect(error.data?.reason).toBe('invalid_arguments');
+    expect(error.data?.issues).toEqual([expect.objectContaining({ path: [bound] })]);
+  });
+
+  it('accepts a leap day and advertises each bound as a calendar date', () => {
+    for (const bound of BOUNDS) {
+      expect(searchLicenses.input.safeParse({ ...FRN, [bound]: '2028-02-29' }).success).toBe(true);
+    }
+    const advertised = z.toJSONSchema(searchLicenses.input, { io: 'input' }) as {
+      properties: Record<string, { format?: string; pattern?: string; type?: string }>;
+    };
+    for (const bound of BOUNDS) {
+      expect(advertised.properties[bound]).toMatchObject({
+        type: 'string',
+        format: 'date',
+        pattern: expect.any(String),
+      });
+    }
+  });
 });

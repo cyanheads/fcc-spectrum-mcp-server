@@ -213,6 +213,17 @@ describe('toMhz / resolveBand', () => {
     expect(toMhz(462.5625, 'MHz')).toBe(462.5625);
   });
 
+  it('reads a kHz or GHz spelling as the same number as its MHz spelling', () => {
+    expect(toMhz(0.8510125, 'GHz')).toBe(851.0125);
+    expect(toMhz(0.15182, 'GHz')).toBe(151.82);
+    expect(toMhz(151_820.3, 'kHz')).toBe(151.8203);
+    expect(resolveBand(0.8510125, undefined, 'GHz')).toEqual({
+      ok: true,
+      lowMhz: 851.0125,
+      highMhz: 851.0125,
+    });
+  });
+
   it('returns undefined when neither edge is given', () => {
     expect(resolveBand(undefined, undefined, 'MHz')).toBeUndefined();
   });

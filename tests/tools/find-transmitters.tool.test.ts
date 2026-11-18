@@ -12,9 +12,14 @@
 
 import { writeFile } from 'node:fs/promises';
 import { join } from 'node:path';
+import { z } from '@cyanheads/mcp-ts-core';
 import { JsonRpcErrorCode } from '@cyanheads/mcp-ts-core/errors';
-import { runToolContract } from '@cyanheads/mcp-ts-core/testing';
-import { afterAll, beforeAll, beforeEach, describe, expect, it } from 'vitest';
+import {
+  createMockContext,
+  type MockContextLogger,
+  runToolContract,
+} from '@cyanheads/mcp-ts-core/testing';
+import { afterAll, beforeAll, beforeEach, describe, expect, it, type Mock, vi } from 'vitest';
 import { findTransmitters } from '@/mcp-server/tools/definitions/find-transmitters.tool.js';
 import { POINTER_FILE, writePointer } from '@/services/uls/schema.js';
 import {
@@ -33,13 +38,46 @@ import {
   successOf,
   useIndex,
 } from '../fixtures/tool-harness.js';
-import { AREA_SITES_WEEKLY, DATA_QUALITY_WEEKLY, QUIRKS_WEEKLY } from '../fixtures/uls-fixtures.js';
+import {
+  AREA_SITES_WEEKLY,
+  DATA_QUALITY_WEEKLY,
+  QUIRKS_WEEKLY,
+  sprawlingPagingWeekly,
+} from '../fixtures/uls-fixtures.js';
 import {
   buildFixtureIndex,
   type FixtureIndex,
   makeTempMirror,
   type TempMirror,
 } from '../fixtures/uls-index.js';
+
+/**
+ * The `add` of every counter a definition creates, by counter name (one per module load, since
+ * some cases load the definition afresh); each still records on the real counter.
+ */
+const counterAdds = vi.hoisted(() => new Map<string, Mock[]>());
+
+vi.mock('@cyanheads/mcp-ts-core/utils', async (importOriginal) => {
+  const actual = await importOriginal<typeof import('@cyanheads/mcp-ts-core/utils')>();
+  return {
+    ...actual,
+    createCounter: (...args: Parameters<typeof actual.createCounter>) => {
+      const counter = actual.createCounter(...args);
+      const add = vi.fn(counter.add);
+      counterAdds.set(args[0], [...(counterAdds.get(args[0]) ?? []), add]);
+      return { add };
+    },
+  };
+});
+
+const WIDE_RADIUS_COUNTER = 'fcc_spectrum.find_transmitters.wide_radius';
+
+/** Total added to the wide-radius counter so far, across every load of the definition. */
+const wideRadiusCount = () =>
+  (counterAdds.get(WIDE_RADIUS_COUNTER) ?? [])
+    .flatMap((add) => add.mock.calls)
+    .reduce((sum, [value]) => sum + Number(value), 0);
+const WIDE_RADIUS_LOG = 'Transmitter search wider than 100 km';
 
 type Output = Parameters<NonNullable<typeof findTransmitters.format>>[0];
 type Site = Output['sites'][number];
@@ -67,6 +105,46 @@ const run = (input: Record<string, unknown>) => runToolContract(findTransmitters
 const page = (result: ContractResult) => successOf<Page>(result);
 const siteIds = (sites: readonly Site[]) =>
   sites.map((site) => `${site.usi}:${site.locationNumber}`);
+
+interface AdvertisedField {
+  description?: string;
+  maximum?: number;
+  minimum?: number;
+  type?: string;
+}
+
+/** The input schema `tools/list` advertises for a find_transmitters definition. */
+const advertisedInput = (definition: { input: z.ZodType } = findTransmitters) =>
+  z.toJSONSchema(definition.input, { io: 'input' }) as {
+    properties: Record<string, AdvertisedField | undefined>;
+  };
+
+/**
+ * Run `definition`'s handler directly under a mock context, returning the log lines it wrote
+ * and how many times it added to the wide-radius counter.
+ */
+async function handlerTrace(definition: typeof findTransmitters, input: Record<string, unknown>) {
+  const ctx = createMockContext({ errors: definition.errors });
+  const before = wideRadiusCount();
+  await definition.handler(definition.input.parse(input), ctx);
+  return { logs: (ctx.log as MockContextLogger).calls, counted: wideRadiusCount() - before };
+}
+
+/**
+ * find_transmitters and the tool harness from a fresh module graph loaded with
+ * FCC_SPECTRUM_WIDE_RADIUS set to `value`: the definition reads the switch when it loads, and
+ * the harness points that graph's own service accessor at an index.
+ */
+async function loadWithWideRadius(value: string) {
+  vi.resetModules();
+  vi.stubEnv('FCC_SPECTRUM_WIDE_RADIUS', value);
+  const [{ findTransmitters: definition }, harness] = await Promise.all([
+    import('@/mcp-server/tools/definitions/find-transmitters.tool.js'),
+    import('../fixtures/tool-harness.js'),
+  ]);
+  vi.unstubAllEnvs();
+  return { definition, harness };
+}
 
 describe('filed location classes', () => {
   let fixture: FixtureIndex;
@@ -296,7 +374,7 @@ describe('warm index', () => {
       ['a blank latitude', { ...SEATTLE, latitude: '' }],
       ['a missing longitude', { latitude: SEATTLE.latitude }],
       ['radius_km 0.05', { ...SEATTLE, radius_km: 0.05 }],
-      ['radius_km 100.5', { ...SEATTLE, radius_km: 100.5 }],
+      ['radius_km 230.5', { ...SEATTLE, radius_km: 230.5 }],
       ['limit 0', { ...SEATTLE, limit: 0 }],
       ['a fractional limit', { ...SEATTLE, limit: 2.5 }],
       ['max_frequencies_per_site 0', { ...SEATTLE, max_frequencies_per_site: 0 }],
@@ -337,6 +415,26 @@ describe('warm index', () => {
       const result = page(await run({ latitude, longitude, radius_km: 1 }));
       expect(result.searchCenter).toEqual({ ...SEATTLE, radiusKm: 1 });
       expect(siteIds(result.sites)).toEqual(['1001:1', '1008:1']);
+    });
+
+    it('advertises coordinates as decimal-degree numbers only, though it still reads strings', () => {
+      const { properties } = advertisedInput();
+      expect(properties.latitude).toMatchObject({ type: 'number', minimum: -90, maximum: 90 });
+      expect(properties.longitude).toMatchObject({ type: 'number', minimum: -180, maximum: 180 });
+      const searchCenter = findTransmitters.enrichment?.searchCenter?.description;
+      for (const text of [
+        findTransmitters.description,
+        properties.latitude?.description,
+        properties.longitude?.description,
+        searchCenter,
+      ]) {
+        expect(text).toBeDefined();
+        expect(text).not.toMatch(/DMS|string|°|"-?\d/i);
+      }
+      for (const text of [properties.latitude?.description, properties.longitude?.description]) {
+        expect(text).toContain('decimal degrees');
+      }
+      expect(findTransmitters.description).toContain('Coordinates are decimal degrees.');
     });
 
     it('reads blank optional inputs as unset', async () => {
@@ -522,7 +620,7 @@ describe('warm index', () => {
       const result = page(await run(PORTLAND));
       expect(result).toMatchObject({ totalCount: 0, shown: 0, sites: [] });
       expect(result.notice).toBe(
-        `No FCC-licensed site within 5 km matches these filters; raise radius_km (max 100) or pass status "any". ${MARKET_HINT}`,
+        `No FCC-licensed site within 5 km matches these filters; raise radius_km (max 230) or pass status "any". ${MARKET_HINT}`,
       );
     });
 
@@ -535,9 +633,16 @@ describe('warm index', () => {
     });
 
     it('offers no options when the radius is at its maximum and status is "any"', async () => {
+      const result = page(await run({ latitude: 0, longitude: 0, radius_km: 230, status: 'any' }));
+      expect(result.notice).toBe(
+        `No FCC-licensed site within 230 km matches these filters. ${MARKET_HINT}`,
+      );
+    });
+
+    it('still offers a wider radius at 100 km', async () => {
       const result = page(await run({ latitude: 0, longitude: 0, radius_km: 100, status: 'any' }));
       expect(result.notice).toBe(
-        `No FCC-licensed site within 100 km matches these filters. ${MARKET_HINT}`,
+        `No FCC-licensed site within 100 km matches these filters; raise radius_km (max 230). ${MARKET_HINT}`,
       );
     });
 
@@ -546,14 +651,14 @@ describe('warm index', () => {
         await run({ ...SEATTLE, frequency_low: 500, frequency_high: 510, radio_service: 'CD' }),
       );
       expect(result.notice).toBe(
-        `No FCC-licensed site within 5 km is authorized on 500–510 MHz under these filters; raise radius_km (max 100), widen the band (lower frequency_low or raise frequency_high), drop radio_service, pass status "any", or call fcc_spectrum_search_frequencies to search by state. ${MARKET_HINT}`,
+        `No FCC-licensed site within 5 km is authorized on 500–510 MHz under these filters; raise radius_km (max 230), widen the band (lower frequency_low or raise frequency_high), drop radio_service, pass status "any", or call fcc_spectrum_search_frequencies to search by state. ${MARKET_HINT}`,
       );
     });
 
     it('suggests frequency_high for a single-frequency search with nothing on it', async () => {
       const result = page(await run({ ...SEATTLE, frequency_low: 500, status: 'any' }));
       expect(result.notice).toBe(
-        `No FCC-licensed site within 5 km is authorized on 500 MHz under these filters; raise radius_km (max 100), widen the band with frequency_high, or call fcc_spectrum_search_frequencies to search by state. ${MARKET_HINT}`,
+        `No FCC-licensed site within 5 km is authorized on 500 MHz under these filters; raise radius_km (max 230), widen the band with frequency_high, or call fcc_spectrum_search_frequencies to search by state. ${MARKET_HINT}`,
       );
     });
   });
@@ -876,16 +981,210 @@ describe('operating areas', () => {
     expect(structured).toMatchObject({ totalCount: 0, sites: [] });
     expect(structured.appliedFilters).toMatchObject({ location_type: '6' });
     expect(structured.notice).toBe(
-      `No FCC-licensed site within 5 km matches these filters; raise radius_km (max 100), drop location_type, or pass status "any". ${MARKET_HINT}`,
+      `No FCC-licensed site within 5 km matches these filters; raise radius_km (max 230), drop location_type, or pass status "any". ${MARKET_HINT}`,
     );
     expect(contractText(result)).toContain(`> ${structured.notice}`);
 
     const widest = page(
-      await run({ ...CENTER, location_type: '6', radius_km: 100, status: 'any' }),
+      await run({ ...CENTER, location_type: '6', radius_km: 230, status: 'any' }),
     );
     expect(widest.notice).toBe(
-      `No FCC-licensed site within 100 km matches these filters; drop location_type. ${MARKET_HINT}`,
+      `No FCC-licensed site within 230 km matches these filters; drop location_type. ${MARKET_HINT}`,
     );
+  });
+});
+
+describe('the 230 km radius', () => {
+  /**
+   * KZZ701 (USI 7001) files locations 1–120. Location n sits (n mod 60) minutes north and west
+   * of this center, about 2.24 km a minute: 60 and 120 sit on it, n and n + 60 share a spot,
+   * and 59 and 119 lie farthest, near 132 km. Location 1 files a second site one second further
+   * out. Each location files one frequency, 150 MHz + n × 12.5 kHz.
+   */
+  const CENTER = { latitude: 47, longitude: -122 };
+
+  let sprawl: FixtureIndex;
+  beforeAll(async () => {
+    sprawl = await buildFixtureIndex({
+      groups: ['paging'],
+      weekly: {
+        paging: sprawlingPagingWeekly({
+          antennasPerLocation: 1,
+          leases: 0,
+          locations: 120,
+          sitesAtFirst: 2,
+        }),
+      },
+    });
+  });
+  beforeEach(async () => {
+    await useIndex(sprawl.mirrorDir, { services: ['paging'] });
+  });
+  afterAll(async () => {
+    await releaseIndex();
+    await sprawl.dispose();
+  });
+
+  /** Every page of one search, following nextCursor, with each page's rendered text. */
+  async function allPages(input: Record<string, unknown>) {
+    const pages: { data: Page; text: string }[] = [];
+    let cursor: string | undefined;
+    do {
+      const result = await run({ ...input, ...(cursor && { cursor }) });
+      pages.push({ data: page(result), text: contractText(result) });
+      cursor = pages.at(-1)?.data.nextCursor;
+    } while (cursor && pages.length < 20);
+    return pages;
+  }
+
+  it('advertises a 230 km ceiling', () => {
+    expect(advertisedInput().properties.radius_km).toMatchObject({
+      type: 'number',
+      minimum: 0.1,
+      maximum: 230,
+      description: 'Search radius in km (0.1–230).',
+    });
+  });
+
+  it('returns sites beyond 100 km, nearest first, across every page at 230 km', async () => {
+    const pages = await allPages({ ...CENTER, radius_km: 230 });
+    expect(pages.map(({ data }) => [data.shown, data.totalCount, data.truncated])).toEqual([
+      [25, 121, true],
+      [25, 121, true],
+      [25, 121, true],
+      [25, 121, true],
+      [21, 121, false],
+    ]);
+    const [first, second] = pages;
+    expect(first?.data.notice).toBe(
+      'Showing 25 of 121 sites; pass nextCursor as cursor with the same inputs for the next page.',
+    );
+    expect(first?.text).toContain(`**nextCursor:** ${first?.data.nextCursor}`);
+    expect(second?.data.searchCenter).toEqual({ ...CENTER, radiusKm: 230 });
+    const last = pages.at(-1);
+    expect(last?.data.nextCursor).toBeUndefined();
+    expect(last?.data.notice).toBeUndefined();
+
+    const sites = pages.flatMap(({ data }) => data.sites);
+    expect(siteIds(sites.slice(0, 5))).toEqual([
+      '7001:60',
+      '7001:120',
+      '7001:1',
+      '7001:61',
+      '7001:1',
+    ]);
+    expect(siteIds(sites.slice(-2))).toEqual(['7001:59', '7001:119']);
+    const distances = sites.map((site) => site.distanceKm);
+    expect(distances).toEqual(distances.toSorted((a, b) => a - b));
+    expect(distances.filter((distance) => distance > 100)).toHaveLength(30);
+    expect(distances.at(-1)).toBeCloseTo(131.96, 1);
+    expect(new Set(sites.map((site) => `${site.locationNumber}@${site.latitude}`)).size).toBe(121);
+    for (const { data, text } of pages) expectCarries(text, data.sites);
+  });
+
+  it.each([
+    [113, 103],
+    [100, 91],
+  ])('keeps only the sites within %i km', async (radius_km, total) => {
+    const result = page(await run({ ...CENTER, radius_km, limit: 100 }));
+    expect(result.totalCount).toBe(total);
+    expect(result.searchCenter.radiusKm).toBe(radius_km);
+    expect(Math.max(...result.sites.map((site) => site.distanceKm))).toBeLessThanOrEqual(radius_km);
+  });
+
+  it('finds a band filed only beyond 100 km, and offers the wider radius at 100 km', async () => {
+    const band = { frequency_low: 150.5625, frequency_high: 150.7375 };
+    const wide = page(await run({ ...CENTER, ...band, radius_km: 230, limit: 10 }));
+    expect(wide).toMatchObject({ totalCount: 15, shown: 10, truncated: true });
+    const rest = page(
+      await run({ ...CENTER, ...band, radius_km: 230, limit: 10, cursor: wide.nextCursor }),
+    );
+    expect(rest).toMatchObject({ totalCount: 15, shown: 5, truncated: false });
+    const sites = [...wide.sites, ...rest.sites];
+    expect(sites.map((site) => site.locationNumber)).toEqual(
+      Array.from({ length: 15 }, (_, i) => 45 + i),
+    );
+    expect(sites.every((site) => site.distanceKm > 100)).toBe(true);
+    expect(sites.map((site) => site.frequencies.map((f) => f.frequencyMhz))).toEqual(
+      sites.map((site) => [Number((150 + site.locationNumber * 0.0125).toFixed(5))]),
+    );
+
+    const near = page(await run({ ...CENTER, ...band, radius_km: 100 }));
+    expect(near).toMatchObject({ totalCount: 0, sites: [] });
+    expect(near.notice).toBe(
+      `No FCC-licensed site within 100 km is authorized on 150.5625–150.7375 MHz under these filters; raise radius_km (max 230), widen the band (lower frequency_low or raise frequency_high), pass status "any", or call fcc_spectrum_search_frequencies to search by state. ${MARKET_HINT}`,
+    );
+  });
+
+  it('logs one line and counts one call for each search wider than 100 km, neither at 100 km', async () => {
+    const wideLines = (logs: MockContextLogger['calls']) =>
+      logs.filter((line) => line.msg === WIDE_RADIUS_LOG);
+
+    const at100 = await handlerTrace(findTransmitters, { ...CENTER, radius_km: 100 });
+    expect(at100.counted).toBe(0);
+    expect(wideLines(at100.logs)).toEqual([]);
+
+    const justOver = await handlerTrace(findTransmitters, { ...CENTER, radius_km: 100.1 });
+    expect(justOver.counted).toBe(1);
+    expect(wideLines(justOver.logs)).toEqual([
+      { level: 'info', msg: WIDE_RADIUS_LOG, data: { radiusKm: 100.1 } },
+    ]);
+
+    const banded = await handlerTrace(findTransmitters, {
+      ...CENTER,
+      radius_km: 230,
+      frequency_low: 150.5625,
+    });
+    expect(banded.counted).toBe(1);
+    expect(wideLines(banded.logs)).toHaveLength(1);
+  });
+});
+
+describe('with FCC_SPECTRUM_WIDE_RADIUS=false', () => {
+  let fixture: FixtureIndex;
+  let narrow: typeof findTransmitters;
+  let harness: typeof import('../fixtures/tool-harness.js');
+  beforeAll(async () => {
+    fixture = await buildFixtureIndex();
+    ({ definition: narrow, harness } = await loadWithWideRadius('false'));
+    await harness.useIndex(fixture.mirrorDir);
+  });
+  afterAll(async () => {
+    await harness.releaseIndex();
+    await fixture.dispose();
+  });
+
+  const runNarrow = (input: Record<string, unknown>) => runToolContract(narrow, input as never);
+
+  it('advertises and enforces the 100 km ceiling', async () => {
+    expect(advertisedInput(narrow).properties.radius_km).toMatchObject({
+      type: 'number',
+      minimum: 0.1,
+      maximum: 100,
+      description: 'Search radius in km (0.1–100).',
+    });
+    for (const radius_km of [100.5, 113, 230]) {
+      const error = errorOf(await runNarrow({ ...SEATTLE, radius_km }));
+      expect(error.code, `${radius_km}`).toBe(JsonRpcErrorCode.InvalidParams);
+      expect(error.data?.reason).toBe('invalid_arguments');
+    }
+    const widest = page(await runNarrow({ ...SEATTLE, radius_km: 100 }));
+    expect(siteIds(widest.sites)).toEqual(['1001:1', '1008:1', '1001:2']);
+  });
+
+  it('offers raise radius_km (max 100) while under it, and nothing at 100 km', async () => {
+    expect(page(await runNarrow(PORTLAND)).notice).toBe(
+      `No FCC-licensed site within 5 km matches these filters; raise radius_km (max 100) or pass status "any". ${MARKET_HINT}`,
+    );
+    expect(
+      page(await runNarrow({ latitude: 0, longitude: 0, radius_km: 100, status: 'any' })).notice,
+    ).toBe(`No FCC-licensed site within 100 km matches these filters. ${MARKET_HINT}`);
+  });
+
+  it('writes no wide-radius log line or count at its ceiling', async () => {
+    const trace = await handlerTrace(narrow, { ...SEATTLE, radius_km: 100 });
+    expect(trace.counted).toBe(0);
+    expect(trace.logs.filter((line) => line.msg === WIDE_RADIUS_LOG)).toEqual([]);
   });
 });
 
@@ -996,5 +1295,80 @@ describe('format()', () => {
   it('says so when no site matched', () => {
     const rendered = formattedText(findTransmitters.format?.({ sites: [] }));
     expect(rendered).toBe('## FCC-licensed sites (0 on this page)\n\nNo sites matched.');
+  });
+});
+
+describe('cursors and search inputs', () => {
+  let fixture: FixtureIndex;
+  beforeAll(async () => {
+    fixture = await buildFixtureIndex();
+  });
+  beforeEach(async () => {
+    await useIndex(fixture.mirrorDir);
+  });
+  afterAll(async () => {
+    await releaseIndex();
+    await fixture.dispose();
+  });
+
+  /** The page the first page of `input` continues to under `next`. */
+  const continued = async (
+    input: Record<string, unknown>,
+    next: Record<string, unknown>,
+  ): Promise<Page> => {
+    const first = page(await run(input));
+    expect(first.nextCursor).toEqual(expect.any(String));
+    return page(await run({ ...next, cursor: first.nextCursor }));
+  };
+
+  // Within 50 km of SEATTLE: 1001:1, 1008:1, 1001:2; within the default 5 km, the first two.
+  const WIDE = { ...SEATTLE, radius_km: 50, limit: 1 };
+  const BAND = { ...WIDE, frequency_low: 100, frequency_high: 1000 };
+
+  it.each<[string, Record<string, unknown>, Record<string, unknown>]>([
+    [
+      'DMS strings for the decimal center',
+      WIDE,
+      { latitude: '47-36-22.3 N', longitude: '122-19-55.6 W', radius_km: 50, limit: 1 },
+    ],
+    ['the default radius passed', { ...SEATTLE, limit: 1 }, { ...SEATTLE, radius_km: 5, limit: 1 }],
+    ['the default status and unit passed', WIDE, { ...WIDE, status: 'active', unit: 'mhz' }],
+    [
+      'the band in kHz',
+      BAND,
+      { ...BAND, frequency_low: 100000, frequency_high: 1000000, unit: 'kHz' },
+    ],
+    ['the band in GHz', BAND, { ...BAND, frequency_low: 0.1, frequency_high: 1, unit: 'GHz' }],
+    ['another limit and per-site budget', WIDE, { ...WIDE, limit: 2, max_frequencies_per_site: 1 }],
+  ])('continues a search given %s', async (_label, input, equivalent) => {
+    const expected = await continued(input, input);
+    const actual = await continued(input, equivalent);
+    expect(actual.sites.length).toBeGreaterThan(0);
+    expect(siteIds(actual.sites).slice(0, expected.sites.length)).toEqual(siteIds(expected.sites));
+    expect(actual.totalCount).toBe(expected.totalCount);
+  });
+
+  it.each<[string, Record<string, unknown>]>([
+    ['another radius', { ...WIDE, radius_km: 49 }],
+    ['another center', { ...WIDE, latitude: SEATTLE.latitude + 0.001 }],
+    ['a band', { ...WIDE, frequency_low: 152.24 }],
+  ])('fails invalid_cursor on both surfaces for a cursor carried to %s', async (_label, other) => {
+    const first = page(await run(WIDE));
+    expectDeclaredError(
+      findTransmitters,
+      await run({ ...other, cursor: first.nextCursor }),
+      'invalid_cursor',
+    );
+  });
+
+  it('names the input mismatch in the invalid_cursor contract and keeps its recovery', () => {
+    expect(findTransmitters.errors?.find((entry) => entry.reason === 'invalid_cursor')).toEqual({
+      reason: 'invalid_cursor',
+      code: JsonRpcErrorCode.ValidationError,
+      when: 'The cursor does not decode, belongs to an earlier index generation, or was minted for a search with another center, radius, or filter.',
+      severity: 'notice',
+      recovery:
+        'Call fcc_spectrum_find_transmitters again with the same inputs and no cursor to start from the first page.',
+    });
   });
 });

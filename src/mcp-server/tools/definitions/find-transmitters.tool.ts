@@ -6,6 +6,8 @@
 
 import { tool, z } from '@cyanheads/mcp-ts-core';
 import { JsonRpcErrorCode } from '@cyanheads/mcp-ts-core/errors';
+import { createCounter } from '@cyanheads/mcp-ts-core/utils';
+import { getServerConfig } from '@/config/server-config.js';
 import {
   bandText,
   callsignText,
@@ -31,6 +33,24 @@ import {
 } from '@/mcp-server/tools/input-schemas.js';
 import { resolveBand } from '@/services/uls/normalize.js';
 import { getUlsIndexService, radioServiceLabel } from '@/services/uls/uls-index-service.js';
+
+/** The radius_km ceiling before the wider one, and still the ceiling with the switch off. */
+const NARROW_RADIUS_KM = 100;
+
+/**
+ * The radius_km ceiling the schema advertises and enforces: 230 km, which holds the 113, 169,
+ * and 229 km co-channel distances of 47 CFR 90.621(b), or 100 km under
+ * FCC_SPECTRUM_WIDE_RADIUS=false. Read when this module loads, since the schema is built then;
+ * `src/index.ts` loads `.env` before any definition.
+ */
+const RADIUS_CEILING_KM = getServerConfig().wideRadius ? 230 : NARROW_RADIUS_KM;
+
+/** Calls that use the radius past 100 km, the input FCC_SPECTRUM_WIDE_RADIUS=false refuses. */
+const wideRadiusSearches = createCounter(
+  'fcc_spectrum.find_transmitters.wide_radius',
+  'fcc_spectrum_find_transmitters calls with radius_km above 100 km',
+  '{calls}',
+);
 
 const SiteFrequencySchema = z
   .object({
@@ -159,16 +179,21 @@ const SiteSchema = z
 export const findTransmitters = tool('fcc_spectrum_find_transmitters', {
   title: 'Find FCC-licensed sites near a point',
   description:
-    'Find FCC-licensed sites within a radius of a coordinate, nearest first, each with its callsign, licensee, distance, coordinates, filed location type and class, ground elevation, structure height, and authorized frequencies. Filter by frequency or band, radio service, location type, location class, and live status (active by default). Unset location_class keeps all filed roles, including receive and passive locations; filed classes describe authorization, not actual on-air activity. Coordinates are decimal degrees or DMS strings. Mobile and temporary-fixed operating areas are returned at their center with radiusKm and match when the center lies within radius_km. Locations without valid coordinates are omitted; market-area licenses without site records are found with fcc_spectrum_search_frequencies.',
+    'Find FCC-licensed sites within a radius of a coordinate, nearest first, each with its callsign, licensee, distance, coordinates, filed location type and class, ground elevation, structure height, and authorized frequencies. Filter by frequency or band, radio service, location type, location class, and live status (active by default). Unset location_class keeps all filed roles, including receive and passive locations; filed classes describe authorization, not actual on-air activity. Coordinates are decimal degrees. Mobile and temporary-fixed operating areas are returned at their center with radiusKm and match when the center lies within radius_km. Locations without valid coordinates are omitted; market-area licenses without site records are found with fcc_spectrum_search_frequencies.',
   annotations: { readOnlyHint: true, idempotentHint: true, openWorldHint: false },
   input: z.object({
     latitude: latitudeSchema.describe(
-      'Search center latitude: decimal degrees (47.6205, "47.6205") or a DMS string with hemisphere ("47-37-13.8 N", "47°37\'13.8"N").',
+      'Search center latitude in decimal degrees, south negative, e.g. 47.6205.',
     ),
     longitude: longitudeSchema.describe(
-      'Search center longitude: decimal degrees (-122.3493) or a DMS string with hemisphere ("122-20-57.5 W").',
+      'Search center longitude in decimal degrees, west negative, e.g. -122.3493.',
     ),
-    radius_km: z.number().min(0.1).max(100).default(5).describe('Search radius in km (0.1–100).'),
+    radius_km: z
+      .number()
+      .min(0.1)
+      .max(RADIUS_CEILING_KM)
+      .default(5)
+      .describe(`Search radius in km (0.1–${RADIUS_CEILING_KM}).`),
     frequency_low: blankAsUnset(frequencySchema.optional()).describe(
       "Only sites authorized on this frequency, in unit; with frequency_high, the band's lower edge. Matches any assignment whose occupied band overlaps.",
     ),
@@ -233,7 +258,7 @@ export const findTransmitters = tool('fcc_spectrum_find_transmitters', {
         longitude: z.number().describe('Center longitude, decimal degrees.'),
         radiusKm: z.number().describe('Search radius, km.'),
       })
-      .describe('The search circle as the server applied it (DMS input converted).'),
+      .describe('The search circle as the server applied it.'),
     appliedFilters: z
       .object({
         frequency_low_mhz: z.number().optional().describe('Band lower edge, converted to MHz.'),
@@ -290,7 +315,7 @@ export const findTransmitters = tool('fcc_spectrum_find_transmitters', {
     {
       reason: 'invalid_cursor',
       code: JsonRpcErrorCode.ValidationError,
-      when: 'The cursor does not decode or belongs to an earlier index generation.',
+      when: 'The cursor does not decode, belongs to an earlier index generation, or was minted for a search with another center, radius, or filter.',
       severity: 'notice',
       recovery:
         'Call fcc_spectrum_find_transmitters again with the same inputs and no cursor to start from the first page.',
@@ -298,6 +323,10 @@ export const findTransmitters = tool('fcc_spectrum_find_transmitters', {
   ],
 
   async handler(input, ctx) {
+    if (input.radius_km > NARROW_RADIUS_KM) {
+      wideRadiusSearches.add(1);
+      ctx.log.info('Transmitter search wider than 100 km', { radiusKm: input.radius_km });
+    }
     const limit = Math.min(input.limit, 100);
     const maxFrequenciesPerSite = Math.min(input.max_frequencies_per_site, 50);
     const index = getUlsIndexService();
@@ -384,7 +413,7 @@ export const findTransmitters = tool('fcc_spectrum_find_transmitters', {
       );
     if (page.total === 0) {
       const widen = orList([
-        input.radius_km < 100 && 'raise radius_km (max 100)',
+        input.radius_km < RADIUS_CEILING_KM && `raise radius_km (max ${RADIUS_CEILING_KM})`,
         band &&
           (input.frequency_high === undefined
             ? 'widen the band with frequency_high'

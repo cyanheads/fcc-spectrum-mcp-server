@@ -1,6 +1,7 @@
 /**
  * @fileoverview Server-specific configuration: mirror location, indexed service
- * groups, individual-licensee redaction, and the ULS bulk host.
+ * groups, individual-licensee redaction, the ULS bulk host, and the find_transmitters
+ * radius ceiling.
  * @module config/server-config
  */
 
@@ -58,6 +59,10 @@ const ServerConfigSchema = z.object({
     .default('https://data.fcc.gov/download/pub/uls')
     .transform((url) => url.replace(/\/+$/, ''))
     .describe('ULS bulk host root'),
+  wideRadius: z
+    .stringbool()
+    .default(true)
+    .describe('Accept find_transmitters radius_km up to 230 km; false restores the 100 km ceiling'),
 });
 
 /** Parsed server configuration. */
@@ -72,6 +77,7 @@ export function getServerConfig(): ServerConfig {
     services: 'FCC_SPECTRUM_SERVICES',
     redactIndividuals: 'FCC_SPECTRUM_REDACT_INDIVIDUALS',
     baseUrl: 'FCC_SPECTRUM_BASE_URL',
+    wideRadius: 'FCC_SPECTRUM_WIDE_RADIUS',
   });
   return _config;
 }

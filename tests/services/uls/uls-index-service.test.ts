@@ -53,10 +53,13 @@ import {
   fr,
   hd,
   INDIVIDUAL_SITES_WEEKLY,
+  LEASE_PARTIES_WEEKLY,
+  LICENSE_DATES_WEEKLY,
   lo,
   MARKET_CODES_WEEKLY,
   MARKET_STATES_WEEKLY,
   MICRO_WEEKLY,
+  MIXED_SITES_WEEKLY,
   PAGING_WEEKLY,
   pa,
   QUIRKS_WEEKLY,
@@ -1308,11 +1311,20 @@ describe('getLicense from a location number', () => {
   });
 });
 
+/** Lease-link name fields, added after the windows below were pinned and left out of their digests. */
+const LEASE_NAME_FIELDS = new Set([
+  'lesseeName',
+  'lesseeRedacted',
+  'licenseeName',
+  'licenseeRedacted',
+]);
+
 /**
  * Every location window of a record, from offset 0 along `nextLocationOffset`: one
  * `[locationOffset, first number, last number, locations, sitesShown, nextLocationOffset]` row per
  * window, and a digest of each window's whole result without the two path counts, which must be 0
- * on a record that files no paths. The record must carry no `paths` anywhere.
+ * on a record that files no paths, and without the lease-link names. The record must carry no
+ * `paths` anywhere.
  */
 async function licenseWindows(service: UlsIndexService, usi: string, maxFrequencies: number) {
   const rows: (number | undefined)[][] = [];
@@ -1327,7 +1339,9 @@ async function licenseWindows(service: UlsIndexService, usi: string, maxFrequenc
     };
     expect(pathTotal ?? 0).toBe(0);
     expect(pathsShown ?? 0).toBe(0);
-    const json = JSON.stringify(rest);
+    const json = JSON.stringify(rest, (key, value) =>
+      LEASE_NAME_FIELDS.has(key) ? undefined : value,
+    );
     expect(json).not.toContain('"paths"');
     digests.push(createHash('sha256').update(json).digest('hex').slice(0, 16));
     rows.push([
@@ -1998,6 +2012,208 @@ describe('findTransmitters', () => {
     expect(await on.findTransmitters(transmitters({ cursor: foreign }))).toEqual({
       ok: false,
       reason: 'invalid_cursor',
+    });
+  });
+});
+
+describe('findTransmitters candidate drivers', () => {
+  /**
+   * KZZ701 (USI 7001) files locations 1–120, two antennas each. Location n sits (n mod 60)
+   * minutes north and west of this center, about 2.24 km a minute, so n and n + 60 share a spot
+   * and tie on distance, and 59 and 119 lie farthest, near 132 km. Location 1 files a second
+   * site one second further out. Location n files 150 MHz + n × 12.5 kHz and the frequency
+   * 6.25 kHz above it, with no emission, so every row sits in the narrowest band class.
+   */
+  const CENTER = { latitude: 47, longitude: -122 };
+  /** The frequencies of locations 45–59, all beyond 100 km: 30 rows. */
+  const FAR_BAND = band(150.5625, 150.74375);
+  /** Every location's frequencies. */
+  const ALL_BANDS = band(150, 151.5);
+
+  let sprawl: FixtureIndex;
+  let service: UlsIndexService;
+  beforeAll(async () => {
+    sprawl = await buildFixtureIndex({
+      groups: ['paging'],
+      weekly: {
+        paging: sprawlingPagingWeekly({
+          antennasPerLocation: 2,
+          leases: 0,
+          locations: 120,
+          sitesAtFirst: 2,
+        }),
+      },
+    });
+    service = sprawl.service();
+  });
+  afterAll(async () => {
+    await sprawl?.dispose();
+  });
+
+  const around = (overrides: Partial<FindTransmittersParams>) =>
+    transmitters({ ...CENTER, radiusKm: 230, ...overrides });
+
+  it('pages a band search past 100 km nearest first, each site with its in-band frequencies', async () => {
+    const { pages, rows, total } = await allPages((cursor) =>
+      service.findTransmitters(around({ band: FAR_BAND, limit: 4, cursor })),
+    );
+    expect(pages).toBe(4);
+    expect(total).toBe(15);
+    expect(rows.map((row) => row.locationNumber)).toEqual(
+      Array.from({ length: 15 }, (_, i) => 45 + i),
+    );
+    expect(rows.every((row) => row.distanceKm > 100 && row.frequencyCount === 2)).toBe(true);
+
+    const all = page(await service.findTransmitters(around({ band: ALL_BANDS, limit: 200 })));
+    expect(all.total).toBe(121);
+    expect(all.rows.slice(0, 5).map((row) => row.locationNumber)).toEqual([60, 120, 1, 61, 1]);
+    expect(all.rows.slice(-2).map((row) => row.locationNumber)).toEqual([59, 119]);
+    expect(
+      page(await service.findTransmitters(around({ band: ALL_BANDS, radiusKm: 100 }))).total,
+    ).toBe(91);
+  });
+
+  /**
+   * Every page of one search, following each nextCursor, with the candidate driver each call
+   * logged (`band_index` or `bounding_box`).
+   */
+  async function walk(on: UlsIndexService, params: FindTransmittersParams) {
+    const debug = vi.spyOn(logger, 'debug').mockImplementation(() => {});
+    try {
+      const pages: ReturnType<typeof page<TransmitterSite>>[] = [];
+      let cursor: string | undefined;
+      do {
+        pages.push(page(await on.findTransmitters({ ...params, cursor })));
+        cursor = pages.at(-1)?.nextCursor;
+      } while (cursor && pages.length < 500);
+      const drivers = debug.mock.calls.flatMap(([, context]) => {
+        const logged = context as { extra?: { driver?: string }; operation?: string } | undefined;
+        return logged?.operation === 'UlsIndexService.findTransmitters'
+          ? [logged.extra?.driver]
+          : [];
+      });
+      return { pages, drivers };
+    } finally {
+      debug.mockRestore();
+    }
+  }
+
+  /** Never the band index: no cover, an empty one included, fits a negative cap. */
+  const BOX_ONLY = { exactCap: -1 };
+
+  it.each<[string, Partial<FindTransmittersParams>]>([
+    ['a band filed only beyond 100 km', { band: FAR_BAND }],
+    ['every location, distance ties and a shared location number included', { band: ALL_BANDS }],
+    ['one channel at the two sites of one location number', { band: band(150.0125) }],
+    ['every location within 100 km', { band: ALL_BANDS, radiusKm: 100 }],
+    ['a band nothing files on', { band: band(160) }],
+    ['a radio service filter', { band: ALL_BANDS, radioService: 'CD' }],
+    ['a radio service nothing in the band carries', { band: ALL_BANDS, radioService: 'ZQ' }],
+    [
+      'a location type filter and status "any"',
+      { band: FAR_BAND, locationType: 'F', status: 'any' },
+    ],
+  ])(
+    'returns the same sites, order, totals, and cursors from either driver: %s',
+    async (_label, overrides) => {
+      const boxed = sprawl.service({ frequencySearch: BOX_ONLY });
+      for (const limit of [1, 7, 200]) {
+        const params = around({ ...overrides, limit });
+        const indexed = await walk(service, params);
+        const scanned = await walk(boxed, params);
+        expect(indexed.pages, `limit ${limit}`).toEqual(scanned.pages);
+        expect(indexed.drivers).toEqual(indexed.pages.map(() => 'band_index'));
+        expect(scanned.drivers).toEqual(scanned.pages.map(() => 'bounding_box'));
+      }
+    },
+  );
+
+  it('takes the band index while its cover fits exactCap, and the bounding box past it', async () => {
+    // FAR_BAND covers 30 index entries: 15 locations, two frequencies each.
+    const params = around({ band: FAR_BAND, limit: 7 });
+    const fits = await walk(sprawl.service({ frequencySearch: { exactCap: 30 } }), params);
+    const over = await walk(sprawl.service({ frequencySearch: { exactCap: 29 } }), params);
+    expect(fits.drivers).toEqual(['band_index', 'band_index', 'band_index']);
+    expect(over.drivers).toEqual(['bounding_box', 'bounding_box', 'bounding_box']);
+    expect(fits.pages).toEqual(over.pages);
+    expect(fits.pages.map((p) => [p.rows.length, p.total])).toEqual([
+      [7, 15],
+      [7, 15],
+      [1, 15],
+    ]);
+  });
+
+  it('takes the bounding box for a search with no band, whatever the cap', async () => {
+    const unfiltered = await walk(service, around({ limit: 200 }));
+    expect(unfiltered.drivers).toEqual(['bounding_box']);
+    expect(unfiltered.pages[0]?.total).toBe(121);
+  });
+
+  it('agrees across the antimeridian and under status "any" on the full fixture', async () => {
+    const boxed = fixture.service({ frequencySearch: BOX_ONLY });
+    const scenarios: FindTransmittersParams[] = [
+      transmitters({ latitude: 52, longitude: 179.9, radiusKm: 25, band: band(929.5) }),
+      transmitters({ latitude: 52, longitude: -179.9, radiusKm: 230, band: band(100, 1000) }),
+      transmitters({
+        latitude: 46.5,
+        longitude: -122.5,
+        radiusKm: 230,
+        band: band(100, 1000),
+        status: 'any',
+      }),
+    ];
+    for (const params of scenarios) {
+      const indexed = await walk(on, { ...params, limit: 1 });
+      const scanned = await walk(boxed, { ...params, limit: 1 });
+      expect(indexed.pages).toEqual(scanned.pages);
+      expect(indexed.pages[0]?.total).toBeGreaterThan(0);
+      expect(new Set(indexed.drivers)).toEqual(new Set(['band_index']));
+      expect(new Set(scanned.drivers)).toEqual(new Set(['bounding_box']));
+    }
+  });
+
+  describe('on sites the filters tell apart', () => {
+    /** The sites of `MIXED_SITES_WEEKLY` near this center, filed around 152–152.1 MHz. */
+    const MIXED_BAND = band(152, 152.1);
+    let mixed: FixtureIndex;
+    beforeAll(async () => {
+      mixed = await buildFixtureIndex({
+        groups: ['paging'],
+        weekly: { paging: MIXED_SITES_WEEKLY },
+      });
+    });
+    afterAll(async () => {
+      await mixed?.dispose();
+    });
+
+    it.each<[string, Partial<FindTransmittersParams>, string[]]>([
+      [
+        'status "A", leaving out the site filed just below the band and the pending-legal and term-pending sites',
+        { band: MIXED_BAND },
+        ['7401:1', '7401:2'],
+      ],
+      [
+        'status "any", adding the pending-legal and term-pending sites',
+        { band: MIXED_BAND, status: 'any' },
+        ['7401:1', '7401:2', '7402:4', '7403:5'],
+      ],
+      ['a transmit location class', { band: MIXED_BAND, locationClass: 'T' }, ['7401:1']],
+      ['a receive location class', { band: MIXED_BAND, locationClass: 'R' }, ['7401:2']],
+    ])('returns the same sites from either driver for %s', async (_label, overrides, expected) => {
+      const indexed = mixed.service();
+      const boxed = mixed.service({ frequencySearch: BOX_ONLY });
+      for (const limit of [1, 200]) {
+        const params = around({ ...overrides, limit });
+        const fromIndex = await walk(indexed, params);
+        const fromBox = await walk(boxed, params);
+        expect(fromIndex.pages, `limit ${limit}`).toEqual(fromBox.pages);
+        expect(fromIndex.drivers).toEqual(fromIndex.pages.map(() => 'band_index'));
+        expect(fromBox.drivers).toEqual(fromBox.pages.map(() => 'bounding_box'));
+        const sites = fromIndex.pages.flatMap((p) =>
+          p.rows.map((row) => `${row.usi}:${row.locationNumber}`),
+        );
+        expect(sites, `limit ${limit}`).toEqual(expected);
+      }
     });
   });
 });
@@ -2943,6 +3159,103 @@ describe('an individual whose sites file names', () => {
   });
 });
 
+describe('getLicense lease parties', () => {
+  let parties: FixtureIndex;
+  let redacting: UlsIndexService;
+  let open: UlsIndexService;
+  beforeAll(async () => {
+    parties = await buildFixtureIndex({
+      groups: ['paging'],
+      weekly: { paging: LEASE_PARTIES_WEEKLY },
+    });
+    redacting = parties.service({ redactIndividuals: true });
+    open = parties.service({ redactIndividuals: false });
+  });
+  afterAll(async () => {
+    await parties?.dispose();
+  });
+
+  /** The `license` of a found record. */
+  async function detail(service: UlsIndexService, callsign: string) {
+    const result = await service.getLicense({ callsign, maxFrequencies: 100 });
+    if (!result.found) throw new Error(`Expected ${callsign}.`);
+    return result.license;
+  }
+
+  it('lists leases in lease-ID order and links each lease to its parent, a missing parent by its filed callsign', async () => {
+    for (const service of [redacting, open]) {
+      expect((await detail(service, 'KZZ731')).leases).toMatchObject([
+        { callsign: 'L000073002', usi: '7302', licenseStatus: 'A' },
+        { callsign: 'L000073003', usi: '7303', licenseStatus: 'A' },
+      ]);
+      expect((await detail(service, 'L000073005')).leasedFrom).toMatchObject([
+        { callsign: 'KZZ734', usi: '7304' },
+      ]);
+      expect((await detail(service, 'L000073006')).leasedFrom).toEqual([
+        { callsign: 'KZZ799', usi: '7399' },
+      ]);
+    }
+  });
+
+  it.each([
+    ['withholds an individual lessee and parent licensee while redacting', true],
+    ['names an individual lessee and parent licensee with redaction off', false],
+  ])('%s', async (_label, redact) => {
+    const service = redact ? redacting : open;
+    const shown = (filed: string) => (redact ? null : filed);
+    const parent = await detail(service, 'KZZ731');
+    expect(parent.leases).toEqual([
+      {
+        callsign: 'L000073002',
+        usi: '7302',
+        licenseStatus: 'A',
+        lesseeName: 'Dockside Telemetry Inc',
+        lesseeRedacted: false,
+      },
+      {
+        callsign: 'L000073003',
+        usi: '7303',
+        licenseStatus: 'A',
+        lesseeName: shown('Jordan J Lessee'),
+        lesseeRedacted: redact,
+      },
+    ]);
+    const individualParent = await detail(service, 'KZZ734');
+    expect(individualParent.leases).toEqual([
+      {
+        callsign: 'L000073005',
+        usi: '7305',
+        licenseStatus: 'A',
+        lesseeName: 'Upriver Paging Co',
+        lesseeRedacted: false,
+      },
+    ]);
+    const organizationLease = await detail(service, 'L000073002');
+    expect(organizationLease.leasedFrom).toEqual([
+      {
+        callsign: 'KZZ731',
+        usi: '7301',
+        licenseeName: 'Harbor Spectrum Holdings LLC',
+        licenseeRedacted: false,
+      },
+    ]);
+    const individualLease = await detail(service, 'L000073005');
+    expect(individualLease.leasedFrom).toEqual([
+      {
+        callsign: 'KZZ734',
+        usi: '7304',
+        licenseeName: shown('Morgan M Parent'),
+        licenseeRedacted: redact,
+      },
+    ]);
+    const body = JSON.stringify([parent, individualParent, organizationLease, individualLease]);
+    for (const filed of ['Jordan', 'Morgan']) {
+      if (redact) expect(body, filed).not.toContain(filed);
+      else expect(body, filed).toContain(filed);
+    }
+  });
+});
+
 describe('band classes', () => {
   let classes: FixtureIndex;
   let service: UlsIndexService;
@@ -3072,5 +3385,373 @@ describe('radioServiceLabel', () => {
     for (const code of ['constructor', 'toString', '__proto__']) {
       expect(radioServiceLabel(code)).toBe(code);
     }
+  });
+});
+
+describe('cursors bound to their search inputs', () => {
+  const INVALID = { ok: false, reason: 'invalid_cursor' };
+
+  /** The JSON parts of a cursor. */
+  const parts = (cursor: string): unknown[] =>
+    JSON.parse(Buffer.from(cursor, 'base64url').toString('utf8'));
+
+  /**
+   * The form a cursor minted before input binding takes: the minted cursor's generation, tag,
+   * and key (its last `keyLength` parts), with no input digest.
+   */
+  const legacyOf = (cursor: string, keyLength: number) => {
+    const [generation, tag] = parts(cursor);
+    return forgeCursor(generation, tag, ...parts(cursor).slice(-keyLength));
+  };
+
+  /** The cursor of a page that must have one. */
+  const cursorOf = <T>(result: PageResult<T>): string => {
+    const { nextCursor } = page(result);
+    if (!nextCursor) throw new Error('Expected the first page to carry a cursor.');
+    return nextCursor;
+  };
+
+  describe('callsign order (search_licenses without licensee)', () => {
+    // Every CD record, status any, in callsign order: 1001 1005 1002 | 1003 1006 1007 | 1009.
+    const first = licenses({ radioService: 'CD', limit: 3 });
+    let cursor: string;
+    beforeAll(async () => {
+      cursor = cursorOf(await on.searchLicenses(first));
+    });
+
+    it.each<[string, Partial<SearchLicensesParams>]>([
+      ['callsign', { callsign: 'KZZ901' }],
+      ['FRN', { frn: '0001234567' }],
+      ['market code', { marketCode: 'PEA016' }],
+      ['radio service', { radioService: 'ZQ' }],
+      ['status', { status: 'A' }],
+      ['licensee state', { state: 'WA' }],
+      ['expiration lower bound', { expiresAfter: '2000-01-01' }],
+      ['expiration upper bound', { expiresBefore: '2031-03-01' }],
+      ['grant lower bound', { grantedAfter: '2000-01-01' }],
+      ['grant upper bound', { grantedBefore: '2030-12-31' }],
+    ])('fails a cursor carried to another %s', async (_label, change) => {
+      expect(await on.searchLicenses({ ...first, ...change, cursor })).toEqual(INVALID);
+    });
+
+    it('continues with the same inputs at another limit, and in its digest-less form', async () => {
+      const next = page(await on.searchLicenses({ ...first, cursor }));
+      expect(usis(next.rows)).toEqual(['1003', '1006', '1007']);
+      expect(usis(page(await on.searchLicenses({ ...first, limit: 50, cursor })).rows)).toEqual([
+        '1003',
+        '1006',
+        '1007',
+        '1009',
+      ]);
+      expect(await on.searchLicenses({ ...first, cursor: legacyOf(cursor, 2) })).toEqual({
+        ok: true,
+        ...next,
+      });
+    });
+  });
+
+  describe('rank order (search_licenses with licensee)', () => {
+    // Five name matches with redaction off: 1001 1003 1005 3001 3003, in bm25 order.
+    const first = licenses({ licensee: 'example', limit: 2 });
+    let cursor: string;
+    beforeAll(async () => {
+      cursor = cursorOf(await off.searchLicenses(first));
+    });
+
+    it.each<[string, Partial<SearchLicensesParams>]>([
+      ['licensee', { licensee: 'paging' }],
+      ['licensee prefix', { licensee: 'exam' }],
+      ['callsign', { callsign: 'KZZ901' }],
+      ['FRN', { frn: '0001234567' }],
+      ['market code', { marketCode: 'PEA016' }],
+      ['radio service', { radioService: 'HA' }],
+      ['status', { status: 'A' }],
+      ['licensee state', { state: 'CO' }],
+      ['expiration lower bound', { expiresAfter: '2000-01-01' }],
+      ['expiration upper bound', { expiresBefore: '2031-03-01' }],
+      ['grant lower bound', { grantedAfter: '2000-01-01' }],
+      ['grant upper bound', { grantedBefore: '2030-12-31' }],
+    ])('fails a cursor carried to another %s', async (_label, change) => {
+      expect(await off.searchLicenses({ ...first, ...change, cursor })).toEqual(INVALID);
+    });
+
+    it.each(['EXAMPLE', '  Example ', 'Éxample', 'exámple'])(
+      'reads licensee %j, differing only in case, spacing, or diacritics, as the same search',
+      async (licensee) => {
+        const next = page(await off.searchLicenses({ ...first, cursor }));
+        expect(next.rows).toHaveLength(2);
+        expect(await off.searchLicenses({ ...first, licensee, cursor })).toEqual({
+          ok: true,
+          ...next,
+        });
+      },
+    );
+
+    it('continues with the same inputs at another limit, and in its digest-less form', async () => {
+      const next = page(await off.searchLicenses({ ...first, cursor }));
+      const rest = page(await off.searchLicenses({ ...first, limit: 50, cursor }));
+      expect(rest.rows).toHaveLength(3);
+      expect(rest.rows.slice(0, 2)).toEqual(next.rows);
+      expect(await off.searchLicenses({ ...first, cursor: legacyOf(cursor, 2) })).toEqual({
+        ok: true,
+        ...next,
+      });
+    });
+  });
+
+  describe('distance order (find_transmitters)', () => {
+    // Three sites within 50 km: 1001:1, 1008:1, 1001:2.
+    const first = transmitters({ radiusKm: 50, limit: 1 });
+    const siteIds = (rows: TransmitterSite[]) =>
+      rows.map((row) => `${row.usi}:${row.locationNumber}`);
+    let cursor: string;
+    beforeAll(async () => {
+      cursor = cursorOf(await on.findTransmitters(first));
+    });
+
+    it.each<[string, Partial<FindTransmittersParams>]>([
+      ['latitude', { latitude: SEATTLE_SITE.latitude + 0.001 }],
+      ['longitude', { longitude: SEATTLE_SITE.longitude + 0.001 }],
+      ['radius', { radiusKm: 49 }],
+      ['band', { band: band(100, 1000) }],
+      ['radio service', { radioService: 'CD' }],
+      ['location type', { locationType: 'F' }],
+      ['location class', { locationClass: 'T' }],
+      ['status', { status: 'any' }],
+    ])('fails a cursor carried to another %s', async (_label, change) => {
+      expect(await on.findTransmitters({ ...first, ...change, cursor })).toEqual(INVALID);
+    });
+
+    it('fails a band-search cursor carried to another band edge', async () => {
+      const banded = { ...first, band: band(100, 1000) };
+      const minted = cursorOf(await on.findTransmitters(banded));
+      expect(page(await on.findTransmitters({ ...banded, cursor: minted })).rows).toHaveLength(1);
+      expect(
+        await on.findTransmitters({ ...banded, band: band(100, 999), cursor: minted }),
+      ).toEqual(INVALID);
+    });
+
+    it('fails a band-search cursor carried to another lower band edge, the upper one kept', async () => {
+      const banded = { ...first, band: band(100, 1000) };
+      const minted = cursorOf(await on.findTransmitters(banded));
+      expect(page(await on.findTransmitters({ ...banded, cursor: minted })).rows).toHaveLength(1);
+      expect(
+        await on.findTransmitters({ ...banded, band: band(101, 1000), cursor: minted }),
+      ).toEqual(INVALID);
+    });
+
+    it('continues at another limit or per-site budget, and in its digest-less form', async () => {
+      const next = page(await on.findTransmitters({ ...first, cursor }));
+      expect(siteIds(next.rows)).toEqual(['1008:1']);
+      const rest = page(
+        await on.findTransmitters({ ...first, limit: 50, maxFrequenciesPerSite: 1, cursor }),
+      );
+      expect(siteIds(rest.rows)).toEqual(['1008:1', '1001:2']);
+      expect(rest.rows.every((row) => row.frequenciesShown <= 1)).toBe(true);
+      expect(await on.findTransmitters({ ...first, cursor: legacyOf(cursor, 4) })).toEqual({
+        ok: true,
+        ...next,
+      });
+    });
+  });
+
+  describe('frequency order (search_frequencies)', () => {
+    // Six rows over 2496–2530 MHz: m2001@2496 m2002@2496 | s2001:1 m2001@2502 | s2001:2 m2004@2524.
+    const first = frequencies({ limit: 2 });
+    let cursor: string;
+    beforeAll(async () => {
+      cursor = cursorOf(await on.searchFrequencies(first));
+    });
+
+    it.each<[string, Partial<SearchFrequenciesParams>]>([
+      ['band lower edge', { band: band(2495, 2530) }],
+      ['band upper edge', { band: band(2496, 2531) }],
+      ['kind', { kind: 'market' }],
+      ['state', { state: 'ND' }],
+      ['radio service', { radioService: 'BR' }],
+      ['licensee', { licensee: 'sample' }],
+      ['FRN', { frn: '0001234567' }],
+      ['market code', { marketCode: 'BTA138' }],
+      ['status', { status: 'any' }],
+    ])('fails a cursor carried to another %s', async (_label, change) => {
+      expect(await on.searchFrequencies({ ...first, ...change, cursor })).toEqual(INVALID);
+    });
+
+    it.each(['SAMPLE BROADBAND', ' sample   broadband ', 'Sámple Broadband', 'SAMPLE BRÓADBAND'])(
+      'reads licensee %j, differing only in case, spacing, or diacritics, as the same search',
+      async (licensee) => {
+        const named = { ...first, licensee: 'Sample Broadband' };
+        const minted = cursorOf(await on.searchFrequencies(named));
+        const next = page(await on.searchFrequencies({ ...named, cursor: minted }));
+        expect(next.rows).toHaveLength(2);
+        expect(await on.searchFrequencies({ ...named, licensee, cursor: minted })).toEqual({
+          ok: true,
+          ...next,
+        });
+      },
+    );
+
+    it('continues with the same inputs at another limit, and in its digest-less form', async () => {
+      const next = page(await on.searchFrequencies({ ...first, cursor }));
+      expect(assignmentKeys(next.rows)).toEqual(['site:2001:1', 'market:2001:2502']);
+      expect(
+        assignmentKeys(page(await on.searchFrequencies({ ...first, limit: 50, cursor })).rows),
+      ).toEqual(['site:2001:1', 'market:2001:2502', 'site:2001:2', 'market:2004:2524']);
+      expect(await on.searchFrequencies({ ...first, cursor: legacyOf(cursor, 5) })).toEqual({
+        ok: true,
+        ...next,
+      });
+    });
+
+    it('binds every cursor of a band walk, and walks to the exact rows across limit changes', async () => {
+      const walker = fixture.service({ frequencySearch: WALK_LIMITS });
+      const params = frequencies({ band: band(0.001, 300_000), status: 'any' });
+      const exact = page(await on.searchFrequencies({ ...params, limit: 200 })).rows;
+      const rows: FrequencyAssignment[] = [];
+      let walkCursor: string | undefined;
+      let calls = 0;
+      do {
+        const limit = [1, 3, 2][calls % 3] as number;
+        if (walkCursor) {
+          expect(
+            await walker.searchFrequencies({
+              ...params,
+              band: band(0.001, 299_999),
+              limit,
+              cursor: walkCursor,
+            }),
+          ).toEqual(INVALID);
+        }
+        const next = page(await walker.searchFrequencies({ ...params, limit, cursor: walkCursor }));
+        rows.push(...next.rows);
+        walkCursor = next.nextCursor;
+        calls++;
+        if (calls > 1000) throw new Error('The cursor walk did not end.');
+      } while (walkCursor);
+      expect(calls).toBeGreaterThan(3);
+      expect(rows).toEqual(exact);
+    });
+  });
+
+  it('keeps every cursor kind inside the cursor input pattern', async () => {
+    const cursors = [
+      cursorOf(await on.searchLicenses(licenses({ radioService: 'CD', limit: 1 }))),
+      cursorOf(await off.searchLicenses(licenses({ licensee: 'example', limit: 1 }))),
+      cursorOf(await on.findTransmitters(transmitters({ radiusKm: 50, limit: 1 }))),
+      cursorOf(await on.searchFrequencies(frequencies({ limit: 1 }))),
+    ];
+    for (const cursor of cursors) expect(cursor).toMatch(/^[A-Za-z0-9_-]{1,200}$/);
+  });
+});
+
+describe('searchLicenses date bounds', () => {
+  let dated: FixtureIndex;
+  let service: UlsIndexService;
+  beforeAll(async () => {
+    dated = await buildFixtureIndex({
+      groups: ['paging'],
+      weekly: { paging: LICENSE_DATES_WEEKLY },
+    });
+    service = dated.service();
+  });
+  afterAll(async () => {
+    await dated.dispose();
+  });
+
+  /** Every record of the dated fixture under `bounds`, status any, in one page. */
+  const bounded = async (bounds: Partial<SearchLicensesParams>) =>
+    page(await service.searchLicenses(licenses({ frn: '0009200000', ...bounds })));
+
+  it.each<[string, Partial<SearchLicensesParams>, string[]]>([
+    [
+      'on or before an expiration date',
+      { expiresBefore: '2027-06-30' },
+      ['9201', '9202', '9205', '9207'],
+    ],
+    ['on or after an expiration date', { expiresAfter: '2027-06-30' }, ['9202', '9203', '9208']],
+    [
+      'on one expiration day',
+      { expiresAfter: '2027-06-30', expiresBefore: '2027-06-30' },
+      ['9202'],
+    ],
+    [
+      'on a leap expiration day',
+      { expiresAfter: '2028-02-29', expiresBefore: '2028-02-29' },
+      ['9208'],
+    ],
+    ['on or after a grant date', { grantedAfter: '2017-07-01' }, ['9202', '9203', '9206', '9208']],
+    ['on or before a grant date', { grantedBefore: '2017-06-30' }, ['9201', '9205']],
+    ['on one grant day', { grantedAfter: '2017-06-30', grantedBefore: '2017-06-30' }, ['9201']],
+    [
+      'with both dates bounded',
+      { grantedAfter: '2017-07-01', expiresBefore: '2027-06-30' },
+      ['9202'],
+    ],
+    ['past every expiration', { expiresAfter: '2028-03-01' }, []],
+  ])(
+    'keeps records %s, bounds inclusive, with an exact total',
+    async (_label, bounds, expected) => {
+      const result = await bounded(bounds);
+      expect(usis(result.rows)).toEqual(expected);
+      expect(result.total).toBe(expected.length);
+    },
+  );
+
+  it('never matches a record without the bounded date', async () => {
+    expect(usis((await bounded({ expiresAfter: '0001-01-01' })).rows)).toEqual([
+      '9201',
+      '9202',
+      '9203',
+      '9205',
+      '9207',
+      '9208',
+    ]);
+    expect(usis((await bounded({ grantedBefore: '9999-12-31' })).rows)).toEqual([
+      '9201',
+      '9202',
+      '9203',
+      '9205',
+      '9206',
+      '9208',
+    ]);
+    expect(usis((await bounded({})).rows)).toHaveLength(8);
+  });
+
+  it('narrows alongside status', async () => {
+    const active = await bounded({ status: 'A', expiresBefore: '2027-06-30' });
+    expect(usis(active.rows)).toEqual(['9201', '9202', '9207']);
+  });
+
+  it.each<[string, Partial<SearchLicensesParams>, string[]]>([
+    ['an expiration upper', { expiresBefore: '2027-06-30' }, ['9201', '9202', '9205', '9207']],
+    ['an expiration lower', { expiresAfter: '2027-06-30' }, ['9202', '9203', '9208']],
+    ['a grant lower', { grantedAfter: '2017-07-01' }, ['9202', '9203', '9206', '9208']],
+    ['a grant upper', { grantedBefore: '2023-12-31' }, ['9201', '9202', '9205', '9206']],
+  ])(
+    'keeps relevance order on a name search under %s bound, counting only bounded rows on every page',
+    async (_label, bound, inBound) => {
+      const ranked = page(
+        await service.searchLicenses(licenses({ licensee: 'dated', limit: 50 })),
+      ).rows;
+      expect(ranked).toHaveLength(8);
+      const { pages, rows, total } = await allPages((cursor) =>
+        service.searchLicenses(licenses({ licensee: 'dated', ...bound, limit: 1, cursor })),
+      );
+      expect(pages).toBe(inBound.length);
+      expect(total).toBe(inBound.length);
+      expect(usis(rows)).toEqual(usis(ranked).filter((usi) => inBound.includes(usi)));
+      expect(usis(rows)).not.toEqual(inBound);
+    },
+  );
+
+  it('pages a bounded callsign-order search past its first page', async () => {
+    const { pages, rows, total } = await allPages((cursor) =>
+      service.searchLicenses(
+        licenses({ frn: '0009200000', grantedAfter: '2017-07-01', limit: 1, cursor }),
+      ),
+    );
+    expect(pages).toBe(4);
+    expect(total).toBe(4);
+    expect(usis(rows)).toEqual(['9202', '9203', '9206', '9208']);
   });
 });

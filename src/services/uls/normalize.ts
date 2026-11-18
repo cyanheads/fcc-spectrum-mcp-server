@@ -158,13 +158,18 @@ export function normalizeUnitInput(raw: string): string {
   return FREQUENCY_UNITS.find((unit) => unit.toLowerCase() === lower) ?? raw;
 }
 
-/** Convert a frequency in `unit` to MHz. */
+/**
+ * Convert a frequency in `unit` to MHz. A kHz or GHz value is rounded to the millihertz, far
+ * below the half-hertz overlap tolerance, so it lands on the same number as its MHz spelling
+ * (0.8510125 GHz is 851.0125, not 851.0124999999999) and searches, echoes, and binds cursors
+ * to the same band.
+ */
 export function toMhz(value: number, unit: FrequencyUnit): number {
   switch (unit) {
     case 'kHz':
-      return value / 1000;
+      return Math.round(value * 1e6) / 1e9;
     case 'GHz':
-      return value * 1000;
+      return Math.round(value * 1e12) / 1e9;
     case 'MHz':
       return value;
   }

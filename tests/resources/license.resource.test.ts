@@ -4,7 +4,8 @@
  * `params`, the declared `index_not_ready` and `license_not_found` contracts, parity with the
  * record `fcc_spectrum_get_license` returns, the frequency-row counts under its fixed cap of
  * 100, the first page of a large license with the notice naming the call that reads the rest,
- * redaction on and off (site names and addresses included, on shared location numbers too),
+ * redaction on and off (site names and addresses included, on shared location numbers too, and
+ * the lessee and parent-licensee names on lease links, matching the tool's),
  * the ASR registration-number rule, registry text kept verbatim in the JSON body, and
  * microwave paths with `pathTotal`, the path count in the notice, and incomplete path coverage.
  * @module tests/resources/license.resource.test
@@ -24,6 +25,7 @@ import { releaseIndex, successOf, useIndex } from '../fixtures/tool-harness.js';
 import {
   dataQualityWeekly,
   INDIVIDUAL_SITES_WEEKLY,
+  LEASE_PARTIES_WEEKLY,
   QUIRKS_WEEKLY,
   sprawlingPagingWeekly,
   widePagingWeekly,
@@ -324,7 +326,14 @@ describe('warm index', () => {
         usi: '2002',
         isLease: true,
         licensee: { name: 'Leaseholder Wireless LLC', role: 'lessee' },
-        leasedFrom: [{ callsign: 'KZZ801', usi: '2001' }],
+        leasedFrom: [
+          {
+            callsign: 'KZZ801',
+            usi: '2001',
+            licenseeName: 'Sample Broadband Inc',
+            licenseeRedacted: false,
+          },
+        ],
         market: { marketCode: 'BTA138', blocks: [{ lowMhz: 2496, highMhz: 2502 }] },
       });
     });
@@ -399,6 +408,64 @@ describe('an individual whose sites file names', () => {
       'SAMPLE BARN',
     ]);
     expect(result.locations[1]?.name).toBe('Sample Ridge');
+  });
+});
+
+describe('lease parties', () => {
+  let parties: FixtureIndex;
+  beforeAll(async () => {
+    parties = await buildFixtureIndex({
+      groups: ['paging'],
+      weekly: { paging: LEASE_PARTIES_WEEKLY },
+    });
+  });
+  afterAll(async () => {
+    await releaseIndex();
+    await parties.dispose();
+  });
+
+  /** The resource body and the tool's first page for `callsign`. */
+  async function both(callsign: string) {
+    const resource = await read(callsign);
+    const tool = successOf<ToolOutput>(await runToolContract(getLicense, { callsign } as never));
+    return { resource, tool };
+  }
+
+  it('returns the license object the tool does, individual names withheld, while redacting', async () => {
+    await useIndex(parties.mirrorDir, { services: ['paging'] });
+    const parent = await both('KZZ731');
+    expect(parent.resource.license).toEqual(parent.tool.license);
+    expect(parent.resource.license.leases[1]).toEqual({
+      callsign: 'L000073003',
+      usi: '7303',
+      licenseStatus: 'A',
+      lesseeName: null,
+      lesseeRedacted: true,
+    });
+    const lease = await both('L000073005');
+    expect(lease.resource.license).toEqual(lease.tool.license);
+    expect(lease.resource.license.leasedFrom).toEqual([
+      { callsign: 'KZZ734', usi: '7304', licenseeName: null, licenseeRedacted: true },
+    ]);
+    const orphan = await both('L000073006');
+    expect(orphan.resource.license).toEqual(orphan.tool.license);
+    expect(orphan.resource.license.leasedFrom).toEqual([{ callsign: 'KZZ799', usi: '7399' }]);
+    const body = JSON.stringify([parent.resource, lease.resource]);
+    for (const filed of ['Jordan', 'Morgan']) expect(body, filed).not.toContain(filed);
+  });
+
+  it('returns the names with redaction off', async () => {
+    await useIndex(parties.mirrorDir, { services: ['paging'], redactIndividuals: false });
+    const parent = await both('KZZ731');
+    expect(parent.resource.license).toEqual(parent.tool.license);
+    expect(parent.resource.license.leases[1]).toMatchObject({
+      lesseeName: 'Jordan J Lessee',
+      lesseeRedacted: false,
+    });
+    const lease = await both('L000073005');
+    expect(lease.resource.license.leasedFrom).toEqual([
+      { callsign: 'KZZ734', usi: '7304', licenseeName: 'Morgan M Parent', licenseeRedacted: false },
+    ]);
   });
 });
 

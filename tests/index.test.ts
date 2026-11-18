@@ -1,7 +1,8 @@
 /**
- * @fileoverview Tests for the server entry point's wiring: the `.env` preload, the options
- * passed to `createApp()` (definitions, session mode, the redaction sentence in the server
- * instructions), `setup()` initializing the index service from the server config and
+ * @fileoverview Tests for the server entry point's wiring: the `.env` preload, ahead of every
+ * definition that reads a setting when it loads; the options passed to `createApp()`
+ * (definitions, session mode, the redaction sentence in the server instructions, the advertised
+ * radius ceiling); `setup()` initializing the index service from the server config and
  * starting the ingest schedule only under the HTTP transport, and `teardown()` stopping the
  * schedule before the index service closes. `createApp` and the schedule are mocked; each
  * case loads `src/index.ts` fresh under its own environment.
@@ -10,7 +11,7 @@
 
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import type { CoreServices, CreateAppOptions } from '@cyanheads/mcp-ts-core';
+import { type CoreServices, type CreateAppOptions, z } from '@cyanheads/mcp-ts-core';
 import { afterEach, describe, expect, it, vi } from 'vitest';
 
 vi.mock('@cyanheads/mcp-ts-core', async (importOriginal) => ({
@@ -48,10 +49,34 @@ const core = (mcpTransportType: 'http' | 'stdio') =>
   ({ config: { mcpTransportType } }) as unknown as CoreServices;
 
 /**
- * Load `src/index.ts` fresh under `env`, with `process.loadEnvFile` replaced by `loadEnv`,
- * and return what it handed `createApp()` alongside the modules it wired.
+ * A `process.loadEnvFile` stand-in for a `.env` file holding `entries`. Like the real one, it
+ * never overrides a variable the environment already sets.
  */
-async function loadIndex(env: Record<string, string> = {}, loadEnv: () => void = () => {}) {
+const dotenv = (entries: Record<string, string>) => () => {
+  for (const [name, value] of Object.entries(entries)) {
+    if (process.env[name] === undefined) vi.stubEnv(name, value);
+  }
+};
+
+/** The `radius_km` maximum the find_transmitters definition handed to `createApp()` advertises. */
+function advertisedRadiusCeiling(options: CreateAppOptions): number | undefined {
+  const definition = options.tools?.find((tool) => tool.name === 'fcc_spectrum_find_transmitters');
+  expect(definition).toBeDefined();
+  const schema = z.toJSONSchema(definition?.input ?? z.object({}), { io: 'input' }) as {
+    properties?: { radius_km?: { maximum?: number } };
+  };
+  return schema.properties?.radius_km?.maximum;
+}
+
+/**
+ * Load `src/index.ts` fresh under `env` (`undefined` unsets a variable), with
+ * `process.loadEnvFile` replaced by `loadEnv`, and return what it handed `createApp()`
+ * alongside the modules it wired.
+ */
+async function loadIndex(
+  env: Record<string, string | undefined> = {},
+  loadEnv: () => void = () => {},
+) {
   vi.resetModules();
   for (const [name, value] of Object.entries({ ...DEFAULT_ENV, ...env })) vi.stubEnv(name, value);
   const loadEnvFile = vi.spyOn(process, 'loadEnvFile').mockImplementation(loadEnv);
@@ -85,6 +110,32 @@ describe('.env preload', () => {
     expect(loadEnvFile.mock.invocationCallOrder[0]).toBeLessThan(
       vi.mocked(createApp).mock.invocationCallOrder[0] ?? Number.NEGATIVE_INFINITY,
     );
+  });
+
+  it('reads settings only ./.env carries in the definitions and in setup()', async () => {
+    const mirrorDir = join(tmpdir(), 'fcc-spectrum-index-test-dotenv-unused');
+    const { options, indexService } = await loadIndex(
+      { FCC_SPECTRUM_MIRROR_DIR: undefined, FCC_SPECTRUM_WIDE_RADIUS: undefined },
+      dotenv({ FCC_SPECTRUM_MIRROR_DIR: mirrorDir, FCC_SPECTRUM_WIDE_RADIUS: 'false' }),
+    );
+    expect(advertisedRadiusCeiling(options)).toBe(100);
+    await options.setup?.(core('stdio'));
+    expect(indexService.initUlsIndexService).toHaveBeenCalledWith(
+      expect.objectContaining({ mirrorDir }),
+    );
+  });
+
+  it('keeps an environment setting over the one ./.env carries', async () => {
+    const { options } = await loadIndex(
+      { FCC_SPECTRUM_WIDE_RADIUS: 'true' },
+      dotenv({ FCC_SPECTRUM_WIDE_RADIUS: 'false' }),
+    );
+    expect(advertisedRadiusCeiling(options)).toBe(230);
+  });
+
+  it('advertises the 230 km radius when nothing sets FCC_SPECTRUM_WIDE_RADIUS', async () => {
+    const { options } = await loadIndex({ FCC_SPECTRUM_WIDE_RADIUS: undefined });
+    expect(advertisedRadiusCeiling(options)).toBe(230);
   });
 
   it('fails startup when ./.env exists but cannot be read', async () => {

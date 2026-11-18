@@ -5,7 +5,9 @@
  * callsign and USI, the `max_frequencies` cap and its 1000-row ceiling, location paging by
  * `location_offset` and `location_number` (with `location_start_conflict`) over a record
  * numbered from 0 with a gap, redaction on and off (site names and addresses included, on
- * shared location numbers too), the ASR registration-number rule, leases and market blocks,
+ * shared location numbers too), the ASR registration-number rule, leases and market blocks
+ * (lessee and parent-licensee names with redaction on and off, a parent the index does not hold
+ * apart from a held one that files no licensee),
  * microwave paths (joined, unjoined, and shared receive ends, the 100-path window and its
  * notice, a record with none, redaction) and incomplete path coverage, the required enrichment on the zero-result (miss) and under-cap (hit) pages, and
  * `format()` parity with registry text carrying CR/LF and `|`.
@@ -37,6 +39,7 @@ import {
 import {
   DATA_QUALITY_WEEKLY,
   INDIVIDUAL_SITES_WEEKLY,
+  LEASE_PARTIES_WEEKLY,
   QUIRKS_WEEKLY,
   sprawlingPagingWeekly,
   widePagingWeekly,
@@ -507,7 +510,14 @@ describe('warm index', () => {
         usi: '2002',
         isLease: true,
         licensee: { name: 'Leaseholder Wireless LLC', role: 'lessee' },
-        leasedFrom: [{ callsign: 'KZZ801', usi: '2001' }],
+        leasedFrom: [
+          {
+            callsign: 'KZZ801',
+            usi: '2001',
+            licenseeName: 'Sample Broadband Inc',
+            licenseeRedacted: false,
+          },
+        ],
         leases: [],
         leaseCount: 0,
         market: { marketCode: 'BTA138', blocks: [{ lowMhz: 2496, highMhz: 2502 }] },
@@ -517,7 +527,9 @@ describe('warm index', () => {
       expect(rendered).toContain(
         '**Lessee:** Leaseholder Wireless LLC · **Redacted:** no · **Role:** lessee · **FRN:** 0004445555 · **Applicant type:** L · **City:** MINNEAPOLIS · **State:** MN',
       );
-      expect(rendered).toContain('**Leased from:** KZZ801 (USI 2001)');
+      expect(rendered).toContain(
+        '**Leased from:** KZZ801 (USI 2001) · **Licensee:** Sample Broadband Inc',
+      );
       expect(rendered).toContain('**Leases:** 0');
       expect(rendered.find((line) => line.startsWith('**Status:**'))).toMatch(
         /\*\*Lease:\*\* yes$/,
@@ -537,8 +549,20 @@ describe('warm index', () => {
         ],
       });
       expect(structured.license?.leases).toEqual([
-        { callsign: 'L000000001', usi: '2002', licenseStatus: 'A' },
-        { callsign: 'L000000002', usi: '2004', licenseStatus: 'A' },
+        {
+          callsign: 'L000000001',
+          usi: '2002',
+          licenseStatus: 'A',
+          lesseeName: 'Leaseholder Wireless LLC',
+          lesseeRedacted: false,
+        },
+        {
+          callsign: 'L000000002',
+          usi: '2004',
+          licenseStatus: 'A',
+          lesseeName: 'Second Lessee Networks',
+          lesseeRedacted: false,
+        },
       ]);
       const rendered = lines(result);
       expect(rendered).toContain(
@@ -548,14 +572,18 @@ describe('warm index', () => {
         '**Spectrum blocks:** 2496–2502 MHz (partition area 1), 2502–2508 MHz',
       );
       expect(rendered).toContain('**Leases:** 2');
-      expect(rendered).toContain('- L000000001 · USI 2002 · status A');
-      expect(rendered).toContain('- L000000002 · USI 2004 · status A');
+      expect(rendered).toContain(
+        '- L000000001 · USI 2002 · status A · **Lessee:** Leaseholder Wireless LLC',
+      );
+      expect(rendered).toContain(
+        '- L000000002 · USI 2004 · status A · **Lessee:** Second Lessee Networks',
+      );
     });
 
-    it('keeps a lease link to a parent the index does not hold', async () => {
+    it('keeps a lease link to a parent the index does not hold, with no licensee', async () => {
       const result = await run({ usi: '2006' });
       expect(hit(result).license?.leasedFrom).toEqual([{ callsign: 'KZZ999', usi: '9999' }]);
-      expect(lines(result)).toContain('**Leased from:** KZZ999 (USI 9999)');
+      expect(lines(result)).toContain('**Leased from:** KZZ999 (USI 9999) · not in the index');
     });
   });
 
@@ -755,6 +783,9 @@ describe('paging a large license', () => {
     expect(rendered).toContain('**Next location_offset:** 48');
     expect(rendered).toContain('**Leases:** 130 (100 listed)');
     expect(rendered).toContain('**Next lease_offset:** 100');
+    expect(rendered.split('\n')).toContain(
+      '- L000070100 · USI 7200 · status A · **Lessee:** Lessee 7200',
+    );
     expectCarries(rendered, {
       license: structured.license,
       locations: structured.locations,
@@ -772,13 +803,25 @@ describe('paging a large license', () => {
     expect(structured.notice).toBe(NEXT_LEASES);
   });
 
-  it('pages leases with lease_offset', async () => {
-    const structured = hit(await run({ usi: '7001', lease_offset: 100 }));
-    expect(structured.license?.leases.map((lease) => lease.callsign)).toEqual(
-      Array.from({ length: 30 }, (_, i) => `L0000${70_101 + i}`),
+  it('pages leases with lease_offset, each with its own lessee', async () => {
+    const result = await run({ usi: '7001', lease_offset: 100 });
+    const structured = hit(result);
+    expect(
+      structured.license?.leases.map((lease) => [lease.callsign, lease.usi, lease.lesseeName]),
+    ).toEqual(
+      Array.from({ length: 30 }, (_, i) => [
+        `L0000${70_101 + i}`,
+        String(7201 + i),
+        `Lessee ${7201 + i}`,
+      ]),
     );
+    expect(structured.license?.leases.every((lease) => lease.lesseeRedacted === false)).toBe(true);
     expect(structured).not.toHaveProperty('nextLeaseOffset');
     expect(structured.notice).toBe(NEXT_LOCATIONS);
+    const rendered = lines(result);
+    expect(rendered).toContain('- L000070101 · USI 7201 · status A · **Lessee:** Lessee 7201');
+    expect(rendered).toContain('- L000070130 · USI 7230 · status A · **Lessee:** Lessee 7230');
+    expect(rendered).not.toContain('- L000070100 · USI 7200 · status A · **Lessee:** Lessee 7200');
   });
 
   it('names the location where max_frequencies starts dropping rows', async () => {
@@ -1266,6 +1309,89 @@ describe('an individual whose sites file names', () => {
   });
 });
 
+describe('lease parties', () => {
+  let parties: FixtureIndex;
+  beforeAll(async () => {
+    parties = await buildFixtureIndex({
+      groups: ['paging'],
+      weekly: { paging: LEASE_PARTIES_WEEKLY },
+    });
+  });
+  afterAll(async () => {
+    await releaseIndex();
+    await parties.dispose();
+  });
+
+  /** The parent's lease list and a lease of the individual parent, on both surfaces. */
+  async function read() {
+    const parent = await run({ callsign: 'KZZ731' });
+    const lease = await run({ callsign: 'L000073005' });
+    return { parent, lease, text: `${contractText(parent)}\n${contractText(lease)}` };
+  }
+
+  it('withholds an individual lessee and parent licensee on both surfaces while redacting', async () => {
+    await useIndex(parties.mirrorDir, { services: ['paging'] });
+    const { parent, lease, text } = await read();
+    expect(
+      hit(parent).license?.leases.map((entry) => [entry.lesseeName, entry.lesseeRedacted]),
+    ).toEqual([
+      ['Dockside Telemetry Inc', false],
+      [null, true],
+    ]);
+    expect(hit(lease).license?.leasedFrom).toEqual([
+      { callsign: 'KZZ734', usi: '7304', licenseeName: null, licenseeRedacted: true },
+    ]);
+    const rendered = text.split('\n');
+    expect(rendered).toContain(
+      '- L000073002 · USI 7302 · status A · **Lessee:** Dockside Telemetry Inc',
+    );
+    expect(rendered).toContain(
+      '- L000073003 · USI 7303 · status A · **Lessee:** Redacted (individual licensee)',
+    );
+    expect(rendered).toContain(
+      '**Leased from:** KZZ734 (USI 7304) · **Licensee:** Redacted (individual licensee)',
+    );
+    for (const filed of ['Jordan', 'Morgan']) {
+      expect(text, filed).not.toContain(filed);
+      expect(JSON.stringify([parent.structuredContent, lease.structuredContent])).not.toContain(
+        filed,
+      );
+    }
+  });
+
+  it('names them on both surfaces with redaction off', async () => {
+    await useIndex(parties.mirrorDir, { services: ['paging'], redactIndividuals: false });
+    const { parent, lease, text } = await read();
+    expect(hit(parent).license?.leases[1]).toMatchObject({
+      lesseeName: 'Jordan J Lessee',
+      lesseeRedacted: false,
+    });
+    expect(hit(lease).license?.leasedFrom).toEqual([
+      { callsign: 'KZZ734', usi: '7304', licenseeName: 'Morgan M Parent', licenseeRedacted: false },
+    ]);
+    const rendered = text.split('\n');
+    expect(rendered).toContain('- L000073003 · USI 7303 · status A · **Lessee:** Jordan J Lessee');
+    expect(rendered).toContain(
+      '**Leased from:** KZZ734 (USI 7304) · **Licensee:** Morgan M Parent',
+    );
+    for (const result of [parent, lease]) {
+      expectCarries(contractText(result), hit(result).license);
+    }
+  });
+
+  it('tells a held parent that files no licensee apart from one the index does not hold', async () => {
+    await useIndex(parties.mirrorDir, { services: ['paging'] });
+    const held = await run({ callsign: 'L000073008' });
+    expect(hit(held).license?.leasedFrom).toEqual([
+      { callsign: 'KZZ737', usi: '7307', licenseeName: null, licenseeRedacted: false },
+    ]);
+    expect(lines(held)).toContain('**Leased from:** KZZ737 (USI 7307) · **Licensee:** Not on file');
+    const missing = await run({ callsign: 'L000073006' });
+    expect(hit(missing).license?.leasedFrom).toEqual([{ callsign: 'KZZ799', usi: '7399' }]);
+    expect(lines(missing)).toContain('**Leased from:** KZZ799 (USI 7399) · not in the index');
+  });
+});
+
 /** A `microSite` fixture coordinate in whole minutes, as decimal degrees. */
 const microLat = (minute: number) => 34 + minute / 60;
 const microLon = (minute: number) => -(119 + minute / 60);
@@ -1555,8 +1681,24 @@ describe('format()', () => {
       channelBlock: 'A\n1',
       blocks: [],
     },
-    leasedFrom: [{ callsign: 'KZZ\n801', usi: '2001' }],
-    leases: [{ callsign: 'L000\r000009', usi: '2009', licenseStatus: 'A' }],
+    leasedFrom: [
+      { callsign: 'KZZ\n801', usi: '2001' },
+      {
+        callsign: 'KZZ802',
+        usi: '2010',
+        licenseeName: 'Harbor\r\nSpectrum',
+        licenseeRedacted: false,
+      },
+    ],
+    leases: [
+      {
+        callsign: 'L000\r000009',
+        usi: '2009',
+        licenseStatus: 'A',
+        lesseeName: 'Dockside\nTelemetry',
+        lesseeRedacted: false,
+      },
+    ],
     leaseCount: 30,
   };
   const location: Location = {
@@ -1626,9 +1768,10 @@ describe('format()', () => {
       '**Lessee:** Acme Radio Club · **Redacted:** no · **Role:** lessee · **City:** NEW YORK · **State:** NY',
       '**Trustee callsign:** KZ1AAA · **Trustee name:** Trustee Person',
       '**Market:** BTA001 — Fargo Moorhead, ND-MN · **Channel block:** A 1',
-      '**Leased from:** KZZ 801 (USI 2001)',
+      '**Leased from:** KZZ 801 (USI 2001) · not in the index',
+      '**Leased from:** KZZ802 (USI 2010) · **Licensee:** Harbor Spectrum',
       '**Leases:** 30 (1 listed)',
-      '- L000 000009 · USI 2009 · status A',
+      '- L000 000009 · USI 2009 · status A · **Lessee:** Dockside Telemetry',
       '#### Location 1 — Seattle Hill',
       '**Type:** F · **Coordinates:** 47.5, -122.25 · **Filed DMS:** 47-30-0 N 122-15-0 W',
       '**Place:** 1 Tower Rd, SEA TTLE, KI NG, WA (state as filed)',
@@ -1740,6 +1883,36 @@ describe('format()', () => {
     expect(render(true)).toContain(
       '**Licensee:** Redacted (individual licensee) · **Redacted:** yes · **Role:** licensee',
     );
+  });
+
+  it('tells a lessee or parent licensee ULS never filed apart from a redacted one', () => {
+    const rendered = formattedText(
+      getLicense.format?.({
+        found: true,
+        license: {
+          ...license,
+          leasedFrom: [
+            { callsign: 'KZZ803', usi: '2011', licenseeName: null, licenseeRedacted: false },
+            { callsign: 'KZZ804', usi: '2012', licenseeName: null, licenseeRedacted: true },
+          ],
+          leases: [
+            { usi: '2013', licenseStatus: 'A', lesseeName: null, lesseeRedacted: false },
+            { usi: '2014', licenseStatus: 'E', lesseeName: null, lesseeRedacted: true },
+          ],
+        },
+        technicalRetained: false,
+        locations: [],
+        otherCallsignRecords: [],
+      }),
+    ).split('\n');
+    for (const line of [
+      '**Leased from:** KZZ803 (USI 2011) · **Licensee:** Not on file',
+      '**Leased from:** KZZ804 (USI 2012) · **Licensee:** Redacted (individual licensee)',
+      '- (no callsign) · USI 2013 · status A · **Lessee:** Not on file',
+      '- (no callsign) · USI 2014 · status E · **Lessee:** Redacted (individual licensee)',
+    ]) {
+      expect(rendered).toContain(line);
+    }
   });
 
   it('describes antennaTypeCode with the codes and labels list_reference serves', () => {
